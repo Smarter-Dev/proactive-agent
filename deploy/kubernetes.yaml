@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smarter-dev-proactive-agent
+  namespace: smarter-dev
+spec:
+  # Start with one replica for the canary. Redis guild leases make it safe to
+  # increase this after the first external guild is stable.
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: smarter-dev-proactive-agent
+  template:
+    metadata:
+      labels:
+        app: smarter-dev-proactive-agent
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: proactive-agent
+          image: zzmmrmn/smarter-dev-proactive-agent:<IMAGE_VERSION>
+          envFrom:
+            - configMapRef:
+                name: smarter-dev-config
+          env:
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: redis-url
+            - name: PROACTIVE_AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: proactive-agent-api-key
+            - name: DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: discord-bot-token
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: gemini-api-key
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: openai-api-key
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: openrouter-api-key
+            - name: OPENCODE_ZEN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: opencode-zen-api-key
+            - name: BRAVE_SEARCH_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: brave-search-api-key
+          ports:
+            - name: health
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
