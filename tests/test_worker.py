@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -22,7 +24,12 @@ class FakeLease:
 
 
 def queue_and_batch():
-    batch = SimpleNamespace(guild_id="111", wake_id="wake-1")
+    batch = SimpleNamespace(
+        guild_id="111",
+        wake_id="wake-1",
+        notifications=("one", "two"),
+        dropped=3,
+    )
     queue = SimpleNamespace(
         externally_owned=AsyncMock(return_value=True),
         discard_embedded_ready=AsyncMock(),
@@ -146,3 +153,74 @@ async def test_a_runtime_that_never_loaded_cannot_be_asked_to_announce():
     queue.record_failure.assert_awaited_once_with(
         batch, error="RuntimeError: no runtime", max_attempts=5
     )
+
+
+def completion_lines(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "wake completed" in record.getMessage()
+    ]
+
+
+async def test_a_completed_wake_says_so(caplog):
+    queue, _batch = queue_and_batch()
+    runtime = SimpleNamespace(process=AsyncMock())
+    runtimes = SimpleNamespace(get=AsyncMock(return_value=runtime))
+    worker = ProactiveWorker(queue, runtimes)
+
+    with caplog.at_level(logging.INFO, logger="proactive_agent.worker"):
+        await worker._run_guild("111", ())
+
+    lines = completion_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "guild=111" in line
+    assert "wake=wake-1" in line
+    assert "notifications=2" in line
+    assert "dropped=3" in line
+    assert re.search(r"duration=\d+\.\d+s", line)
+
+
+async def test_the_logged_duration_measures_the_wake(caplog):
+    queue, _batch = queue_and_batch()
+
+    async def slow_process(_batch):
+        await asyncio.sleep(0.05)
+
+    runtime = SimpleNamespace(process=slow_process)
+    runtimes = SimpleNamespace(get=AsyncMock(return_value=runtime))
+    worker = ProactiveWorker(queue, runtimes)
+
+    with caplog.at_level(logging.INFO, logger="proactive_agent.worker"):
+        await worker._run_guild("111", ())
+
+    seconds = float(re.search(r"duration=(\d+\.\d+)s", completion_lines(caplog)[0])[1])
+    assert seconds >= 0.05
+
+
+async def test_a_failed_wake_is_never_logged_as_completed(caplog):
+    queue, _batch = queue_and_batch()
+    runtime = SimpleNamespace(
+        process=AsyncMock(side_effect=RuntimeError("boom")),
+        report_failure=AsyncMock(),
+    )
+    runtimes = SimpleNamespace(get=AsyncMock(return_value=runtime))
+    worker = ProactiveWorker(queue, runtimes)
+
+    with caplog.at_level(logging.INFO, logger="proactive_agent.worker"):
+        await worker._run_guild("111", ())
+
+    assert completion_lines(caplog) == []
+
+
+async def test_a_wake_with_nothing_to_process_is_not_logged_as_completed(caplog):
+    queue, _batch = queue_and_batch()
+    queue.build_batch.return_value = None
+    runtimes = SimpleNamespace(get=AsyncMock())
+    worker = ProactiveWorker(queue, runtimes)
+
+    with caplog.at_level(logging.INFO, logger="proactive_agent.worker"):
+        await worker._run_guild("111", ())
+
+    assert completion_lines(caplog) == []

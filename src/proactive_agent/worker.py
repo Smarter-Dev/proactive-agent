@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from proactive_agent.queue import ReadyRecord
 
@@ -63,6 +64,7 @@ class ProactiveWorker:
             renew_task = asyncio.create_task(self._renew_lease(lease))
             process_task = None
             runtime = None
+            started = time.monotonic()
             try:
                 runtime = await self._runtimes.get(guild_id)
                 process_task = asyncio.create_task(runtime.process(batch))
@@ -76,6 +78,16 @@ class ProactiveWorker:
                     await renew_task
                 await process_task
                 await self._queue.acknowledge(batch)
+                # The only line a healthy wake writes. Without it an idle
+                # agent and a dead one leave identical logs.
+                logger.info(
+                    "proactive guild wake completed guild=%s wake=%s notifications=%d dropped=%d duration=%.2fs",
+                    guild_id,
+                    batch.wake_id,
+                    len(batch.notifications),
+                    batch.dropped,
+                    time.monotonic() - started,
+                )
             except Exception as error:
                 logger.exception(
                     "proactive guild wake failed guild=%s wake=%s",
