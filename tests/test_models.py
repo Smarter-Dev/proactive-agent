@@ -5,7 +5,16 @@ from types import SimpleNamespace
 from pydantic_ai.models.openai import OpenAIChatModel
 
 from proactive_agent.agent import usage_dict
+from proactive_agent.config import Settings
 from proactive_agent.models import build_model
+
+
+def test_default_agent_model_matches_the_production_configmap() -> None:
+    """The pod reads PROACTIVE_AGENT_MODEL from smarter-dev-config, so this
+    default only applies if that key goes missing. It should still name the
+    model production actually runs rather than a stale one."""
+    default = Settings.model_fields["proactive_agent_model"].default
+    assert default == "gemini-3.8-flash"
 
 
 def test_litellm_proxy_routes_both_model_families(monkeypatch) -> None:

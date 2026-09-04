@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     api_base_url: str = "http://localhost:8000/api"
     proactive_agent_api_key: str = ""
     discord_bot_token: str = ""
-    proactive_agent_model: str = "gemini-3.7-flash"
+    proactive_agent_model: str = "gemini-3.8-flash"
     proactive_skim_model: str = "z-ai/glm-5.3-flash"
     proactive_web_summarizer_model: str = "openai/gpt-5.6-luna"
     proactive_web_summarizer_fallback_model: str = "gemini-3.5-flash-lite"
