@@ -633,6 +633,39 @@ async def self_compaction_summary(
     return result.output, usage_dict(result.usage)
 
 
+def starts_wake_turn(message: ModelMessage) -> bool:
+    """True when the message opens a new turn instead of continuing one.
+
+    A ModelRequest carrying only ToolReturnParts is the answer to a
+    ToolCallPart in the response before it, so the two belong to the same
+    turn and must never be separated.
+    """
+    return isinstance(message, ModelRequest) and any(
+        isinstance(part, UserPromptPart) for part in message.parts
+    )
+
+
+def fold_boundary(history: list[ModelMessage], keep_messages: int) -> int | None:
+    """Index where the folded half ends and the kept tail begins.
+
+    Only the start of a turn is a legal boundary. Cutting on a tool-return
+    request strands its ToolCallPart at the end of the folded half, and
+    pydantic-ai refuses to run a new prompt against a history ending on an
+    unanswered call. Prefer the first turn start at or after the ideal cut
+    so compaction still frees the tokens it was called to free, and fall
+    back to the last one before it when the final turn ran longer than
+    ``keep_messages``. None means there is nothing safe to fold.
+    """
+    ideal = max(0, len(history) - keep_messages)
+    for index in range(ideal, len(history)):
+        if starts_wake_turn(history[index]):
+            return index
+    for index in range(ideal - 1, 0, -1):
+        if starts_wake_turn(history[index]):
+            return index
+    return None
+
+
 async def compact_agent_history(
     history: list[ModelMessage],
     *,
@@ -642,17 +675,15 @@ async def compact_agent_history(
 ) -> list[ModelMessage]:
     """Fold old wakes into a summary once the history outgrows the limit.
 
-    The kept tail always starts at a ModelRequest so the sequence stays
-    valid for the API.
+    Both halves are cut on a turn boundary, so neither the folded half nor
+    the kept tail ever splits a tool call from its return.
     """
     if estimated_history_tokens(history) <= token_limit:
         return history
-    cut = max(0, len(history) - keep_messages)
-    while cut < len(history) and not isinstance(history[cut], ModelRequest):
-        cut += 1
-    old, tail = history[:cut], history[cut:]
-    if not old:
+    cut = fold_boundary(history, keep_messages)
+    if not cut:
         return history
+    old, tail = history[:cut], history[cut:]
     summary = await summarize(old)
     return [
         ModelRequest(
