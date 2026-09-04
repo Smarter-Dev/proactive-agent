@@ -11,6 +11,7 @@ from proactive_agent.contracts import NotificationEnvelope
 from proactive_agent.keys import (
     DEAD_LETTER_STREAM_KEY,
     READY_STREAM_KEY,
+    failure_notice_key,
     ownership_key,
     pending_key,
     wake_stream_key,
@@ -180,3 +181,25 @@ async def test_acknowledging_one_guild_does_not_ack_another(redis_client):
     )
     assert pending_second["pending"] == 1
     await queue.acknowledge(second)
+
+
+@pytest.mark.asyncio
+async def test_failure_notice_window_admits_one_claim_then_closes(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+
+    assert await queue.claim_failure_notice("111", ttl_seconds=21_600)
+    assert not await queue.claim_failure_notice("111", ttl_seconds=21_600)
+    # A second guild failing has its own window.
+    assert await queue.claim_failure_notice("999", ttl_seconds=21_600)
+
+    assert await redis_client.ttl(failure_notice_key("111")) == 21_600
+
+
+@pytest.mark.asyncio
+async def test_failure_notice_window_reopens_once_it_expires(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+
+    assert await queue.claim_failure_notice("111", ttl_seconds=21_600)
+    await redis_client.delete(failure_notice_key("111"))
+
+    assert await queue.claim_failure_notice("111", ttl_seconds=21_600)

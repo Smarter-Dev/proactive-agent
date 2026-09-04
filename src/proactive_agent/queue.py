@@ -16,6 +16,7 @@ from proactive_agent.keys import (
     attempts_key,
     batch_dropped_key,
     batch_key,
+    failure_notice_key,
     lease_key,
     ownership_key,
     pending_dropped_key,
@@ -420,6 +421,17 @@ class RedisWakeQueue:
         )
         await self.acknowledge(batch)
         return True
+
+    async def claim_failure_notice(self, guild_id: str, *, ttl_seconds: int) -> bool:
+        """True for the first caller of the window, false for the rest.
+
+        The window opens on the first claim, so one dropped wake speaks and
+        anything failing behind it stays quiet until the window expires.
+        """
+        claimed = await self._redis.set(
+            failure_notice_key(guild_id), "1", nx=True, ex=ttl_seconds
+        )
+        return bool(claimed)
 
     async def acknowledge_ready(self, records: tuple[ReadyRecord, ...]) -> None:
         if records:

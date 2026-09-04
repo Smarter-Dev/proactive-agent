@@ -51,6 +51,10 @@ def attempts_key(guild_id: str, wake_id: str) -> str:
     return f"{KEY_PREFIX}:{guild_tag(guild_id)}:attempts:{wake_id}"
 
 
+def failure_notice_key(guild_id: str) -> str:
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:failure-notice"
+
+
 def history_key(guild_id: str) -> str:
     return f"{KEY_PREFIX}:{guild_tag(guild_id)}:history"
 

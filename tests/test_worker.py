@@ -88,3 +88,61 @@ async def test_lost_lease_cancels_processing_and_leaves_batch_for_retry():
     queue.record_failure.assert_awaited_once_with(
         batch, error="GuildLeaseLostError: lost", max_attempts=5
     )
+
+
+async def test_dead_lettered_wake_announces_itself():
+    queue, batch = queue_and_batch()
+    queue.record_failure.return_value = True
+    runtime = SimpleNamespace(
+        process=AsyncMock(side_effect=RuntimeError("boom")),
+        report_failure=AsyncMock(return_value="channel-1"),
+    )
+    runtimes = SimpleNamespace(get=AsyncMock(return_value=runtime))
+    worker = ProactiveWorker(queue, runtimes)
+
+    await worker._run_guild("111", ())
+
+    runtime.report_failure.assert_awaited_once_with(batch, "RuntimeError: boom")
+
+
+async def test_failure_below_the_ceiling_stays_silent():
+    queue, _batch = queue_and_batch()
+    queue.record_failure.return_value = False
+    runtime = SimpleNamespace(
+        process=AsyncMock(side_effect=RuntimeError("boom")),
+        report_failure=AsyncMock(),
+    )
+    runtimes = SimpleNamespace(get=AsyncMock(return_value=runtime))
+    worker = ProactiveWorker(queue, runtimes)
+
+    await worker._run_guild("111", ())
+
+    runtime.report_failure.assert_not_awaited()
+
+
+async def test_a_broken_announcement_does_not_escape_the_worker():
+    queue, _batch = queue_and_batch()
+    queue.record_failure.return_value = True
+    runtime = SimpleNamespace(
+        process=AsyncMock(side_effect=RuntimeError("boom")),
+        report_failure=AsyncMock(side_effect=RuntimeError("discord down")),
+    )
+    runtimes = SimpleNamespace(get=AsyncMock(return_value=runtime))
+    worker = ProactiveWorker(queue, runtimes)
+
+    await worker._run_guild("111", ())
+
+    queue.record_failure.assert_awaited_once()
+
+
+async def test_a_runtime_that_never_loaded_cannot_be_asked_to_announce():
+    queue, batch = queue_and_batch()
+    queue.record_failure.return_value = True
+    runtimes = SimpleNamespace(get=AsyncMock(side_effect=RuntimeError("no runtime")))
+    worker = ProactiveWorker(queue, runtimes)
+
+    await worker._run_guild("111", ())
+
+    queue.record_failure.assert_awaited_once_with(
+        batch, error="RuntimeError: no runtime", max_attempts=5
+    )
