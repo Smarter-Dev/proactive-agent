@@ -62,6 +62,7 @@ class ProactiveWorker:
                 return
             renew_task = asyncio.create_task(self._renew_lease(lease))
             process_task = None
+            runtime = None
             try:
                 runtime = await self._runtimes.get(guild_id)
                 process_task = asyncio.create_task(runtime.process(batch))
@@ -81,9 +82,10 @@ class ProactiveWorker:
                     guild_id,
                     batch.wake_id,
                 )
+                detail = f"{type(error).__name__}: {error}"
                 dead_lettered = await self._queue.record_failure(
                     batch,
-                    error=f"{type(error).__name__}: {error}",
+                    error=detail,
                     max_attempts=self._max_attempts,
                 )
                 if dead_lettered:
@@ -92,6 +94,7 @@ class ProactiveWorker:
                         guild_id,
                         batch.wake_id,
                     )
+                    await self._announce_failure(runtime, batch, detail)
                 # Below the ceiling records remain pending for reclaim.
             finally:
                 renew_task.cancel()
@@ -100,6 +103,31 @@ class ProactiveWorker:
                     process_task.cancel()
                     cleanup_tasks.append(process_task)
                 await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+    async def _announce_failure(self, runtime, batch, detail: str) -> None:
+        """Tell the guild a wake was dropped, without ever raising.
+
+        A dead-lettered wake is already the bad path; a failure to announce
+        it must not replace the logged cause with its own traceback.
+        """
+        if runtime is None:
+            return
+        try:
+            channel_id = await runtime.report_failure(batch, detail)
+        except Exception:
+            logger.exception(
+                "proactive failure notice failed guild=%s wake=%s",
+                batch.guild_id,
+                batch.wake_id,
+            )
+            return
+        if channel_id is not None:
+            logger.info(
+                "proactive failure notice sent guild=%s wake=%s channel=%s",
+                batch.guild_id,
+                batch.wake_id,
+                channel_id,
+            )
 
     async def _renew_lease(self, lease) -> None:
         while True:

@@ -23,6 +23,22 @@ from proactive_agent.types import ActivationResult
 
 MEMORY_REFRESH_SECONDS = 3600
 HISTORY_FETCH_LIMIT = 60
+# One dropped wake is worth saying out loud; a broken model or a poisoned
+# history would otherwise repeat it every few minutes for hours.
+FAILURE_NOTICE_INTERVAL_SECONDS = 6 * 60 * 60
+FAILURE_NOTICE_ERROR_LIMIT = 1500
+
+
+def failure_notice_text(error: str) -> str:
+    """The single message a guild sees when a wake is given up on."""
+    detail = error.replace("```", "'''")[:FAILURE_NOTICE_ERROR_LIMIT]
+    return (
+        "\u26a0\ufe0f I hit an error while waking up and gave up on that wake "
+        "after several retries, so I may have missed something here. This one "
+        "needs a look at my logs.\n"
+        f"```{detail}```\n"
+        "I'll stay quiet about any further failures for the next 6 hours."
+    )
 
 
 def render_memory_block(memory: dict | None) -> str:
@@ -214,6 +230,39 @@ class GuildRuntime:
         self.history_revision = snapshot.revision
         await self._record_usage(batch, result, responses)
         return result
+
+    async def report_failure(self, batch: WakeBatch, error: str) -> str | None:
+        """Say in Discord that a wake was dropped, at most once per window.
+
+        Returns the channel posted in, or None when there was nowhere to
+        post or the window is still held by an earlier failure.
+        """
+        channel_id = await self._failure_notice_channel(batch)
+        if channel_id is None:
+            return None
+        # Claim last: an unclaimable window must not be spent on a notice
+        # that was never going to be sent.
+        if not await self.queue.claim_failure_notice(
+            self.guild_id, ttl_seconds=FAILURE_NOTICE_INTERVAL_SECONDS
+        ):
+            return None
+        await self.discord.send_message(channel_id, failure_notice_text(error))
+        return channel_id
+
+    async def _failure_notice_channel(self, batch: WakeBatch) -> str | None:
+        """The channel the wake was for, else any the agent is enabled in."""
+        enabled = [
+            row.channel_id
+            for row in await self.api.list_enabled_channels(self.guild_id)
+        ]
+        if not enabled:
+            return None
+        candidates = [item.envelope.channel_id for item in batch.waking]
+        candidates += [envelope.channel_id for envelope in batch.notifications]
+        return next(
+            (channel_id for channel_id in candidates if channel_id in enabled),
+            enabled[0],
+        )
 
     async def _load_history(self) -> None:
         if self.history_loaded:
