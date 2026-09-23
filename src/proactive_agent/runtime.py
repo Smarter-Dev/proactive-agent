@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from pydantic_ai.messages import ModelMessagesTypeAdapter
+from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 
 from proactive_agent.agent import OPERATING_POLICY_BRIEF
 from proactive_agent.contracts import ControlCommand, NotificationEnvelope
@@ -275,6 +281,49 @@ class GuildRuntime:
         )
         self.history_revision = snapshot.revision
         self.history_loaded = True
+
+    async def record_unavailable_retries(
+        self, batch: WakeBatch, *, retries: int, recovered: bool
+    ) -> None:
+        """Put a worker error in the next agent wake's history without waking it."""
+        await self._load_history()
+        marker = f"[WORKER UNAVAILABLE wake={batch.wake_id}]"
+        history = self.engine.agent_runner.history
+        if any(
+            isinstance(message, ModelRequest)
+            and any(
+                isinstance(part, UserPromptPart)
+                and isinstance(part.content, str)
+                and part.content.startswith(marker)
+                for part in message.parts
+            )
+            for message in history
+        ):
+            return
+        outcome = (
+            "The same wake eventually completed."
+            if recovered
+            else "The wake was abandoned and may have missed an action."
+        )
+        note = (
+            f"{marker}\n"
+            "This is a worker-generated error record, not a Discord user message "
+            "or a request to respond now. A model request returned HTTP 503 "
+            f"UNAVAILABLE. The worker retried {retries} time(s) after the "
+            f"initial attempt. {outcome} Use this context on the next real wake."
+        )
+        updated = [
+            *history,
+            ModelRequest(parts=[UserPromptPart(note)]),
+            ModelResponse(parts=[TextPart("Worker error recorded for the next wake.")]),
+        ]
+        snapshot = await self.history_writer.save(
+            guild_id=self.guild_id,
+            history=json.loads(ModelMessagesTypeAdapter.dump_json(updated)),
+            previous_revision=self.history_revision,
+        )
+        self.engine.agent_runner.history = updated
+        self.history_revision = snapshot.revision
 
     async def _dispatch(
         self,

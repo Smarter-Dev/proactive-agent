@@ -6,13 +6,22 @@ import asyncio
 import logging
 import time
 
+from pydantic_ai.exceptions import ModelHTTPError
+
 from proactive_agent.queue import ReadyRecord
 
 logger = logging.getLogger(__name__)
+UNAVAILABLE_RETRY_DELAYS = (30, 60, 120)
 
 
 class GuildLeaseLostError(RuntimeError):
     pass
+
+
+class UnavailableRetriesExhausted(RuntimeError):
+    def __init__(self, retries: int):
+        self.retries = retries
+        super().__init__(f"model returned HTTP 503 after {retries} retries")
 
 
 class ProactiveWorker:
@@ -22,6 +31,7 @@ class ProactiveWorker:
         self._semaphore = asyncio.Semaphore(concurrency)
         self._max_attempts = max_attempts
         self._tasks: set[asyncio.Task] = set()
+        self._sleep_retry = asyncio.sleep
 
     async def run(self, stop: asyncio.Event) -> None:
         await self._queue.initialize()
@@ -67,7 +77,9 @@ class ProactiveWorker:
             started = time.monotonic()
             try:
                 runtime = await self._runtimes.get(guild_id)
-                process_task = asyncio.create_task(runtime.process(batch))
+                process_task = asyncio.create_task(
+                    self._process_with_unavailable_retries(runtime, batch)
+                )
                 done, _pending = await asyncio.wait(
                     {process_task, renew_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -95,12 +107,17 @@ class ProactiveWorker:
                     batch.wake_id,
                 )
                 detail = f"{type(error).__name__}: {error}"
+                unavailable = isinstance(error, UnavailableRetriesExhausted)
                 dead_lettered = await self._queue.record_failure(
                     batch,
                     error=detail,
-                    max_attempts=self._max_attempts,
+                    max_attempts=1 if unavailable else self._max_attempts,
                 )
                 if dead_lettered:
+                    if unavailable and runtime is not None:
+                        await self._record_unavailable_note(
+                            runtime, batch, retries=error.retries, recovered=False
+                        )
                     logger.error(
                         "proactive guild wake dead-lettered guild=%s wake=%s",
                         guild_id,
@@ -115,6 +132,45 @@ class ProactiveWorker:
                     process_task.cancel()
                     cleanup_tasks.append(process_task)
                 await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+    async def _process_with_unavailable_retries(self, runtime, batch) -> None:
+        for retries in range(len(UNAVAILABLE_RETRY_DELAYS) + 1):
+            try:
+                await runtime.process(batch)
+            except ModelHTTPError as error:
+                if error.status_code != 503:
+                    raise
+                if retries == len(UNAVAILABLE_RETRY_DELAYS):
+                    raise UnavailableRetriesExhausted(retries) from error
+                delay = UNAVAILABLE_RETRY_DELAYS[retries]
+                logger.warning(
+                    "proactive model unavailable guild=%s wake=%s retry=%d delay=%ds",
+                    batch.guild_id,
+                    batch.wake_id,
+                    retries + 1,
+                    delay,
+                )
+                await self._sleep_retry(delay)
+            else:
+                if retries:
+                    await self._record_unavailable_note(
+                        runtime, batch, retries=retries, recovered=True
+                    )
+                return
+
+    async def _record_unavailable_note(
+        self, runtime, batch, *, retries: int, recovered: bool
+    ) -> None:
+        try:
+            await runtime.record_unavailable_retries(
+                batch, retries=retries, recovered=recovered
+            )
+        except Exception:
+            logger.exception(
+                "proactive unavailable history note failed guild=%s wake=%s",
+                batch.guild_id,
+                batch.wake_id,
+            )
 
     async def _announce_failure(self, runtime, batch, detail: str) -> None:
         """Tell the guild a wake was dropped, without ever raising.

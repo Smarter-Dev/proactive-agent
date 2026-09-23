@@ -4,7 +4,9 @@ import asyncio
 import logging
 import re
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
+
+from pydantic_ai.exceptions import ModelHTTPError
 
 from proactive_agent.worker import GuildLeaseLostError, ProactiveWorker
 
@@ -67,6 +69,100 @@ async def test_successful_wake_is_acknowledged():
     runtime.process.assert_awaited_once_with(batch)
     queue.acknowledge.assert_awaited_once_with(batch)
     queue.record_failure.assert_not_awaited()
+
+
+async def test_unavailable_retries_at_30_and_60_before_recovery():
+    queue, batch = queue_and_batch()
+    runtime = SimpleNamespace(
+        process=AsyncMock(
+            side_effect=[
+                ModelHTTPError(503, "gemini-3.8-flash"),
+                ModelHTTPError(503, "gemini-3.8-flash"),
+                None,
+            ]
+        ),
+        record_unavailable_retries=AsyncMock(),
+    )
+    worker = ProactiveWorker(
+        queue, SimpleNamespace(get=AsyncMock(return_value=runtime))
+    )
+    worker._sleep_retry = AsyncMock()
+
+    await worker._run_guild("111", ())
+
+    assert runtime.process.await_count == 3
+    assert worker._sleep_retry.await_args_list == [call(30), call(60)]
+    runtime.record_unavailable_retries.assert_awaited_once_with(
+        batch, retries=2, recovered=True
+    )
+    queue.acknowledge.assert_awaited_once_with(batch)
+    queue.record_failure.assert_not_awaited()
+
+
+async def test_unavailable_exhausts_three_retries_then_dead_letters():
+    queue, batch = queue_and_batch()
+    queue.record_failure.return_value = True
+    runtime = SimpleNamespace(
+        process=AsyncMock(side_effect=ModelHTTPError(503, "gemini-3.8-flash")),
+        record_unavailable_retries=AsyncMock(),
+        report_failure=AsyncMock(return_value=None),
+    )
+    worker = ProactiveWorker(
+        queue, SimpleNamespace(get=AsyncMock(return_value=runtime))
+    )
+    worker._sleep_retry = AsyncMock()
+
+    await worker._run_guild("111", ())
+
+    assert runtime.process.await_count == 4
+    assert worker._sleep_retry.await_args_list == [call(30), call(60), call(120)]
+    runtime.record_unavailable_retries.assert_awaited_once_with(
+        batch, retries=3, recovered=False
+    )
+    queue.acknowledge.assert_not_awaited()
+    queue.record_failure.assert_awaited_once_with(
+        batch,
+        error="UnavailableRetriesExhausted: model returned HTTP 503 after 3 retries",
+        max_attempts=1,
+    )
+    runtime.report_failure.assert_awaited_once()
+
+
+async def test_history_note_failure_does_not_repeat_a_completed_wake():
+    queue, batch = queue_and_batch()
+    runtime = SimpleNamespace(
+        process=AsyncMock(side_effect=[ModelHTTPError(503, "gemini-3.8-flash"), None]),
+        record_unavailable_retries=AsyncMock(side_effect=RuntimeError("cache down")),
+    )
+    worker = ProactiveWorker(
+        queue, SimpleNamespace(get=AsyncMock(return_value=runtime))
+    )
+    worker._sleep_retry = AsyncMock()
+
+    await worker._run_guild("111", ())
+
+    assert runtime.process.await_count == 2
+    queue.acknowledge.assert_awaited_once_with(batch)
+    queue.record_failure.assert_not_awaited()
+
+
+async def test_other_model_http_error_keeps_existing_retry_policy():
+    queue, _batch = queue_and_batch()
+    runtime = SimpleNamespace(
+        process=AsyncMock(side_effect=ModelHTTPError(500, "gemini-3.8-flash")),
+        record_unavailable_retries=AsyncMock(),
+    )
+    worker = ProactiveWorker(
+        queue, SimpleNamespace(get=AsyncMock(return_value=runtime))
+    )
+    worker._sleep_retry = AsyncMock()
+
+    await worker._run_guild("111", ())
+
+    assert runtime.process.await_count == 1
+    worker._sleep_retry.assert_not_awaited()
+    runtime.record_unavailable_retries.assert_not_awaited()
+    assert queue.record_failure.await_args.kwargs["max_attempts"] == 5
 
 
 async def test_lost_lease_cancels_processing_and_leaves_batch_for_retry():
