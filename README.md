@@ -69,6 +69,10 @@ marked that guild `external` in Redis.
   API; the worker has no database credentials.
 - Agent history is cached immediately in Redis and flushed to Postgres through
   the API after the configured debounce. Shutdown attempts a final flush.
+- A model HTTP 503 during a wake is retried on the same guild lease after 30,
+  60, then 120 seconds. If it still fails, the wake is dead-lettered. The
+  worker adds one history-only note with the retry count and outcome, so the
+  agent sees it on its next real wake without generating another wake.
 
 ## Rollout from the bot repository
 
