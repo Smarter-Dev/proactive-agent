@@ -71,3 +71,51 @@ async def test_discord_rest_preserves_reply_anchor_and_suppresses_embeds():
     assert seen[0].headers["authorization"] == "Bot token"
     assert seen[1].method == "PUT"
     assert seen[1].url.path.endswith("/channels/22/messages/33/reactions/👍/@me")
+
+
+async def test_privacy_ack_posts_to_the_run_and_reports_unknown_runs():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if "unknown" in request.url.path:
+            return httpx.Response(404, json={"detail": "not found"})
+        return httpx.Response(200, json={"accepted": True})
+
+    api = ApplicationAPI(
+        base_url="https://app.test/api",
+        api_key="sk_test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        accepted = await api.post_privacy_ack(
+            "run-1",
+            component="worker",
+            guild_id="333333333333333333",
+            outcome="purged",
+            stores=["proactive:v1:history"],
+            detail="d" * 600,
+        )
+        unknown = await api.post_privacy_ack(
+            "unknown",
+            component="worker",
+            guild_id="333333333333333333",
+            outcome="failed",
+            stores=[],
+            detail="",
+        )
+    finally:
+        await api.close()
+
+    assert accepted is True
+    assert unknown is False
+    assert seen[0].method == "POST"
+    assert seen[0].url.path == "/api/privacy/purges/run-1/acks"
+    body = json.loads(seen[0].content)
+    assert body == {
+        "component": "worker",
+        "guild_id": "333333333333333333",
+        "outcome": "purged",
+        "stores": ["proactive:v1:history"],
+        "detail": "d" * 500,
+    }

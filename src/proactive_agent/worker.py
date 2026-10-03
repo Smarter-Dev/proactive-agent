@@ -25,8 +25,18 @@ class UnavailableRetriesExhausted(RuntimeError):
 
 
 class ProactiveWorker:
-    def __init__(self, queue, runtimes, *, concurrency: int = 8, max_attempts: int = 5):
+    def __init__(
+        self,
+        queue,
+        runtimes,
+        *,
+        concurrency: int = 8,
+        max_attempts: int = 5,
+        services: tuple = (),
+    ):
         self._queue = queue
+        # Long-running side loops (privacy purges, ...) with run(stop).
+        self._services = tuple(services)
         self._runtimes = runtimes
         self._semaphore = asyncio.Semaphore(concurrency)
         self._max_attempts = max_attempts
@@ -34,6 +44,16 @@ class ProactiveWorker:
         self._sleep_retry = asyncio.sleep
 
     async def run(self, stop: asyncio.Event) -> None:
+        services = [
+            asyncio.create_task(service.run(stop)) for service in self._services
+        ]
+        try:
+            await self._run_wakes(stop)
+        finally:
+            stop.set()
+            await asyncio.gather(*services, return_exceptions=True)
+
+    async def _run_wakes(self, stop: asyncio.Event) -> None:
         await self._queue.initialize()
         while not stop.is_set():
             reclaimed = await self._queue.reclaim_ready()

@@ -28,6 +28,7 @@ from proactive_agent.health import HealthServer
 from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
 from proactive_agent.models import build_model
 from proactive_agent.parity import build_proactive_agent
+from proactive_agent.purge import PrivacyPurgeConsumer
 from proactive_agent.queue import RedisWakeQueue
 from proactive_agent.runtime import ActionJournal, GuildRuntime, GuildRuntimeRegistry
 from proactive_agent.worker import ProactiveWorker
@@ -118,11 +119,23 @@ async def run() -> None:
         )
 
     runtimes = GuildRuntimeRegistry(build_runtime)
+    privacy_purges = PrivacyPurgeConsumer(
+        redis_client,
+        api,
+        queue,
+        history_repository,
+        history_writer,
+        runtimes,
+        # The agent's own model rewrites its own memory.
+        model=build_model(settings.proactive_agent_model),
+        consumer_name=queue.consumer_name,
+    )
     worker = ProactiveWorker(
         queue,
         runtimes,
         concurrency=settings.proactive_worker_concurrency,
         max_attempts=settings.proactive_max_attempts,
+        services=(privacy_purges,),
     )
     health = HealthServer(redis_client, api, port=settings.proactive_health_port)
     await health.start()

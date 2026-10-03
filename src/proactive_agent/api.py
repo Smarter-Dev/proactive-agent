@@ -116,6 +116,31 @@ class ApplicationAPI:
             },
         )
 
+    async def post_privacy_ack(
+        self,
+        run_id: str,
+        *,
+        component: str,
+        guild_id: str,
+        outcome: str,
+        stores: list[str],
+        detail: str,
+    ) -> bool:
+        """Report one guild's purge outcome; False when the run is unknown."""
+        response = await self._request(
+            "POST",
+            f"/privacy/purges/{run_id}/acks",
+            allow_not_found=True,
+            json={
+                "component": component,
+                "guild_id": guild_id,
+                "outcome": outcome,
+                "stores": stores,
+                "detail": detail[:500],
+            },
+        )
+        return response is not None
+
     async def get_memory(self, guild_id: str) -> dict[str, Any] | None:
         response = await self._request(
             "GET", f"/guilds/{guild_id}/chat-memory", allow_not_found=True

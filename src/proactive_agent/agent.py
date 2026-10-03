@@ -14,7 +14,9 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from inspect import isawaitable
+from typing import Literal
 
+from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
     ModelMessage,
@@ -863,6 +865,95 @@ async def purge_agent_history(
     if not history:
         return history
     return memory_note_pair(await summarize(list(history)))
+
+
+PRIVACY_WATCH_PROMPT = """\
+PRIVACY PURGE. A member of this community has asked to be forgotten. Their
+Discord user id is {user_id}{names_clause}.
+
+Below are the watch instructions you set for the watcher in one channel. Decide
+for each one:
+- keep: it has nothing to do with this person;
+- rewrite: it still serves other people, but must no longer refer to this
+person (give the new text, without their id, names, mentions or anything that
+identifies them);
+- drop: it exists only because of this person.
+Return one decision per instruction id.
+
+WATCH INSTRUCTIONS:
+{entries}"""
+
+PRIVACY_WATCH_RETRY_PROMPT = """\
+At least one instruction you kept or rewrote still contains the user id
+{user_id} or one of their names. Decide again for every instruction."""
+
+
+class WatchDecision(BaseModel):
+    instruction_id: str
+    action: Literal["keep", "rewrite", "drop"]
+    text: str | None = None
+
+
+class WatchDecisions(BaseModel):
+    decisions: list[WatchDecision]
+
+
+async def privacy_watch_decisions(
+    model: Model | str,
+    entries: dict[str, str],
+    *,
+    user_id: str,
+    names: list[str],
+) -> dict[str, str | None]:
+    """The agent decides keep/rewrite/drop for each watch instruction.
+
+    Returns the new text per instruction id (None = drop). An entry without a
+    decision is kept as is. Kept or rewritten text holding the user id is
+    asked about once more, then PrivacyCompactionError is raised; a name
+    match after the retry is accepted, as with the memory note.
+    """
+    if not entries:
+        return {}
+    names_clause = (
+        "; they have appeared under these names: "
+        + ", ".join(f'"{name}"' for name in names)
+        if names
+        else ""
+    )
+    prompt = PRIVACY_WATCH_PROMPT.format(
+        user_id=user_id,
+        names_clause=names_clause,
+        entries="\n".join(f"- {key}: {text}" for key, text in entries.items()),
+    )
+    decision_agent = Agent(model, output_type=WatchDecisions)
+    history: list[ModelMessage] | None = None
+    for attempt in range(2):
+        result = await decision_agent.run(prompt, message_history=history)
+        by_id = {item.instruction_id: item for item in result.output.decisions}
+        outcome: dict[str, str | None] = {}
+        for key, text in entries.items():
+            decision = by_id.get(key)
+            if decision is None or decision.action == "keep":
+                outcome[key] = text
+            elif decision.action == "drop" or not (decision.text or "").strip():
+                outcome[key] = None
+            else:
+                outcome[key] = decision.text.strip()
+        kept = [text for text in outcome.values() if text is not None]
+        leaks_id = any(user_id in text for text in kept)
+        leaks_name = any(name_hits(text, names) for text in kept)
+        if not leaks_id and not leaks_name:
+            return outcome
+        if attempt == 0:
+            history = result.all_messages()
+            prompt = PRIVACY_WATCH_RETRY_PROMPT.format(user_id=user_id)
+            continue
+        if leaks_id:
+            raise PrivacyCompactionError(
+                "watch instructions still held the user id after a retry"
+            )
+        return outcome
+    raise AssertionError("unreachable")
 
 
 @dataclass

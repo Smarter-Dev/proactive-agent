@@ -320,3 +320,21 @@ async def test_a_wake_with_nothing_to_process_is_not_logged_as_completed(caplog)
         await worker._run_guild("111", ())
 
     assert completion_lines(caplog) == []
+
+
+async def test_services_run_beside_the_wake_loop_and_stop_with_it():
+    queue = SimpleNamespace(initialize=AsyncMock())
+    started = []
+
+    class Service:
+        async def run(self, stop):
+            started.append(True)
+            await stop.wait()
+
+    stop = asyncio.Event()
+    stop.set()
+    worker = ProactiveWorker(queue, SimpleNamespace(), services=(Service(),))
+
+    await asyncio.wait_for(worker.run(stop), timeout=1)
+
+    assert started == [True]
