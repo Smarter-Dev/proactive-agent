@@ -65,3 +65,25 @@ def legacy_history_key(guild_id: str) -> str:
 
 def control_stream_key() -> str:
     return f"{KEY_PREFIX}:control"
+
+
+def purge_epoch_key(guild_id: str) -> str:
+    """Bumped after every privacy purge of the guild's history.
+
+    Runtimes reload history when it moves, and its existence alone forbids
+    restoring the pre-split legacy history key for the guild.
+    """
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:purge-epoch"
+
+
+def privacy_lock_key(guild_id: str) -> str:
+    """Purge fence for a guild the external worker does not own."""
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:privacy-lock"
+
+
+PRIVACY_PURGE_STREAM_KEY = "privacy:v1:purge"
+
+
+def privacy_enforcing_key(component: str) -> str:
+    """Set after each blocked-users fetch; tells the purge job we enforce it."""
+    return f"privacy:v1:enforcing:{component}"

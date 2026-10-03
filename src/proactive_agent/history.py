@@ -10,7 +10,7 @@ import logging
 from pydantic import ValidationError
 
 from proactive_agent.contracts import HistorySnapshot
-from proactive_agent.keys import history_key, legacy_history_key
+from proactive_agent.keys import history_key, legacy_history_key, purge_epoch_key
 
 logger = logging.getLogger(__name__)
 
@@ -51,29 +51,26 @@ class GuildHistoryRepository:
         self._api = api
 
     async def load(self, guild_id: str) -> HistorySnapshot:
+        """v1 Redis, then the Postgres recovery copy, then the legacy key.
+
+        The legacy embedded-bot key is never restored once the guild has a
+        purge epoch: it may still hold a purged user's raw history.
+        """
+        snapshot = await self.load_canonical(guild_id)
+        if snapshot is not None:
+            return snapshot
+        if not await self._redis.exists(purge_epoch_key(guild_id)):
+            legacy = await self._load_legacy(guild_id)
+            if legacy is not None:
+                await self.cache(legacy)
+                return legacy
+        return build_snapshot(guild_id, [], revision=0)
+
+    async def load_canonical(self, guild_id: str) -> HistorySnapshot | None:
+        """v1 Redis, else the Postgres copy (cached into v1); never legacy."""
         cached = await self._load_redis(guild_id)
         if cached is not None:
             return cached
-
-        # During the split rollout the integrated bot's existing Redis key is
-        # still the freshest live history. Prefer it to a potentially older
-        # Postgres snapshot left by an earlier canary.
-        legacy = await self._load_legacy(guild_id)
-        if legacy is not None:
-            durable = await self._api.get_history(guild_id)
-            if durable is not None:
-                if not snapshot_is_valid(durable):
-                    raise ValueError(
-                        f"durable proactive history checksum failed for guild {guild_id}"
-                    )
-                # Keep the legacy content but inherit the durable revision so
-                # the next write is a valid monotonic replacement.
-                legacy = build_snapshot(
-                    guild_id, legacy.history, revision=durable.revision
-                )
-            await self.cache(legacy)
-            return legacy
-
         durable = await self._api.get_history(guild_id)
         if durable is not None:
             if not snapshot_is_valid(durable):
@@ -82,8 +79,7 @@ class GuildHistoryRepository:
                 )
             await self.cache(durable)
             return durable
-
-        return build_snapshot(guild_id, [], revision=0)
+        return None
 
     async def cache(self, snapshot: HistorySnapshot) -> None:
         if not snapshot_is_valid(snapshot):
@@ -160,12 +156,69 @@ class DebouncedHistoryWriter:
         self._tasks[guild_id] = asyncio.create_task(self._flush_after_delay(guild_id))
         return snapshot
 
+    def discard(self, guild_id: str) -> HistorySnapshot | None:
+        """Drop the guild's dirty copy and pending flush without writing it.
+
+        A purge calls this first: the dirty copy may hold the purged user's
+        words and must never reach Postgres afterwards. Returns the copy so
+        a failed purge can put it back.
+        """
+        task = self._tasks.pop(guild_id, None)
+        if task is not None:
+            task.cancel()
+        return self._dirty.pop(guild_id, None)
+
+    def restore(self, snapshot: HistorySnapshot | None) -> None:
+        """Put back a dirty copy taken by discard() when a purge failed."""
+        if snapshot is None or self._closed:
+            return
+        current = self._dirty.get(snapshot.guild_id)
+        if current is not None and current.revision >= snapshot.revision:
+            return
+        self._dirty[snapshot.guild_id] = snapshot
+        task = self._tasks.get(snapshot.guild_id)
+        if task is not None:
+            task.cancel()
+        self._tasks[snapshot.guild_id] = asyncio.create_task(
+            self._flush_after_delay(snapshot.guild_id)
+        )
+
+    async def replace_purged(
+        self, guild_id: str, history: list[dict], *, previous_revision: int
+    ) -> HistorySnapshot:
+        """Synchronously replace the guild's history after a privacy purge.
+
+        Any dirty copy is discarded, the Postgres recovery copy is written
+        first at a revision above both stores, then the v1 Redis key. If the
+        PUT fails nothing was written; the caller treats the purge as failed.
+        """
+        self.discard(guild_id)
+        durable = await self._api.get_history(guild_id)
+        revision = max(previous_revision, durable.revision if durable else 0) + 1
+        snapshot = build_snapshot(guild_id, history, revision=revision)
+        await self._api.put_history(snapshot)
+        await self._repository.cache(snapshot)
+        return snapshot
+
     async def flush(self, guild_id: str) -> None:
         attempt = 0
         while snapshot := self._dirty.get(guild_id):
             try:
                 await self._api.put_history(snapshot)
-            except Exception:
+            except Exception as error:
+                if getattr(error, "status_code", None) == 409:
+                    # Postgres already holds a newer revision (for example a
+                    # purge written by another replica). Retrying an older
+                    # copy can never succeed; Redis keeps the live history.
+                    logger.warning(
+                        "proactive history flush superseded guild=%s revision=%d",
+                        guild_id,
+                        snapshot.revision,
+                    )
+                    latest = self._dirty.get(guild_id)
+                    if latest is not None and latest.revision == snapshot.revision:
+                        self._dirty.pop(guild_id, None)
+                    continue
                 attempt += 1
                 logger.exception(
                     "proactive history flush failed guild=%s revision=%d",

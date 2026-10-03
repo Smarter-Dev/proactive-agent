@@ -6,24 +6,40 @@ import json
 import fakeredis.aioredis
 import pytest
 
+from proactive_agent.api import ApplicationAPIError
 from proactive_agent.history import (
     DebouncedHistoryWriter,
     GuildHistoryRepository,
     build_snapshot,
 )
-from proactive_agent.keys import history_key, legacy_history_key
+from proactive_agent.keys import history_key, legacy_history_key, purge_epoch_key
 
 
 class FakeAPI:
+    """Postgres stand-in that enforces the server's monotonic revisions."""
+
     def __init__(self, durable=None):
         self.durable = durable
         self.puts = []
+        self.fail_puts = False
+        # Every PUT the writer tried, accepted or not.
+        self.attempts = []
 
     async def get_history(self, guild_id):
         return self.durable
 
     async def put_history(self, snapshot):
+        self.attempts.append(snapshot)
+        if self.fail_puts:
+            raise ApplicationAPIError(500, "boom")
+        if self.durable is not None and snapshot.revision <= self.durable.revision:
+            if snapshot.revision == self.durable.revision and (
+                snapshot.checksum == self.durable.checksum
+            ):
+                return
+            raise ApplicationAPIError(409, "conflict")
         self.puts.append(snapshot)
+        self.durable = snapshot
 
 
 @pytest.fixture
@@ -84,8 +100,10 @@ async def test_legacy_history_migrates_when_no_durable_copy_exists(redis_client)
 
 
 @pytest.mark.asyncio
-async def test_live_legacy_history_wins_over_stale_canary_snapshot(redis_client):
-    durable = build_snapshot("111", [{"from": "old-canary"}], revision=9)
+async def test_postgres_snapshot_wins_over_legacy_history(redis_client):
+    # Restore order is v1 -> Postgres -> legacy: a purge writes Postgres, so
+    # the legacy key must never outrank it.
+    durable = build_snapshot("111", [{"from": "postgres"}], revision=9)
     api = FakeAPI(durable=durable)
     repository = GuildHistoryRepository(redis_client, api)
     await redis_client.set(
@@ -94,8 +112,23 @@ async def test_live_legacy_history_wins_over_stale_canary_snapshot(redis_client)
 
     loaded = await repository.load("111")
 
-    assert loaded.history == [{"from": "embedded-bot"}]
-    assert loaded.revision == 9
+    assert loaded == durable
+
+
+@pytest.mark.asyncio
+async def test_legacy_history_is_never_restored_after_a_purge(redis_client):
+    api = FakeAPI()
+    repository = GuildHistoryRepository(redis_client, api)
+    await redis_client.set(
+        legacy_history_key("111"), json.dumps([{"from": "kai 111111111111111111"}])
+    )
+    await redis_client.incr(purge_epoch_key("111"))
+
+    loaded = await repository.load("111")
+
+    assert loaded.history == []
+    assert loaded.revision == 0
+    assert await redis_client.get(history_key("111")) is None
 
 
 @pytest.mark.asyncio
@@ -133,3 +166,91 @@ async def test_close_flushes_dirty_history_without_waiting_for_debounce(
 
     assert len(api.puts) == 1
     assert api.puts[0].history == [{"wake": 1}]
+
+
+@pytest.mark.asyncio
+async def test_replace_purged_discards_dirty_copy_and_writes_postgres_first(
+    redis_client,
+):
+    api = FakeAPI()
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(
+        repository, api, debounce_seconds=0.05, retry_base_seconds=0.001
+    )
+    stale = await writer.save(
+        guild_id="111", history=[{"raw": "kai said x"}], previous_revision=0
+    )
+
+    purged = await writer.replace_purged(
+        "111", [{"note": "clean"}], previous_revision=stale.revision
+    )
+    await asyncio.sleep(0.1)
+
+    assert [snapshot.history for snapshot in api.puts] == [[{"note": "clean"}]]
+    assert purged.revision == stale.revision + 1
+    assert (await repository.load("111")).history == [{"note": "clean"}]
+    await writer.close(timeout=1)
+    assert [snapshot.history for snapshot in api.attempts] == [[{"note": "clean"}]]
+
+
+@pytest.mark.asyncio
+async def test_replace_purged_goes_above_a_newer_postgres_revision(redis_client):
+    api = FakeAPI(durable=build_snapshot("111", [{"x": 1}], revision=7))
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(repository, api)
+
+    purged = await writer.replace_purged(
+        "111", [{"note": "clean"}], previous_revision=3
+    )
+
+    assert purged.revision == 8
+    await writer.close(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_failed_purged_put_leaves_redis_untouched(redis_client):
+    api = FakeAPI()
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(repository, api)
+    before = build_snapshot("111", [{"raw": "old"}], revision=4)
+    await repository.cache(before)
+    api.fail_puts = True
+
+    with pytest.raises(ApplicationAPIError):
+        await writer.replace_purged("111", [{"note": "clean"}], previous_revision=4)
+
+    assert await repository.load("111") == before
+    await writer.close(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_restore_puts_back_a_discarded_dirty_copy(redis_client):
+    api = FakeAPI()
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(repository, api, debounce_seconds=0.01)
+    await writer.save(guild_id="111", history=[{"wake": 1}], previous_revision=0)
+
+    taken = writer.discard("111")
+    writer.restore(taken)
+    await asyncio.sleep(0.05)
+
+    assert [snapshot.history for snapshot in api.puts] == [[{"wake": 1}]]
+    await writer.close(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_superseded_flush_is_dropped_not_retried_forever(redis_client):
+    # Another replica's purge wrote revision 5; this replica's stale dirty
+    # revision 5 (different content) can never land and must not loop.
+    api = FakeAPI(durable=build_snapshot("111", [{"note": "clean"}], revision=5))
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(
+        repository, api, debounce_seconds=0.01, retry_base_seconds=0.001
+    )
+    await writer.save(guild_id="111", history=[{"raw": "kai"}], previous_revision=4)
+
+    await asyncio.wait_for(writer.flush("111"), timeout=1)
+
+    assert api.puts == []
+    assert api.durable.history == [{"note": "clean"}]
+    await writer.close(timeout=1)
