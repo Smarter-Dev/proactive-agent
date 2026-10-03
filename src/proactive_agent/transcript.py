@@ -33,6 +33,6 @@ def render_transcript_line(record: dict, tags: dict[str, str]) -> str:
     )
     tag = tags[record["author_id"]]
     return (
-        f"[id={record['id']}] {bot_marker}{tag}·{record['author_display']}"
-        f"{reply_marker}: {record['content']}"
+        f"[id={record['id']}] {bot_marker}{tag}·{record['author_display']} "
+        f"(uid={record['author_id']}){reply_marker}: {record['content']}"
     )
