@@ -1,8 +1,15 @@
-"""Redis Stream consumer with guild isolation and crash-safe pending batches."""
+"""Redis Stream consumer with guild isolation and crash-safe pending batches.
+
+Envelopes carry verbatim Discord message text, so nothing here keeps one past
+:data:`CONTENT_RETENTION_MILLISECONDS`: a claimed batch and its dropped
+counter expire that long after the claim, and the dead-letter stream keeps
+ids and an error type rather than envelopes, trimmed to the same window.
+"""
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -29,14 +36,19 @@ READY_GROUP = "proactive-agent-workers-v1"
 WAKE_GROUP = "proactive-agent-v1"
 WAKE_PAYLOAD_FIELD = "payload"
 
+# The same 48-hour window smarter-dev bounds the wake stream and its own
+# claimed batches by.
+CONTENT_RETENTION_MILLISECONDS = 48 * 60 * 60 * 1000
+
 _CLAIM_PENDING_LUA = """
 if redis.call('EXISTS', KEYS[2]) == 0 then
   if redis.call('EXISTS', KEYS[1]) == 1 then
     redis.call('RENAME', KEYS[1], KEYS[2])
+    redis.call('PEXPIRE', KEYS[2], ARGV[1])
   end
   local dropped = redis.call('GET', KEYS[3])
   if dropped then
-    redis.call('SET', KEYS[4], dropped)
+    redis.call('SET', KEYS[4], dropped, 'PX', ARGV[1])
     redis.call('DEL', KEYS[3])
   end
 end
@@ -78,11 +90,17 @@ for _, value in ipairs(values) do
 end
 if #values > 0 then
   redis.call('DEL', KEYS[1])
+  if redis.call('PTTL', KEYS[2]) < 0 then
+    redis.call('PEXPIRE', KEYS[2], ARGV[1])
+  end
 end
 local dropped = tonumber(redis.call('GET', KEYS[3]) or '0')
 if dropped > 0 then
   redis.call('INCRBY', KEYS[4], dropped)
   redis.call('DEL', KEYS[3])
+  if redis.call('PTTL', KEYS[4]) < 0 then
+    redis.call('PEXPIRE', KEYS[4], ARGV[1])
+  end
 end
 table.insert(values, 1, tostring(dropped))
 return values
@@ -315,6 +333,7 @@ class RedisWakeQueue:
             batch_key(guild_id, wake_id),
             pending_dropped_key(guild_id),
             batch_dropped_key(guild_id, wake_id),
+            CONTENT_RETENTION_MILLISECONDS,
         )
         dropped = int(_decode(raw_pending[0]))
         pending = tuple(
@@ -359,6 +378,7 @@ class RedisWakeQueue:
             batch_key(batch.guild_id, batch.wake_id),
             pending_dropped_key(batch.guild_id),
             batch_dropped_key(batch.guild_id, batch.wake_id),
+            CONTENT_RETENTION_MILLISECONDS,
         )
         dropped = int(_decode(raw_pending[0]))
         newly_pending = [
@@ -403,6 +423,9 @@ class RedisWakeQueue:
         """Record a failed wake; dead-letter and ack it at the retry ceiling.
 
         Returns true when the batch was moved aside and must not be retried.
+        The dead letter keeps the notifications' ids, not their envelopes, and
+        only the error's type: an exception message, a provider error above
+        all, can quote the prompt and so a member's message.
         """
         key = attempts_key(batch.guild_id, batch.wake_id)
         attempts = int(await self._redis.incr(key))
@@ -414,7 +437,13 @@ class RedisWakeQueue:
                 "wake_id": batch.wake_id,
                 "dropped": batch.dropped,
                 "notifications": [
-                    item.model_dump(mode="json") for item in batch.notifications
+                    {
+                        "notification_id": str(item.notification_id),
+                        "channel_id": item.channel_id,
+                        "kind": item.kind,
+                        "message_ids": list(item.message_ids),
+                    }
+                    for item in batch.notifications
                 ],
             },
             separators=(",", ":"),
@@ -423,7 +452,7 @@ class RedisWakeQueue:
             guild_id=batch.guild_id,
             stream_id=batch.waking[0].stream_id,
             payload=payload,
-            error=error[:2000],
+            error=error.split(":", 1)[0][:200],
             attempts=attempts,
         )
         await self.acknowledge(batch)
@@ -470,6 +499,11 @@ class RedisWakeQueue:
             },
             maxlen=10_000,
             approximate=True,
+        )
+        await self._redis.xtrim(
+            DEAD_LETTER_STREAM_KEY,
+            minid=f"{int(time.time() * 1000) - CONTENT_RETENTION_MILLISECONDS}-0",
+            approximate=False,
         )
 
     async def _ensure_guild_group(self, guild_id: str) -> None:
