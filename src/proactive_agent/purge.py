@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 PURGE_GROUP = "proactive-agent-workers-v1-privacy"
 PURGE_COMPONENT = "worker"
 RECLAIM_IDLE_MS = 10 * 60 * 1000
+# Re-claim the entry being worked on this often, well inside RECLAIM_IDLE_MS,
+# so a long multi-guild purge is never reclaimed by another replica.
+HEARTBEAT_SECONDS = 60
 PRIVACY_LOCK_SECONDS = 600
 FENCE_WAIT_SECONDS = 15 * 60
 FENCE_POLL_SECONDS = 0.5
@@ -155,6 +158,7 @@ class PrivacyPurgeConsumer:
         fence_wait_seconds: float = FENCE_WAIT_SECONDS,
         fence_poll_seconds: float = FENCE_POLL_SECONDS,
         reclaim_idle_ms: int = RECLAIM_IDLE_MS,
+        heartbeat_seconds: float = HEARTBEAT_SECONDS,
     ):
         if model is None and (compact is None or decide_watch is None):
             raise ValueError("a model is required unless both steps are injected")
@@ -176,6 +180,7 @@ class PrivacyPurgeConsumer:
         self._fence_wait_seconds = fence_wait_seconds
         self._fence_poll_seconds = fence_poll_seconds
         self._reclaim_idle_ms = reclaim_idle_ms
+        self._heartbeat_seconds = heartbeat_seconds
 
     async def initialize(self) -> None:
         try:
@@ -232,8 +237,34 @@ class PrivacyPurgeConsumer:
             for _stream, stream_entries in records or ():
                 entries.extend(stream_entries)
         for stream_id, fields in entries:
-            await self.handle(_decode(stream_id), fields)
+            stream_id = _decode(stream_id)
+            heartbeat = asyncio.create_task(self._heartbeat(stream_id))
+            try:
+                await self.handle(stream_id, fields)
+            finally:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
         return len(entries)
+
+    async def _heartbeat(self, stream_id: str) -> None:
+        """Keep the owned entry's idle time near zero while it is handled."""
+        while True:
+            await asyncio.sleep(self._heartbeat_seconds)
+            try:
+                await self._redis.xclaim(
+                    PRIVACY_PURGE_STREAM_KEY,
+                    PURGE_GROUP,
+                    self._consumer_name,
+                    0,
+                    [stream_id],
+                    justid=True,
+                )
+            except Exception as error:
+                logger.warning(
+                    "privacy purge heartbeat failed id=%s type=%s",
+                    stream_id,
+                    type(error).__name__,
+                )
 
     async def handle(self, stream_id: str, fields) -> None:
         raw = None

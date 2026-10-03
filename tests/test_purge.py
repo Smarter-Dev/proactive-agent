@@ -625,3 +625,37 @@ async def test_purge_put_conflict_is_retried_once_with_a_fresh_revision(
     assert json.loads(await stored_v1(redis_client))["revision"] == 5
     assert api.acks[0]["outcome"] == "purged"
     await replica.writer.close(timeout=1)
+
+
+async def test_a_working_consumers_entry_is_not_reclaimed(redis_client, world):
+    # A purge running longer than the reclaim idle time keeps its entry
+    # fresh, so a second replica does not start a duplicate purge.
+    api = world
+    replica_a = Replica(redis_client, api, honest_model([]), name="a")
+    replica_b = Replica(redis_client, api, honest_model([]), name="b")
+    replica_a.consumer._heartbeat_seconds = 0.01
+    replica_b.consumer._reclaim_idle_ms = 50
+    real_compact = replica_a.consumer._compact
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def slow_compact(messages, **kwargs):
+        started.set()
+        await release.wait()
+        return await real_compact(messages, **kwargs)
+
+    replica_a.consumer._compact = slow_compact
+    await replica_a.consumer.initialize()
+    await submit(redis_client, command())
+    working = asyncio.create_task(replica_a.consumer.poll_once())
+    await started.wait()
+
+    for _ in range(10):
+        await asyncio.sleep(0.03)  # 300 ms in total, 6x the idle limit
+        assert await replica_b.consumer.poll_once() == 0
+
+    release.set()
+    assert await working == 1
+    assert [ack["outcome"] for ack in api.acks] == ["purged"]
+    await replica_a.writer.close(timeout=1)
+    await replica_b.writer.close(timeout=1)
