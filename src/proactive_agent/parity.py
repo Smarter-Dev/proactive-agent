@@ -251,6 +251,11 @@ async def add_reaction(ctx, message_id: str, emoji: str) -> dict[str, Any]:
     """React to a message with an emoji (unicode char, or name:id for custom)."""
     if not str(message_id).isdigit():
         return {"ok": False, "error": "message_id must be a numeric Discord id"}
+    # Same guard as the core react tool: only messages the agent can see,
+    # never a blocked user's message (which has no addressable id).
+    env = await ctx.deps.channel_env(ctx.deps.channel_id)
+    if env.lookup(str(message_id)) is None:
+        return {"ok": False, "error": f"No message with id {message_id} is visible."}
     cleaned = (emoji or "").strip().lstrip("<").rstrip(">")
     if not cleaned:
         return {"ok": False, "error": "empty emoji"}

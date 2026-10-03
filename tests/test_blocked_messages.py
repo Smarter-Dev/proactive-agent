@@ -21,16 +21,13 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from proactive_agent.agent import (
-    AgentDeps,
-    KimiAgentRunner,
-    build_kimi_agent,
-)
+from proactive_agent.agent import KimiAgentRunner
 from proactive_agent.blocked_users import BlockedUsers
 from proactive_agent.contracts import BlockedUsersList
 from proactive_agent.discord import DiscordREST
 from proactive_agent.engine import AgentEngine, SkimRunner
 from proactive_agent.environment import ChannelEnvironment, InstructionStore
+from proactive_agent.parity import ProactiveDeps, build_proactive_agent
 from proactive_agent.transcript import render_transcript_line, speaker_tags
 from proactive_agent.types import BlockedMessage
 
@@ -92,12 +89,24 @@ def discord_client(blocked_users) -> DiscordREST:
             return httpx.Response(200, json=[{"id": "1", "name": "Rustaceans"}])
         raise AssertionError(path)
 
-    return DiscordREST(
+    client = RecordingDiscord(
         bot_token="t",
         api_base="https://discord.test/api/v10",
         transport=httpx.MockTransport(handler),
         blocked_users=blocked_users,
     )
+    return client
+
+
+class RecordingDiscord(DiscordREST):
+    reactions: list
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reactions = []
+
+    async def add_reaction(self, channel_id, message_id, emoji):
+        self.reactions.append((channel_id, message_id, emoji))
 
 
 class ListAPI(FakeAPI):
@@ -121,6 +130,14 @@ def scripted_agent(seen: list[list[ModelMessage]]) -> FunctionModel:
         (
             "react_to_message",
             {"channel_id": CHANNEL, "message_id": KAI_MESSAGE, "emoji": "x"},
+        ),
+        (
+            "add_reaction",
+            {"channel_id": CHANNEL, "message_id": KAI_MESSAGE, "emoji": "x"},
+        ),
+        (
+            "add_reaction",
+            {"channel_id": CHANNEL, "message_id": NIA_MESSAGE, "emoji": "x"},
         ),
     ]
 
@@ -146,16 +163,22 @@ def skim_model(seen: list[list[ModelMessage]]) -> FunctionModel:
 async def wake_with(discord: DiscordREST):
     agent_seen: list[list[ModelMessage]] = []
     skim_seen: list[list[ModelMessage]] = []
+    # The production agent: core tools plus the parity tools, with the
+    # same ProactiveDeps the runtime builds.
     runner = KimiAgentRunner(
-        agent=build_kimi_agent(scripted_agent(agent_seen), system_prompt="sys"),
+        agent=build_proactive_agent(scripted_agent(agent_seen), system_prompt="sys"),
         summarize=None,
     )
+
+    def deps_factory(**kwargs):
+        return ProactiveDeps(guild_id=GUILD, discord=discord, api=None, **kwargs)
+
     engine = AgentEngine(
         agent_runner=runner,
         skim=SkimRunner(skim_model(skim_seen)),
         agent_model_id="fake",
         skim_model_id="fake-skim",
-        deps_factory=AgentDeps,
+        deps_factory=deps_factory,
     )
 
     async def channel_envs(channel_id: str) -> ChannelEnvironment:
@@ -181,11 +204,14 @@ async def wake_with(discord: DiscordREST):
             if not isinstance(message, ModelResponse)
         ]
     ).decode()
+    tool_outputs: dict[str, list] = {}
+    for message in agent_seen[-1]:
+        for part in getattr(message, "parts", ()):
+            if isinstance(part, ToolReturnPart):
+                tool_outputs.setdefault(part.tool_name, []).append(part.content)
     tool_outputs = {
-        part.tool_name: part.content
-        for message in agent_seen[-1]
-        for part in getattr(message, "parts", ())
-        if isinstance(part, ToolReturnPart)
+        name: outputs[0] if len(outputs) == 1 else outputs
+        for name, outputs in tool_outputs.items()
     }
     return model_input, tool_outputs, result
 
@@ -217,6 +243,7 @@ async def test_purged_user_messages_do_not_reach_model_input():
     # The purge adds kai to the list; the next refresh picks it up.
     api.blocked = {"revision": 2, "user_ids": [TARGET]}
     await blocked.refresh()
+    discord.reactions.clear()
     model_input, tools, result = await wake_with(discord)
 
     # The only place kai's message id may appear is the refusal echoing the
@@ -237,6 +264,13 @@ async def test_purged_user_messages_do_not_reach_model_input():
     assert tools["reply_to_message"] == refusal
     assert tools["react_to_message"] == refusal
     assert tools["skim_messages"] == "nia shares release notes"
+    # The parity reaction tool refuses the blocked id the same way and
+    # still reacts to a visible message.
+    assert tools["add_reaction"] == [
+        {"ok": False, "error": refusal},
+        {"ok": True},
+    ]
+    assert discord.reactions == [(CHANNEL, NIA_MESSAGE, "x")]
     assert result.responses == [] and result.reactions == ()
     await discord.close()
 
