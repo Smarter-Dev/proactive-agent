@@ -33,10 +33,13 @@ class ProactiveWorker:
         concurrency: int = 8,
         max_attempts: int = 5,
         services: tuple = (),
+        blocked_users=None,
     ):
         self._queue = queue
         # Long-running side loops (privacy purges, ...) with run(stop).
         self._services = tuple(services)
+        # No wake runs before the blocked-users list has been read once.
+        self._blocked_users = blocked_users
         self._runtimes = runtimes
         self._semaphore = asyncio.Semaphore(concurrency)
         self._max_attempts = max_attempts
@@ -54,6 +57,10 @@ class ProactiveWorker:
             await asyncio.gather(*services, return_exceptions=True)
 
     async def _run_wakes(self, stop: asyncio.Event) -> None:
+        if self._blocked_users is not None:
+            logger.info("proactive worker waiting for the blocked users list")
+            if not await self._blocked_users.wait_loaded(stop):
+                return
         await self._queue.initialize()
         while not stop.is_set():
             reclaimed = await self._queue.reclaim_ready()

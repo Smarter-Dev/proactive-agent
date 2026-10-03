@@ -15,6 +15,7 @@ from proactive_agent.agent import (
     self_compaction_summary,
 )
 from proactive_agent.api import ApplicationAPI
+from proactive_agent.blocked_users import BlockedUsers
 from proactive_agent.capabilities import (
     HandlerAuthor,
     ImageCapabilities,
@@ -47,6 +48,7 @@ async def run() -> None:
         base_url=settings.api_base_url,
         api_key=settings.proactive_agent_api_key,
     )
+    blocked_users = BlockedUsers(api, redis_client, component="worker")
     discord = DiscordREST(bot_token=settings.discord_bot_token)
     history_repository = GuildHistoryRepository(redis_client, api)
     history_writer = DebouncedHistoryWriter(
@@ -135,7 +137,8 @@ async def run() -> None:
         runtimes,
         concurrency=settings.proactive_worker_concurrency,
         max_attempts=settings.proactive_max_attempts,
-        services=(privacy_purges,),
+        services=(blocked_users, privacy_purges),
+        blocked_users=blocked_users,
     )
     health = HealthServer(redis_client, api, port=settings.proactive_health_port)
     await health.start()

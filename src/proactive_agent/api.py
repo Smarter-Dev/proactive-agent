@@ -7,7 +7,11 @@ from typing import Any
 
 import httpx
 
-from proactive_agent.contracts import EnabledChannel, HistorySnapshot
+from proactive_agent.contracts import (
+    BlockedUsersList,
+    EnabledChannel,
+    HistorySnapshot,
+)
 
 
 class ApplicationAPIError(Exception):
@@ -115,6 +119,10 @@ class ApplicationAPI:
                 "entries": entries,
             },
         )
+
+    async def get_blocked_users(self) -> BlockedUsersList:
+        response = await self._request("GET", "/privacy/blocked-users")
+        return BlockedUsersList.model_validate(response.json())
 
     async def post_privacy_ack(
         self,

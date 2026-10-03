@@ -103,3 +103,11 @@ class PurgeCommand(BaseModel):
         return f"PurgeCommand(run_id={self.run_id}, guilds={len(self.guild_ids)})"
 
     __str__ = __repr__
+
+
+class BlockedUsersList(BaseModel):
+    """``GET /api/privacy/blocked-users``: users whose messages never reach
+    the model. Purges add to it today; the opt-out list takes it over (#74)."""
+
+    revision: int = Field(ge=0)
+    user_ids: list[Snowflake]
