@@ -25,13 +25,29 @@ from proactive_agent.history import (
     GuildHistoryRepository,
     StaleHistoryError,
 )
-from proactive_agent.keys import checkpoint_key, control_stream_key, purge_epoch_key
+from proactive_agent.keys import (
+    checkpoint_key,
+    control_stream_key,
+    history_key,
+    purge_epoch_key,
+)
 from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
 from proactive_agent.response_fitting import split_for_discord
 from proactive_agent.types import ActivationResult
 
 MEMORY_REFRESH_SECONDS = 3600
+# One round trip at wake start: the guild's purge epoch and the revision of
+# the v1 history snapshot (matched as text, never decoding the history).
+_STORE_STATE_LUA = """
+local epoch = redis.call('GET', KEYS[1]) or ''
+local current = redis.call('GET', KEYS[2])
+local revision = ''
+if current then
+  revision = string.match(current, '"revision":(%d+)') or ''
+end
+return {epoch, revision}
+"""
 HISTORY_FETCH_LIMIT = 60
 # One dropped wake is worth saying out loud; a broken model or a poisoned
 # history would otherwise repeat it every few minutes for hours.
@@ -49,6 +65,12 @@ def failure_notice_text(error: str) -> str:
         f"```{detail}```\n"
         "I'll stay quiet about any further failures for the next 6 hours."
     )
+
+
+def _decode_or_none(value) -> str | None:
+    if value is None or value in (b"", ""):
+        return None
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 def render_memory_block(memory: dict | None) -> str:
@@ -123,12 +145,12 @@ class GuildRuntime:
     memory_block: str = ""
     memory_refreshed_at: float = 0
     # The guild's purge-epoch value the in-RAM history was loaded under.
-    purge_epoch: bytes | None = None
+    purge_epoch: str | None = None
 
     async def process(self, batch: WakeBatch) -> ActivationResult:
         if batch.guild_id != self.guild_id:
             raise ValueError("wake batch crossed guild runtime boundary")
-        await self._sync_purge_epoch()
+        await self._sync_with_store()
         enabled_rows = await self.api.list_enabled_channels(self.guild_id)
         enabled_channels: dict[str, str] = {}
         instruction_stores: dict[str, InstructionStore] = {}
@@ -296,18 +318,31 @@ class GuildRuntime:
         self.memory_block = ""
         self.memory_refreshed_at = 0
 
-    async def _sync_purge_epoch(self) -> None:
-        """One GET per wake: reload if a purge ran since this history loaded.
+    async def _sync_with_store(self) -> None:
+        """One Redis call per wake, before the model runs.
 
-        Another replica (or this one's purge consumer) may have replaced the
-        guild's history; saving on top of the stale in-RAM copy would bring
-        the purged user's words back.
+        - The purge epoch moved: a purge replaced the guild's history, so
+          history AND memory are reloaded (saving on the stale in-RAM copy
+          would bring the purged user's words back).
+        - The stored v1 revision differs from the one this runtime holds:
+          another replica ran the guild's last wake, so history is reloaded.
+          Without this the wake would run and only then have its save
+          refused by the compare-on-revision backstop.
         """
-        epoch = await self.redis.get(purge_epoch_key(self.guild_id))
-        if self.history_loaded and epoch == self.purge_epoch:
-            return
+        raw_epoch, raw_revision = await self.redis.eval(
+            _STORE_STATE_LUA,
+            2,
+            purge_epoch_key(self.guild_id),
+            history_key(self.guild_id),
+        )
+        epoch = _decode_or_none(raw_epoch)
+        revision = _decode_or_none(raw_revision)
         if self.history_loaded:
-            self.forget_history()
+            if epoch != self.purge_epoch:
+                self.forget_history()
+            elif revision != str(self.history_revision):
+                self.history_loaded = False
+                self.engine.agent_runner.history = []
         self.purge_epoch = epoch
 
     async def _load_history(self) -> None:

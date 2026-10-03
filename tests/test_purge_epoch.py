@@ -108,9 +108,9 @@ async def test_registry_forget_resets_a_cached_runtime(redis_client):
 
 
 async def test_a_stale_writer_cannot_overwrite_a_purged_snapshot(redis_client):
-    # A wake that lost its lease (or ran on a stale replica) tries to save
-    # revision 4 after a purge stored revision 10: refused, and the runtime
-    # drops its stale in-RAM copy.
+    # The backstop: a wake that lost its lease mid-run, after its start-of-
+    # wake check, tries to save revision 4 over the purge's revision 10.
+    # Refused, and the runtime drops its stale in-RAM copy.
     api = FakeAPI()
     api.addenda[GUILD] = {CHANNEL: ""}
     repository = GuildHistoryRepository(redis_client, api)
@@ -119,11 +119,15 @@ async def test_a_stale_writer_cannot_overwrite_a_purged_snapshot(redis_client):
         build_snapshot(GUILD, dump(raw_history_with_target()), revision=3)
     )
     runtime = make_runtime(redis_client, api, repository, writer)
-    await runtime._sync_purge_epoch()
-    await runtime._load_history()
     purged = build_snapshot(GUILD, [], revision=10)
-    writer.discard(GUILD)
-    assert await repository.cache(purged)
+    real_wake = runtime.engine.wake
+
+    async def purge_lands_mid_wake(**kwargs):
+        writer.discard(GUILD)
+        assert await repository.cache(purged)
+        return await real_wake(**kwargs)
+
+    runtime.engine.wake = purge_lands_mid_wake
 
     with pytest.raises(StaleHistoryError):
         await runtime.process(batch())
@@ -149,3 +153,28 @@ async def test_an_unreadable_v1_snapshot_does_not_block_the_postgres_copy(
 
     assert await repository.load(GUILD) == durable
     assert await repository.load_canonical(GUILD) == durable
+
+
+async def test_alternating_replicas_hand_off_without_stale_saves(redis_client):
+    # Wakes alternate between two replicas. Each must notice at wake start
+    # that the other stored a newer revision, reload, and save on top of
+    # it: no StaleHistoryError, no lost wake.
+    api = FakeAPI()
+    api.addenda[GUILD] = {CHANNEL: ""}
+    replicas = []
+    for _ in range(2):
+        repository = GuildHistoryRepository(redis_client, api)
+        writer = DebouncedHistoryWriter(repository, api, debounce_seconds=60)
+        replicas.append(make_runtime(redis_client, api, repository, writer))
+
+    for turn in range(6):
+        await replicas[turn % 2].process(batch())
+
+    stored = await replicas[0].history_repository.load(GUILD)
+    assert stored.revision == 6
+    assert len(stored.history) == 12  # every wake's request/response pair
+    # The replica that ran the last wake started from the other's save.
+    assert replicas[1].engine.seen_histories[-1].count('"wake"') == 5
+    assert api.memory_reads == 2  # a hand-off reloads history, not memory
+    for runtime in replicas:
+        await runtime.history_writer.close(timeout=1)
