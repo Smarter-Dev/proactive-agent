@@ -548,3 +548,80 @@ async def test_a_22_digit_guild_id_from_the_contract_is_purged(redis_client, wor
     ]
     assert await redis_client.get(purge_epoch_key(long_guild)) == b"1"
     await replica.writer.close(timeout=1)
+
+
+async def test_v1_write_failing_after_the_put_falls_back_to_postgres(
+    redis_client, world
+):
+    api = world
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+
+    async def broken_cache(_snapshot):
+        raise ConnectionError("redis write lost")
+
+    replica.repository.cache = broken_cache
+    await replica.consumer.initialize()
+    await submit(redis_client, command())
+
+    await replica.consumer.poll_once()
+
+    assert not await redis_client.exists(history_key(GUILD))
+    assert not leaks(json.dumps(api.durable[GUILD].history))
+    assert await redis_client.get(purge_epoch_key(GUILD)) == b"1"
+    assert api.acks[0]["outcome"] == "purged"
+    # The next load reads the purged Postgres copy, never the legacy key.
+    loaded = await GuildHistoryRepository(redis_client, api).load(GUILD)
+    assert loaded == api.durable[GUILD]
+    await replica.writer.close(timeout=1)
+
+
+async def test_v1_write_and_delete_both_failing_acks_failed(redis_client, world):
+    api = world
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+
+    async def broken(*_args):
+        raise ConnectionError("redis down")
+
+    replica.repository.cache = broken
+    replica.repository.forget = broken
+    await replica.consumer.initialize()
+    await submit(redis_client, command())
+
+    await replica.consumer.poll_once()
+
+    assert api.acks[0]["outcome"] == "failed"
+    assert api.acks[0]["detail"] == "purge: ConnectionError"
+    assert not await redis_client.exists(purge_epoch_key(GUILD))
+    await replica.writer.close(timeout=1)
+
+
+async def test_purge_put_conflict_is_retried_once_with_a_fresh_revision(
+    redis_client, world
+):
+    api = world
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    real_get = api.get_history
+    reads = []
+
+    async def get_history(guild_id):
+        snapshot = await real_get(guild_id)
+        reads.append(snapshot.revision)
+        if len(reads) == 1:
+            # A stale flush lands between the purge's read and its PUT.
+            api.durable[guild_id] = build_snapshot(
+                guild_id, dump(raw_history_with_target()), revision=4
+            )
+        return snapshot
+
+    api.get_history = get_history
+    await replica.consumer.initialize()
+    await submit(redis_client, command())
+
+    await replica.consumer.poll_once()
+
+    assert reads == [2, 4]
+    assert api.durable[GUILD].revision == 5
+    assert not leaks(json.dumps(api.durable[GUILD].history))
+    assert json.loads(await stored_v1(redis_client))["revision"] == 5
+    assert api.acks[0]["outcome"] == "purged"
+    await replica.writer.close(timeout=1)

@@ -20,7 +20,11 @@ from proactive_agent.agent import OPERATING_POLICY_BRIEF
 from proactive_agent.contracts import ControlCommand, NotificationEnvelope
 from proactive_agent.engine import AgentEngine, render_notifications
 from proactive_agent.environment import ChannelEnvironment, InstructionStore
-from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
+from proactive_agent.history import (
+    DebouncedHistoryWriter,
+    GuildHistoryRepository,
+    StaleHistoryError,
+)
 from proactive_agent.keys import checkpoint_key, control_stream_key, purge_epoch_key
 from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
@@ -234,11 +238,7 @@ class GuildRuntime:
         serialized_history = json.loads(
             ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
         )
-        snapshot = await self.history_writer.save(
-            guild_id=self.guild_id,
-            history=serialized_history,
-            previous_revision=self.history_revision,
-        )
+        snapshot = await self._save_history(serialized_history)
         self.history_revision = snapshot.revision
         await self._record_usage(batch, result, responses)
         return result
@@ -275,6 +275,19 @@ class GuildRuntime:
             (channel_id for channel_id in candidates if channel_id in enabled),
             enabled[0],
         )
+
+    async def _save_history(self, history: list[dict]):
+        try:
+            return await self.history_writer.save(
+                guild_id=self.guild_id,
+                history=history,
+                previous_revision=self.history_revision,
+            )
+        except StaleHistoryError:
+            # Someone else (another replica, or a purge) stored a newer
+            # revision; this copy is stale and must be reloaded, not kept.
+            self.forget_history()
+            raise
 
     def forget_history(self) -> None:
         """Drop the in-RAM history and memory so the next wake reloads both."""
@@ -344,10 +357,8 @@ class GuildRuntime:
             ModelRequest(parts=[UserPromptPart(note)]),
             ModelResponse(parts=[TextPart("Worker error recorded for the next wake.")]),
         ]
-        snapshot = await self.history_writer.save(
-            guild_id=self.guild_id,
-            history=json.loads(ModelMessagesTypeAdapter.dump_json(updated)),
-            previous_revision=self.history_revision,
+        snapshot = await self._save_history(
+            json.loads(ModelMessagesTypeAdapter.dump_json(updated))
         )
         self.engine.agent_runner.history = updated
         self.history_revision = snapshot.revision

@@ -14,6 +14,36 @@ from proactive_agent.keys import history_key, legacy_history_key, purge_epoch_ke
 
 logger = logging.getLogger(__name__)
 
+# Set the v1 snapshot only over an older revision. HistorySnapshot JSON puts
+# "revision" before "history", so the first match is the snapshot's own
+# field, read without decoding a potentially large history in Lua.
+_CACHE_IF_NEWER_LUA = """
+local current = redis.call('GET', KEYS[1])
+if current then
+  local revision = tonumber(string.match(current, '"revision":(%d+)'))
+  if revision and revision >= tonumber(ARGV[2]) then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+"""
+
+_DELETE_IF_EQUAL_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+class StaleHistoryError(RuntimeError):
+    """The v1 key already holds this revision or a newer one.
+
+    A writer that lost its guild lease (or ran before a purge) must not
+    overwrite what the current owner stored.
+    """
+
 
 def canonical_history(history: list[dict]) -> bytes:
     return json.dumps(
@@ -81,11 +111,22 @@ class GuildHistoryRepository:
             return durable
         return None
 
-    async def cache(self, snapshot: HistorySnapshot) -> None:
+    async def cache(self, snapshot: HistorySnapshot) -> bool:
+        """Set the v1 key only if it holds an older revision (or nothing).
+
+        Returns False, writing nothing, when the stored revision is equal or
+        newer.
+        """
         if not snapshot_is_valid(snapshot):
             raise ValueError("refusing to cache history with an invalid checksum")
-        await self._redis.set(
-            history_key(snapshot.guild_id), snapshot.model_dump_json()
+        return bool(
+            await self._redis.eval(
+                _CACHE_IF_NEWER_LUA,
+                1,
+                history_key(snapshot.guild_id),
+                snapshot.model_dump_json(),
+                snapshot.revision,
+            )
         )
 
     async def _load_redis(self, guild_id: str) -> HistorySnapshot | None:
@@ -96,11 +137,22 @@ class GuildHistoryRepository:
             snapshot = HistorySnapshot.model_validate_json(raw)
         except ValidationError:
             logger.warning("invalid Redis proactive history guild=%s", guild_id)
+            await self._drop_unreadable(guild_id, raw)
             return None
         if snapshot.guild_id != guild_id or not snapshot_is_valid(snapshot):
             logger.warning("mismatched Redis proactive history guild=%s", guild_id)
+            await self._drop_unreadable(guild_id, raw)
             return None
         return snapshot
+
+    async def forget(self, guild_id: str) -> None:
+        """Delete the v1 key so the next load reads the Postgres copy."""
+        await self._redis.delete(history_key(guild_id))
+
+    async def _drop_unreadable(self, guild_id: str, raw) -> None:
+        # An unreadable snapshot's revision would otherwise block caching
+        # the Postgres copy that replaces it.
+        await self._redis.eval(_DELETE_IF_EQUAL_LUA, 1, history_key(guild_id), raw)
 
     async def _load_legacy(self, guild_id: str) -> HistorySnapshot | None:
         raw = await self._redis.get(legacy_history_key(guild_id))
@@ -146,7 +198,11 @@ class DebouncedHistoryWriter:
         if self._closed:
             raise RuntimeError("history writer is closed")
         snapshot = build_snapshot(guild_id, history, revision=previous_revision + 1)
-        await self._repository.cache(snapshot)
+        if not await self._repository.cache(snapshot):
+            raise StaleHistoryError(
+                f"proactive history revision {snapshot.revision} is stale "
+                f"for guild {guild_id}"
+            )
         current = self._dirty.get(guild_id)
         if current is None or snapshot.revision >= current.revision:
             self._dirty[guild_id] = snapshot
@@ -189,15 +245,45 @@ class DebouncedHistoryWriter:
         """Synchronously replace the guild's history after a privacy purge.
 
         Any dirty copy is discarded, the Postgres recovery copy is written
-        first at a revision above both stores, then the v1 Redis key. If the
-        PUT fails nothing was written; the caller treats the purge as failed.
+        first at a revision above both stores, then the v1 Redis key.
+        - The PUT fails: nothing was written; the error propagates.
+        - The PUT hits 409 (a stale flush landed after the revision read):
+          the revision is read again and the PUT retried once.
+        - The v1 SET fails or is refused after the PUT: the v1 key is
+          deleted so loads fall back to the purged Postgres copy; only if
+          that delete fails too does the error propagate.
         """
         self.discard(guild_id)
-        durable = await self._api.get_history(guild_id)
-        revision = max(previous_revision, durable.revision if durable else 0) + 1
-        snapshot = build_snapshot(guild_id, history, revision=revision)
-        await self._api.put_history(snapshot)
-        await self._repository.cache(snapshot)
+        for attempt in range(2):
+            durable = await self._api.get_history(guild_id)
+            revision = max(previous_revision, durable.revision if durable else 0) + 1
+            snapshot = build_snapshot(guild_id, history, revision=revision)
+            try:
+                await self._api.put_history(snapshot)
+            except Exception as error:
+                if getattr(error, "status_code", None) == 409 and attempt == 0:
+                    logger.warning(
+                        "proactive purged history conflicted, retrying guild=%s",
+                        guild_id,
+                    )
+                    continue
+                raise
+            break
+        try:
+            cached = await self._repository.cache(snapshot)
+        except Exception as error:
+            logger.warning(
+                "proactive purged history cache failed guild=%s type=%s",
+                guild_id,
+                type(error).__name__,
+            )
+            cached = False
+        if not cached:
+            # Raises if Redis cannot delete either: the purge then fails.
+            await self._repository.forget(guild_id)
+            logger.warning(
+                "proactive purged history left only in Postgres guild=%s", guild_id
+            )
         return snapshot
 
     async def flush(self, guild_id: str) -> None:

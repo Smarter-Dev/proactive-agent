@@ -18,9 +18,10 @@ from purge_fakes import (
 from proactive_agent.history import (
     DebouncedHistoryWriter,
     GuildHistoryRepository,
+    StaleHistoryError,
     build_snapshot,
 )
-from proactive_agent.keys import purge_epoch_key
+from proactive_agent.keys import history_key, purge_epoch_key
 from proactive_agent.runtime import GuildRuntimeRegistry
 
 
@@ -64,11 +65,18 @@ async def test_unchanged_epoch_keeps_the_loaded_history(redis_client):
     await redis_client.incr(purge_epoch_key(GUILD))
     runtime = make_runtime(redis_client, api, repository, writer)
 
+    loads = []
+    real_load = repository.load
+
+    async def counting_load(guild_id):
+        loads.append(guild_id)
+        return await real_load(guild_id)
+
+    repository.load = counting_load
     await runtime.process(batch())
-    # A write behind the runtime's back is not reloaded without an epoch bump.
-    await repository.cache(build_snapshot(GUILD, [], revision=50))
     await runtime.process(batch())
 
+    assert loads == [GUILD]
     assert runtime.history_revision == 2
     assert api.memory_reads == 1
     await writer.close(timeout=1)
@@ -97,3 +105,47 @@ async def test_registry_forget_resets_a_cached_runtime(redis_client):
     assert runtime.memory_block == ""
     assert runtime.engine.agent_runner.history == []
     await writer.close(timeout=1)
+
+
+async def test_a_stale_writer_cannot_overwrite_a_purged_snapshot(redis_client):
+    # A wake that lost its lease (or ran on a stale replica) tries to save
+    # revision 4 after a purge stored revision 10: refused, and the runtime
+    # drops its stale in-RAM copy.
+    api = FakeAPI()
+    api.addenda[GUILD] = {CHANNEL: ""}
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(repository, api, debounce_seconds=60)
+    await repository.cache(
+        build_snapshot(GUILD, dump(raw_history_with_target()), revision=3)
+    )
+    runtime = make_runtime(redis_client, api, repository, writer)
+    await runtime._sync_purge_epoch()
+    await runtime._load_history()
+    purged = build_snapshot(GUILD, [], revision=10)
+    writer.discard(GUILD)
+    assert await repository.cache(purged)
+
+    with pytest.raises(StaleHistoryError):
+        await runtime.process(batch())
+
+    assert await repository.load(GUILD) == purged
+    assert runtime.history_loaded is False
+    assert runtime.engine.agent_runner.history == []
+    await writer.close(timeout=1)
+    assert api.puts == []
+
+
+async def test_an_unreadable_v1_snapshot_does_not_block_the_postgres_copy(
+    redis_client,
+):
+    api = FakeAPI()
+    durable = build_snapshot(GUILD, [{"from": "postgres"}], revision=2)
+    api.durable[GUILD] = durable
+    repository = GuildHistoryRepository(redis_client, api)
+    broken = build_snapshot(GUILD, [{"x": 1}], revision=9).model_copy(
+        update={"checksum": "0" * 64}
+    )
+    await redis_client.set(history_key(GUILD), broken.model_dump_json())
+
+    assert await repository.load(GUILD) == durable
+    assert await repository.load_canonical(GUILD) == durable
