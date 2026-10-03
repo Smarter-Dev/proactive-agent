@@ -666,25 +666,8 @@ def fold_boundary(history: list[ModelMessage], keep_messages: int) -> int | None
     return None
 
 
-async def compact_agent_history(
-    history: list[ModelMessage],
-    *,
-    token_limit: int,
-    summarize: Callable[[list[ModelMessage]], Awaitable[str]],
-    keep_messages: int = COMPACTION_KEEP_MESSAGES,
-) -> list[ModelMessage]:
-    """Fold old wakes into a summary once the history outgrows the limit.
-
-    Both halves are cut on a turn boundary, so neither the folded half nor
-    the kept tail ever splits a tool call from its return.
-    """
-    if estimated_history_tokens(history) <= token_limit:
-        return history
-    cut = fold_boundary(history, keep_messages)
-    if not cut:
-        return history
-    old, tail = history[:cut], history[cut:]
-    summary = await summarize(old)
+def memory_note_pair(summary: str) -> list[ModelMessage]:
+    """The standard two-message memory note that replaces folded history."""
     return [
         ModelRequest(
             parts=[
@@ -705,8 +688,181 @@ async def compact_agent_history(
                 )
             ]
         ),
-        *tail,
     ]
+
+
+async def compact_agent_history(
+    history: list[ModelMessage],
+    *,
+    token_limit: int,
+    summarize: Callable[[list[ModelMessage]], Awaitable[str]],
+    keep_messages: int = COMPACTION_KEEP_MESSAGES,
+) -> list[ModelMessage]:
+    """Fold old wakes into a summary once the history outgrows the limit.
+
+    Both halves are cut on a turn boundary, so neither the folded half nor
+    the kept tail ever splits a tool call from its return.
+    """
+    if estimated_history_tokens(history) <= token_limit:
+        return history
+    cut = fold_boundary(history, keep_messages)
+    if not cut:
+        return history
+    old, tail = history[:cut], history[cut:]
+    summary = await summarize(old)
+    return [*memory_note_pair(summary), *tail]
+
+
+PRIVACY_PURGE_PROMPT = """\
+PRIVACY PURGE. A member of this community has asked to be forgotten. Their
+Discord user id is {user_id}{names_clause}. Everything above this message will
+be replaced by the memory note you write now; nothing else of it survives.
+
+Write the note exactly as you would for a normal compaction (rules below),
+with one overriding difference: leave this person out entirely.
+- Nothing they said, asked, shared or did, and nothing you learned about them
+or from them.
+- Never write their user id, any of their names, a mention of them, or a
+description that would identify them.
+- Keep everyone else: their conversations, commitments, preferences and facts.
+Where someone else's words only made sense as a reply to this person, keep
+what the other person said or decided without attributing anything to the
+person being forgotten.
+- Do not say that anyone was removed, that a purge happened, or that anything
+is missing.
+
+Normal compaction rules:
+{compaction_rules}"""
+
+PRIVACY_ID_RETRY_PROMPT = """\
+Your note still contains the user id {user_id}, or is empty. Write the whole
+note again, without that id and without anything else about the person being
+forgotten. Reply with the complete note only."""
+
+PRIVACY_NAME_RETRY_PROMPT = """\
+Your note still uses a name of the person being forgotten. Write the whole note
+again without any of their names and without anything else about them. If a
+word only coincides with one of the names and refers to something else, keep
+it. Reply with the complete note only."""
+
+PRIVACY_MAX_ID_RETRIES = 2
+PRIVACY_MAX_NAME_RETRIES = 1
+
+
+class PrivacyCompactionError(RuntimeError):
+    """The model could not write a valid purged note. Content-free message."""
+
+
+@dataclass(frozen=True)
+class PrivacyNote:
+    text: str
+    # Whole-word name matches left after the retry; allowed, but reported.
+    name_hits: int
+    attempts: int
+    usage: dict
+
+
+def build_privacy_purge_prompt(user_id: str, names: list[str]) -> str:
+    names_clause = (
+        "; they have appeared under these names: "
+        + ", ".join(f'"{name}"' for name in names)
+        if names
+        else ""
+    )
+    return PRIVACY_PURGE_PROMPT.format(
+        user_id=user_id,
+        names_clause=names_clause,
+        compaction_rules=COMPACTION_PROMPT,
+    )
+
+
+def _word_char(character: str) -> bool:
+    return character.isalnum() or character == "_"
+
+
+def name_hits(text: str, names: list[str]) -> list[str]:
+    """Names that occur in ``text`` as whole words, case-insensitively."""
+    folded = text.casefold()
+    found = []
+    for name in names:
+        needle = name.strip().casefold()
+        if not needle:
+            continue
+        start = 0
+        while (index := folded.find(needle, start)) != -1:
+            end = index + len(needle)
+            before = index == 0 or not _word_char(folded[index - 1])
+            after = end == len(folded) or not _word_char(folded[end])
+            if before and after:
+                found.append(name)
+                break
+            start = index + 1
+    return found
+
+
+async def privacy_compaction_summary(
+    model: Model | str,
+    messages: list[ModelMessage],
+    *,
+    user_id: str,
+    names: list[str],
+    max_id_retries: int = PRIVACY_MAX_ID_RETRIES,
+    max_name_retries: int = PRIVACY_MAX_NAME_RETRIES,
+) -> PrivacyNote:
+    """The agent's own memory note, rewritten by its own model without one user.
+
+    The note may never contain the user id (or be empty): the model is asked
+    again up to ``max_id_retries`` times, then PrivacyCompactionError is
+    raised and the caller must leave the stored history untouched. A
+    whole-word name match is asked about once more and then accepted (and
+    reported), because a name can be an ordinary word.
+    """
+    compaction_agent = Agent(model, output_type=str)
+    prompt = build_privacy_purge_prompt(user_id, names)
+    history: list[ModelMessage] = list(messages)
+    usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
+    id_retries = name_retries = attempts = 0
+    while True:
+        attempts += 1
+        result = await compaction_agent.run(prompt, message_history=history or None)
+        for key, value in usage_dict(result.usage).items():
+            usage[key] += value
+        note = str(result.output)
+        if user_id in note or not note.strip():
+            if id_retries >= max_id_retries:
+                raise PrivacyCompactionError(
+                    f"purged note still held the user id or was empty after "
+                    f"{attempts} attempts"
+                )
+            id_retries += 1
+            history = result.all_messages()
+            prompt = PRIVACY_ID_RETRY_PROMPT.format(user_id=user_id)
+            continue
+        hits = name_hits(note, names)
+        if hits and name_retries < max_name_retries:
+            name_retries += 1
+            history = result.all_messages()
+            prompt = PRIVACY_NAME_RETRY_PROMPT
+            continue
+        return PrivacyNote(
+            text=note, name_hits=len(hits), attempts=attempts, usage=usage
+        )
+
+
+async def purge_agent_history(
+    history: list[ModelMessage],
+    *,
+    summarize: Callable[[list[ModelMessage]], Awaitable[str]],
+) -> list[ModelMessage]:
+    """Fold the WHOLE history, no kept tail, into the memory-note pair.
+
+    Unlike compact_agent_history nothing is kept verbatim: every raw message
+    may hold the purged user's words, so all of it goes through the model.
+    An empty history has nothing to fold and is returned as is.
+    """
+    if not history:
+        return history
+    return memory_note_pair(await summarize(list(history)))
 
 
 @dataclass
