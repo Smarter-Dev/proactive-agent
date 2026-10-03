@@ -78,6 +78,24 @@ class ChannelMessage:
 
 
 @dataclass(frozen=True)
+class BlockedMessage:
+    """A message whose author is on the blocked-users list.
+
+    It keeps only its place in the channel: no id, author, timestamp,
+    content, reply, mentions, attachments or roles, so nothing of it can
+    reach the model, be looked up, replied to or reacted to.
+    """
+
+    id: None = None
+    author_id: None = None
+    is_bot: bool = False
+    blocked: bool = True
+
+    def to_record(self) -> dict:
+        return {"blocked": True}
+
+
+@dataclass(frozen=True)
 class ActivationContext:
     channel_name: str
     guild_name: str

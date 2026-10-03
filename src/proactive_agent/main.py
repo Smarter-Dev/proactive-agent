@@ -49,7 +49,9 @@ async def run() -> None:
         api_key=settings.proactive_agent_api_key,
     )
     blocked_users = BlockedUsers(api, redis_client, component="worker")
-    discord = DiscordREST(bot_token=settings.discord_bot_token)
+    discord = DiscordREST(
+        bot_token=settings.discord_bot_token, blocked_users=blocked_users
+    )
     history_repository = GuildHistoryRepository(redis_client, api)
     history_writer = DebouncedHistoryWriter(
         history_repository,
