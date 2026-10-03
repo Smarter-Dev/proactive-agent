@@ -532,3 +532,19 @@ async def test_run_loop_survives_errors_and_stops(redis_client, world):
 
     assert api.acks[0]["outcome"] == "purged"
     await replica.writer.close(timeout=1)
+
+
+async def test_a_22_digit_guild_id_from_the_contract_is_purged(redis_client, world):
+    api = world
+    long_guild = "1" * 22
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    await replica.consumer.initialize()
+    await submit(redis_client, command(long_guild))
+
+    await replica.consumer.poll_once()
+
+    assert [(ack["guild_id"], ack["outcome"]) for ack in api.acks] == [
+        (long_guild, "unchanged")
+    ]
+    assert await redis_client.get(purge_epoch_key(long_guild)) == b"1"
+    await replica.writer.close(timeout=1)

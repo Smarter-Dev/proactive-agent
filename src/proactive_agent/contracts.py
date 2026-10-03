@@ -66,7 +66,7 @@ class HistorySnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal[1] = 1
-    guild_id: str = Field(pattern=r"^[0-9]{1,20}$")
+    guild_id: str = Field(pattern=r"^[0-9]{1,22}$")
     revision: int = Field(ge=0)
     checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
     history: list[dict]

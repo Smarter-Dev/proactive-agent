@@ -10,7 +10,8 @@ LEGACY_HISTORY_PREFIX = "proactive:guild-history"
 
 
 def guild_tag(guild_id: str) -> str:
-    if not guild_id.isdigit() or len(guild_id) > 20:
+    # Up to 22 digits, as the privacy purge contract allows for snowflakes.
+    if not guild_id.isdigit() or len(guild_id) > 22:
         raise ValueError("guild_id must be a Discord snowflake")
     return f"{{guild:{guild_id}}}"
 

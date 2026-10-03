@@ -301,8 +301,6 @@ class PrivacyPurgeConsumer:
     async def purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         """Purge one guild. Never raises; failures come back as an outcome."""
         stores: list[str] = []
-        if not guild_id.isdigit() or len(guild_id) > 20:
-            return GuildOutcome("failed", stores, "guild id outside supported range")
         try:
             fence = await self._acquire_fence(guild_id)
         except Exception as error:
