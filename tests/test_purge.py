@@ -659,3 +659,51 @@ async def test_a_working_consumers_entry_is_not_reclaimed(redis_client, world):
     assert [ack["outcome"] for ack in api.acks] == ["purged"]
     await replica_a.writer.close(timeout=1)
     await replica_b.writer.close(timeout=1)
+
+
+async def test_a_purge_waits_for_a_running_wake_then_purges_its_save(
+    redis_client, world
+):
+    api = world
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    runtime = await replica.runtimes.get(GUILD)
+    engine = runtime.engine
+    in_wake = asyncio.Event()
+    finish_wake = asyncio.Event()
+    real_wake = engine.wake
+
+    async def slow_wake(**kwargs):
+        in_wake.set()
+        await finish_wake.wait()
+        return await real_wake(**kwargs)
+
+    engine.wake = slow_wake
+    lease = await replica.queue.acquire_lease(GUILD)
+
+    async def wake_under_lease():
+        async with lease:
+            await runtime.process(batch())
+            return runtime.history_revision
+
+    wake_task = asyncio.create_task(wake_under_lease())
+    await in_wake.wait()
+    await replica.consumer.initialize()
+    await submit(redis_client, command())
+    purge_task = asyncio.create_task(replica.consumer.poll_once())
+    await asyncio.sleep(0.1)
+
+    assert api.acks == []  # the purge is waiting for the lease
+    assert not await redis_client.exists(purge_epoch_key(GUILD))
+    finish_wake.set()
+    wake_revision = await wake_task
+    assert await purge_task == 1
+
+    v1 = json.loads(await stored_v1(redis_client))
+    assert v1["revision"] > wake_revision
+    assert not leaks(json.dumps(v1))
+    assert "ship Rust 1.95" in json.dumps(v1)
+    assert not leaks(json.dumps(api.durable[GUILD].history))
+    assert api.acks[0]["outcome"] == "purged"
+    await asyncio.sleep(0.15)  # the wake's dirty copy never reaches Postgres
+    assert not leaks(json.dumps(api.durable[GUILD].history))
+    await replica.writer.close(timeout=1)
