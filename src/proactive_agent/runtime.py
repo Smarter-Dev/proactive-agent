@@ -21,7 +21,7 @@ from proactive_agent.contracts import ControlCommand, NotificationEnvelope
 from proactive_agent.engine import AgentEngine, render_notifications
 from proactive_agent.environment import ChannelEnvironment, InstructionStore
 from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
-from proactive_agent.keys import checkpoint_key, control_stream_key
+from proactive_agent.keys import checkpoint_key, control_stream_key, purge_epoch_key
 from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
 from proactive_agent.response_fitting import split_for_discord
@@ -118,10 +118,13 @@ class GuildRuntime:
     history_revision: int = 0
     memory_block: str = ""
     memory_refreshed_at: float = 0
+    # The guild's purge-epoch value the in-RAM history was loaded under.
+    purge_epoch: bytes | None = None
 
     async def process(self, batch: WakeBatch) -> ActivationResult:
         if batch.guild_id != self.guild_id:
             raise ValueError("wake batch crossed guild runtime boundary")
+        await self._sync_purge_epoch()
         enabled_rows = await self.api.list_enabled_channels(self.guild_id)
         enabled_channels: dict[str, str] = {}
         instruction_stores: dict[str, InstructionStore] = {}
@@ -160,7 +163,10 @@ class GuildRuntime:
             )
 
         await self._load_history()
-        if time.monotonic() - self.memory_refreshed_at >= MEMORY_REFRESH_SECONDS:
+        if (
+            not self.memory_refreshed_at
+            or time.monotonic() - self.memory_refreshed_at >= MEMORY_REFRESH_SECONDS
+        ):
             self.memory_block = render_memory_block(
                 await self.api.get_memory(self.guild_id)
             )
@@ -269,6 +275,27 @@ class GuildRuntime:
             (channel_id for channel_id in candidates if channel_id in enabled),
             enabled[0],
         )
+
+    def forget_history(self) -> None:
+        """Drop the in-RAM history and memory so the next wake reloads both."""
+        self.history_loaded = False
+        self.engine.agent_runner.history = []
+        self.memory_block = ""
+        self.memory_refreshed_at = 0
+
+    async def _sync_purge_epoch(self) -> None:
+        """One GET per wake: reload if a purge ran since this history loaded.
+
+        Another replica (or this one's purge consumer) may have replaced the
+        guild's history; saving on top of the stale in-RAM copy would bring
+        the purged user's words back.
+        """
+        epoch = await self.redis.get(purge_epoch_key(self.guild_id))
+        if self.history_loaded and epoch == self.purge_epoch:
+            return
+        if self.history_loaded:
+            self.forget_history()
+        self.purge_epoch = epoch
 
     async def _load_history(self) -> None:
         if self.history_loaded:
@@ -485,6 +512,12 @@ class GuildRuntimeRegistry:
             runtime = await self._factory(guild_id)
             self._runtimes[guild_id] = runtime
         return runtime
+
+    def forget(self, guild_id: str) -> None:
+        """Make a cached runtime reload its history and memory next wake."""
+        runtime = self._runtimes.get(guild_id)
+        if runtime is not None:
+            runtime.forget_history()
 
     @property
     def guild_ids(self) -> frozenset[str]:
