@@ -57,17 +57,49 @@ async def test_failed_refresh_keeps_the_last_list_and_logs_no_ids(redis_client, 
     assert not any(TARGET in record.getMessage() for record in caplog.records)
 
 
-async def test_an_older_revision_never_replaces_a_newer_list(redis_client):
+async def test_a_lower_revision_after_a_restore_still_replaces_the_list(
+    redis_client, caplog
+):
     api = ListAPI()
     api.blocked = {"revision": 5, "user_ids": [TARGET]}
     blocked = BlockedUsers(api, redis_client)
     await blocked.refresh()
-    api.blocked = {"revision": 4, "user_ids": []}
+    api.blocked = {"revision": 2, "user_ids": ["222222222222222222"]}
 
-    await blocked.refresh()
+    assert await blocked.refresh()
 
-    assert blocked.is_blocked(TARGET)
+    assert not blocked.is_blocked(TARGET)
+    assert blocked.is_blocked("222222222222222222")
+    assert blocked.revision == 2
+    assert await redis_client.get(privacy_enforcing_key("worker")) == b"2"
+    assert "revision went back" in caplog.text
+
+
+async def test_the_aggregate_is_the_minimum_over_live_replicas(redis_client):
+    api_new, api_old = ListAPI(), ListAPI()
+    api_new.blocked = {"revision": 5, "user_ids": [TARGET]}
+    api_old.blocked = {"revision": 3, "user_ids": []}
+    current = BlockedUsers(api_new, redis_client, replica_id="a")
+    lagging = BlockedUsers(api_old, redis_client, replica_id="b")
+
+    await lagging.refresh()
+    await current.refresh()
+
+    # The replica still on revision 3 holds the component key down, so the
+    # purge job cannot believe every worker blocks the revision-5 user.
+    assert await redis_client.get(privacy_enforcing_key("worker")) == b"3"
+    assert await redis_client.get(privacy_enforcing_key("worker") + ":a") == b"5"
+    assert await redis_client.ttl(privacy_enforcing_key("worker") + ":b") <= 180
+
+    api_old.blocked = {"revision": 5, "user_ids": [TARGET]}
+    await lagging.refresh()
     assert await redis_client.get(privacy_enforcing_key("worker")) == b"5"
+
+    # A replica that died stops counting once its own key expires.
+    api_new.blocked = {"revision": 6, "user_ids": [TARGET]}
+    await redis_client.delete(privacy_enforcing_key("worker") + ":b")
+    await current.refresh()
+    assert await redis_client.get(privacy_enforcing_key("worker")) == b"6"
 
 
 async def test_cold_start_retries_with_backoff_until_the_first_list(redis_client):

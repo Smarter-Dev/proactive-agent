@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -37,6 +38,7 @@ from proactive_agent.response_fitting import split_for_discord
 from proactive_agent.types import ActivationResult
 
 MEMORY_REFRESH_SECONDS = 3600
+_SNOWFLAKE_PATTERN = re.compile(r"(?<![0-9])([0-9]{15,22})(?![0-9])")
 # One round trip at wake start: the guild's purge epoch and the revision of
 # the v1 history snapshot (matched as text, never decoding the history).
 _STORE_STATE_LUA = """
@@ -146,6 +148,10 @@ class GuildRuntime:
     memory_refreshed_at: float = 0
     # The guild's purge-epoch value the in-RAM history was loaded under.
     purge_epoch: str | None = None
+    store_synced: bool = False
+    # Anything with is_blocked(user_id); notification bodies naming a
+    # blocked user's id never reach the brief. None blocks nobody.
+    blocked_users: object = None
 
     async def process(self, batch: WakeBatch) -> ActivationResult:
         if batch.guild_id != self.guild_id:
@@ -155,7 +161,7 @@ class GuildRuntime:
         enabled_channels: dict[str, str] = {}
         instruction_stores: dict[str, InstructionStore] = {}
         persisted_addenda: dict[str, str] = {}
-        notifications = list(batch.notifications)
+        notifications = self._without_blocked(batch.notifications)
         for row in enabled_rows:
             channel = await self.discord.channel(row.channel_id)
             channel_name = channel.get("name") or row.channel_id
@@ -225,6 +231,7 @@ class GuildRuntime:
 
         async def drain_notifications() -> str:
             arrived, dropped = await self.queue.drain_midrun(batch)
+            arrived = tuple(self._without_blocked(arrived))
             if not arrived:
                 return "No new notifications."
             return render_notifications(arrived, dropped)
@@ -311,6 +318,22 @@ class GuildRuntime:
             self.forget_history()
             raise
 
+    def _without_blocked(self, notifications) -> list[NotificationEnvelope]:
+        """Drop notifications whose body names a blocked user's id.
+
+        The producer stops emitting them; this is the backstop for anything
+        queued before the user was blocked.
+        """
+        if self.blocked_users is None:
+            return list(notifications)
+        kept = []
+        for notification in notifications:
+            ids = _SNOWFLAKE_PATTERN.findall(notification.body)
+            if any(self.blocked_users.is_blocked(user_id) for user_id in ids):
+                continue
+            kept.append(notification)
+        return kept
+
     def forget_history(self) -> None:
         """Drop the in-RAM history and memory so the next wake reloads both."""
         self.history_loaded = False
@@ -337,13 +360,15 @@ class GuildRuntime:
         )
         epoch = _decode_or_none(raw_epoch)
         revision = _decode_or_none(raw_revision)
-        if self.history_loaded:
-            if epoch != self.purge_epoch:
-                self.forget_history()
-            elif revision != str(self.history_revision):
-                self.history_loaded = False
-                self.engine.agent_runner.history = []
+        if self.store_synced and epoch != self.purge_epoch:
+            # Also when history is not loaded: a cached memory block from
+            # before the purge must be refetched too.
+            self.forget_history()
+        elif self.history_loaded and revision != str(self.history_revision):
+            self.history_loaded = False
+            self.engine.agent_runner.history = []
         self.purge_epoch = epoch
+        self.store_synced = True
 
     async def _load_history(self) -> None:
         if self.history_loaded:

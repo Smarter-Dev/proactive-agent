@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import socket
 
@@ -48,7 +49,10 @@ async def run() -> None:
         base_url=settings.api_base_url,
         api_key=settings.proactive_agent_api_key,
     )
-    blocked_users = BlockedUsers(api, redis_client, component="worker")
+    replica_id = f"{socket.gethostname()}-{os.getpid()}"
+    blocked_users = BlockedUsers(
+        api, redis_client, component="worker", replica_id=replica_id
+    )
     discord = DiscordREST(
         bot_token=settings.discord_bot_token, blocked_users=blocked_users
     )
@@ -120,6 +124,7 @@ async def run() -> None:
             image_capabilities=image_capabilities,
             media_reader=media_reader,
             author_handler=author_handler,
+            blocked_users=blocked_users,
         )
 
     runtimes = GuildRuntimeRegistry(build_runtime)
@@ -133,6 +138,7 @@ async def run() -> None:
         # The agent's own model rewrites its own memory.
         model=build_model(settings.proactive_agent_model),
         consumer_name=queue.consumer_name,
+        blocked_users=blocked_users,
     )
     worker = ProactiveWorker(
         queue,

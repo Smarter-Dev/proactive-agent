@@ -88,3 +88,31 @@ PRIVACY_PURGE_STREAM_KEY = "privacy:v1:purge"
 def privacy_enforcing_key(component: str) -> str:
     """Set after each blocked-users fetch; tells the purge job we enforce it."""
     return f"privacy:v1:enforcing:{component}"
+
+
+def history_invalid_key(guild_id: str) -> str:
+    """Tombstone: the v1 history key must not be read (Postgres is newer).
+
+    Set when a purge rewrote Postgres but could neither write nor delete the
+    v1 key; cleared by the next successful v1 write.
+    """
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:history-invalid"
+
+
+def batch_key_pattern(guild_id: str) -> str:
+    """SCAN pattern for the guild's claimed-batch lists (and their counters)."""
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:batch:*"
+
+
+def privacy_enforcing_replica_key(component: str, replica_id: str) -> str:
+    """One replica's own enforcing report; the component key is their minimum."""
+    return f"{privacy_enforcing_key(component)}:{replica_id}"
+
+
+def purge_done_key(component: str, request_id: str) -> str:
+    """Hash guild_id -> outcome JSON of guilds this component finished."""
+    return f"privacy:v1:purge-done:{component}:{request_id}"
+
+
+def purge_deliveries_key(run_id: str) -> str:
+    return f"privacy:v1:purge-deliveries:{run_id}"

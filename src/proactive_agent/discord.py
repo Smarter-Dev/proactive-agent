@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -12,6 +13,8 @@ import httpx
 from proactive_agent.types import BlockedMessage, ChannelMessage
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+_MENTION_PATTERN = re.compile(r"<@!?([0-9]{15,22})>")
+_SNOWFLAKE_PATTERN = re.compile(r"(?<![0-9])([0-9]{15,22})(?![0-9])")
 
 
 class DiscordRESTError(Exception):
@@ -165,13 +168,24 @@ class DiscordREST:
         author = referenced.get("author") or {}
         return author.get("id") is not None and self._blocked(author["id"])
 
-    def _without_blocked_mentions(self, content: str, mentions) -> str:
-        for user in mentions:
-            user_id = str(user["id"])
-            if self._blocked(user_id):
-                for form in (f"<@{user_id}>", f"<@!{user_id}>"):
-                    content = content.replace(form, "@[blocked user]")
-        return content
+    def _without_blocked_ids(self, content: str) -> str:
+        """Scrub blocked users' ids from the text itself.
+
+        Discord's ``mentions`` list misses mentions inside code blocks and
+        anything a bot or webhook wrote, so the content is scanned directly:
+        `<@id>`/`<@!id>` become `@[blocked user]`, a bare id `[blocked user]`.
+        """
+        if self._blocked_users is None:
+            return content
+
+        def mention(match: re.Match) -> str:
+            return "@[blocked user]" if self._blocked(match.group(1)) else match[0]
+
+        def bare(match: re.Match) -> str:
+            return "[blocked user]" if self._blocked(match.group(1)) else match[0]
+
+        content = _MENTION_PATTERN.sub(mention, content)
+        return _SNOWFLAKE_PATTERN.sub(bare, content)
 
     def _message(
         self, record: dict[str, Any], role_names: dict[str, str]
@@ -208,9 +222,7 @@ class DiscordREST:
             author_name=author.get("username") or str(author["id"]),
             author_display=display,
             is_bot=bool(author.get("bot", False)),
-            content=self._without_blocked_mentions(
-                record.get("content") or "", mentions
-            ),
+            content=self._without_blocked_ids(record.get("content") or ""),
             reply_to_id=(
                 str(reference["message_id"])
                 if reference.get("message_id") is not None

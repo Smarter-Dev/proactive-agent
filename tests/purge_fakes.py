@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -226,4 +226,22 @@ def make_runtime(redis_client, api, repository, writer) -> GuildRuntime:
         image_capabilities=None,
         media_reader=None,
         author_handler=None,
+    )
+
+
+def watch_addendum() -> str:
+    expires = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+    return json.dumps(
+        [
+            {
+                "id": "w1",
+                "text": f"wake when {TARGET_NAME} reports back",
+                "expires_at": expires,
+            },
+            {
+                "id": "w2",
+                "text": "watch for nia's Rust 1.95 release",
+                "expires_at": expires,
+            },
+        ]
     )

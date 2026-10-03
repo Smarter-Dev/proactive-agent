@@ -782,14 +782,33 @@ def _word_char(character: str) -> bool:
     return character.isalnum() or character == "_"
 
 
+# Same rule as smarter-dev's PurgeTarget.checked_names: shorter names match
+# too much ordinary text to be checked deterministically (the model still
+# sees them in the purge prompt).
+MIN_CHECKED_NAME_CHARS = 2
+
+
+def checked_names(names: list[str]) -> list[str]:
+    """Names with whitespace collapsed, deduplicated, at least 2 characters."""
+    seen: dict[str, str] = {}
+    for name in names:
+        cleaned = " ".join(name.split())
+        if len(cleaned) >= MIN_CHECKED_NAME_CHARS and cleaned.casefold() not in seen:
+            seen[cleaned.casefold()] = cleaned
+    return list(seen.values())
+
+
+def mentions_target(text: str, user_id: str, names: list[str]) -> bool:
+    """The user id anywhere, or a checked name as a whole word."""
+    return user_id in text or bool(name_hits(text, names))
+
+
 def name_hits(text: str, names: list[str]) -> list[str]:
-    """Names that occur in ``text`` as whole words, case-insensitively."""
+    """Checked names occurring in ``text`` as whole words, case-insensitively."""
     folded = text.casefold()
     found = []
-    for name in names:
-        needle = name.strip().casefold()
-        if not needle:
-            continue
+    for name in checked_names(names):
+        needle = name.casefold()
         start = 0
         while (index := folded.find(needle, start)) != -1:
             end = index + len(needle)
@@ -904,16 +923,17 @@ async def privacy_watch_decisions(
     *,
     user_id: str,
     names: list[str],
-) -> dict[str, str | None]:
+) -> tuple[dict[str, str | None], int]:
     """The agent decides keep/rewrite/drop for each watch instruction.
 
-    Returns the new text per instruction id (None = drop). An entry without a
-    decision is kept as is. Kept or rewritten text holding the user id is
+    Returns the new text per instruction id (None = drop) and the number of
+    kept entries still matching a name. An entry without a decision is kept
+    as is. Kept or rewritten text holding the user id is
     asked about once more, then PrivacyCompactionError is raised; a name
     match after the retry is accepted, as with the memory note.
     """
     if not entries:
-        return {}
+        return {}, 0
     names_clause = (
         "; they have appeared under these names: "
         + ", ".join(f'"{name}"' for name in names)
@@ -941,9 +961,9 @@ async def privacy_watch_decisions(
                 outcome[key] = decision.text.strip()
         kept = [text for text in outcome.values() if text is not None]
         leaks_id = any(user_id in text for text in kept)
-        leaks_name = any(name_hits(text, names) for text in kept)
+        leaks_name = sum(1 for text in kept if name_hits(text, names))
         if not leaks_id and not leaks_name:
-            return outcome
+            return outcome, 0
         if attempt == 0:
             history = result.all_messages()
             prompt = PRIVACY_WATCH_RETRY_PROMPT.format(user_id=user_id)
@@ -952,7 +972,7 @@ async def privacy_watch_decisions(
             raise PrivacyCompactionError(
                 "watch instructions still held the user id after a retry"
             )
-        return outcome
+        return outcome, leaks_name
     raise AssertionError("unreachable")
 
 

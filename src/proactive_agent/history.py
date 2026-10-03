@@ -10,7 +10,12 @@ import logging
 from pydantic import ValidationError
 
 from proactive_agent.contracts import HistorySnapshot
-from proactive_agent.keys import history_key, legacy_history_key, purge_epoch_key
+from proactive_agent.keys import (
+    history_invalid_key,
+    history_key,
+    legacy_history_key,
+    purge_epoch_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +31,7 @@ if current then
   end
 end
 redis.call('SET', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[2])
 return 1
 """
 
@@ -35,6 +41,14 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
+
+
+class PartialPurgeError(RuntimeError):
+    """Postgres holds the purged history but v1 could not be replaced.
+
+    The message names exactly which stores were touched; it holds no
+    content and is used as the purge ack detail.
+    """
 
 
 class StaleHistoryError(RuntimeError):
@@ -90,17 +104,22 @@ class GuildHistoryRepository:
         if snapshot is not None:
             return snapshot
         if not await self._redis.exists(purge_epoch_key(guild_id)):
-            legacy = await self._load_legacy(guild_id)
+            legacy = await self.load_legacy(guild_id)
             if legacy is not None:
                 await self.cache(legacy)
                 return legacy
         return build_snapshot(guild_id, [], revision=0)
 
     async def load_canonical(self, guild_id: str) -> HistorySnapshot | None:
-        """v1 Redis, else the Postgres copy (cached into v1); never legacy."""
-        cached = await self._load_redis(guild_id)
-        if cached is not None:
-            return cached
+        """v1 Redis, else the Postgres copy (cached into v1); never legacy.
+
+        A history-invalid tombstone skips v1: it may hold history a purge
+        already removed from Postgres.
+        """
+        if not await self._redis.exists(history_invalid_key(guild_id)):
+            cached = await self._load_redis(guild_id)
+            if cached is not None:
+                return cached
         durable = await self._api.get_history(guild_id)
         if durable is not None:
             if not snapshot_is_valid(durable):
@@ -122,8 +141,9 @@ class GuildHistoryRepository:
         return bool(
             await self._redis.eval(
                 _CACHE_IF_NEWER_LUA,
-                1,
+                2,
                 history_key(snapshot.guild_id),
+                history_invalid_key(snapshot.guild_id),
                 snapshot.model_dump_json(),
                 snapshot.revision,
             )
@@ -149,12 +169,26 @@ class GuildHistoryRepository:
         """Delete the v1 key so the next load reads the Postgres copy."""
         await self._redis.delete(history_key(guild_id))
 
+    async def invalidate(self, guild_id: str) -> bool:
+        """Best effort: mark v1 unreadable until the next successful write."""
+        try:
+            await self._redis.set(history_invalid_key(guild_id), "1")
+        except Exception as error:
+            logger.error(
+                "proactive history tombstone failed guild=%s type=%s",
+                guild_id,
+                type(error).__name__,
+            )
+            return False
+        return True
+
     async def _drop_unreadable(self, guild_id: str, raw) -> None:
         # An unreadable snapshot's revision would otherwise block caching
         # the Postgres copy that replaces it.
         await self._redis.eval(_DELETE_IF_EQUAL_LUA, 1, history_key(guild_id), raw)
 
-    async def _load_legacy(self, guild_id: str) -> HistorySnapshot | None:
+    async def load_legacy(self, guild_id: str) -> HistorySnapshot | None:
+        """The pre-split embedded bot's history key, as a revision-1 snapshot."""
         raw = await self._redis.get(legacy_history_key(guild_id))
         if not raw:
             return None
@@ -279,8 +313,19 @@ class DebouncedHistoryWriter:
             )
             cached = False
         if not cached:
-            # Raises if Redis cannot delete either: the purge then fails.
-            await self._repository.forget(guild_id)
+            try:
+                await self._repository.forget(guild_id)
+            except Exception as error:
+                logger.error(
+                    "proactive purged history v1 delete failed guild=%s type=%s",
+                    guild_id,
+                    type(error).__name__,
+                )
+                tombstoned = await self._repository.invalidate(guild_id)
+                raise PartialPurgeError(
+                    "postgres:purged v1:unpurged "
+                    + ("v1:tombstoned" if tombstoned else "v1:not-tombstoned")
+                ) from error
             logger.warning(
                 "proactive purged history left only in Postgres guild=%s", guild_id
             )

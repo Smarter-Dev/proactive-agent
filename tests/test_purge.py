@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import fakeredis.aioredis
@@ -16,7 +15,6 @@ from purge_fakes import (
     GUILD,
     TARGET,
     TARGET_NAME,
-    FakeAPI,
     batch,
     dump,
     make_runtime,
@@ -38,6 +36,7 @@ from proactive_agent.history import (
 )
 from proactive_agent.keys import (
     PRIVACY_PURGE_STREAM_KEY,
+    history_invalid_key,
     history_key,
     legacy_history_key,
     ownership_key,
@@ -123,24 +122,6 @@ def command(*guilds: str) -> dict:
     }
 
 
-def watch_addendum() -> str:
-    expires = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
-    return json.dumps(
-        [
-            {
-                "id": "w1",
-                "text": f"wake when {TARGET_NAME} reports back",
-                "expires_at": expires,
-            },
-            {
-                "id": "w2",
-                "text": "watch for nia's Rust 1.95 release",
-                "expires_at": expires,
-            },
-        ]
-    )
-
-
 class Replica:
     """One worker process: its own writer, queue, runtimes and consumer."""
 
@@ -178,22 +159,6 @@ class Replica:
 @pytest.fixture
 def redis_client():
     return fakeredis.aioredis.FakeRedis(decode_responses=False)
-
-
-@pytest.fixture
-async def world(redis_client):
-    """A guild the worker owns, with the target in every store."""
-    api = FakeAPI()
-    api.addenda[GUILD] = {CHANNEL: watch_addendum()}
-    raw = dump(raw_history_with_target())
-    api.durable[GUILD] = build_snapshot(GUILD, raw[:2], revision=2)
-    await redis_client.set(ownership_key(GUILD), "external")
-    await redis_client.set(legacy_history_key(GUILD), json.dumps(raw))
-    await GuildHistoryRepository(redis_client, api).cache(
-        build_snapshot(GUILD, raw, revision=3)
-    )
-    yield api
-    await asyncio.sleep(0)
 
 
 async def submit(redis_client, payload) -> str:
@@ -285,7 +250,11 @@ async def test_legacy_history_cannot_come_back_after_a_purge(redis_client, world
     await replica.writer.close(timeout=1)
 
 
-async def test_second_purge_of_a_clean_history_is_idempotent(redis_client, world):
+async def test_a_purge_of_another_user_skips_an_already_folded_history(
+    redis_client, world
+):
+    # Rule (b): after a purge the history is just the agent's memory note,
+    # so a later purge for someone the note never mentions folds nothing.
     api = world
     calls: list[str] = []
     replica = Replica(redis_client, api, honest_model(calls), name="a")
@@ -294,18 +263,17 @@ async def test_second_purge_of_a_clean_history_is_idempotent(redis_client, world
     await replica.consumer.poll_once()
     first = await stored_v1(redis_client)
 
-    await submit(redis_client, command())
+    other = command()
+    other["user_id"] = "777777777777777777"
+    other["names"] = ["zed"]
+    await submit(redis_client, other)
     await replica.consumer.poll_once()
 
-    second = await stored_v1(redis_client)
-    assert not leaks(second)
-    note = json.loads(first)["history"][0]["parts"][0]["content"]
-    assert json.loads(second)["history"][0]["parts"][0]["content"] == note
-    assert json.loads(second)["revision"] == json.loads(first)["revision"] + 1
-    assert [ack["outcome"] for ack in api.acks] == ["purged", "purged"]
-    # Watch instructions were already clean: no second write.
-    assert "watch_instructions" not in api.acks[1]["stores"]
-    assert await redis_client.get(purge_epoch_key(GUILD)) == b"2"
+    assert await stored_v1(redis_client) == first
+    assert calls == ["note", "watch", "watch"]  # no second fold
+    assert [ack["outcome"] for ack in api.acks] == ["purged", "unchanged"]
+    assert api.acks[1]["detail"] == "history already attributed and clean"
+    assert await redis_client.get(purge_epoch_key(GUILD)) == b"1"
     await replica.writer.close(timeout=1)
 
 
@@ -357,7 +325,7 @@ async def test_failing_summarizer_acks_failed_and_continues_with_next_guild(
         raise RuntimeError(f"provider echoed {TARGET}")
 
     async def no_watch(entries, **_kwargs):
-        return entries
+        return entries, 0
 
     replica = Replica(redis_client, api, honest_model([]), name="a")
     replica.consumer._compact = broken
@@ -467,6 +435,8 @@ async def test_malformed_command_is_dropped_without_logging_it(
 
     assert api.acks == []
     assert await pending_count(redis_client) == 0
+    # Nobody else will XDEL a malformed entry: the consumer does.
+    assert await redis_client.xlen(PRIVACY_PURGE_STREAM_KEY) == 0
     assert not any(leaks(record.getMessage()) for record in caplog.records)
     await replica.writer.close(timeout=1)
 
@@ -482,6 +452,7 @@ async def test_unknown_run_is_dropped_after_the_first_404(redis_client, world):
     await replica.consumer.poll_once()
 
     assert await pending_count(redis_client) == 0
+    assert await redis_client.xlen(PRIVACY_PURGE_STREAM_KEY) == 0  # XDELed
     assert calls == ["note", "watch"]  # the second guild was never started
     await replica.writer.close(timeout=1)
 
@@ -546,7 +517,8 @@ async def test_a_22_digit_guild_id_from_the_contract_is_purged(redis_client, wor
     assert [(ack["guild_id"], ack["outcome"]) for ack in api.acks] == [
         (long_guild, "unchanged")
     ]
-    assert await redis_client.get(purge_epoch_key(long_guild)) == b"1"
+    # Nothing was written, so no epoch bump.
+    assert not await redis_client.exists(purge_epoch_key(long_guild))
     await replica.writer.close(timeout=1)
 
 
@@ -589,9 +561,20 @@ async def test_v1_write_and_delete_both_failing_acks_failed(redis_client, world)
 
     await replica.consumer.poll_once()
 
+    # Postgres was purged, v1 could be neither written nor deleted: v1 is
+    # tombstoned so loads skip it, and the ack names the exact state.
     assert api.acks[0]["outcome"] == "failed"
-    assert api.acks[0]["detail"] == "purge: ConnectionError"
-    assert not await redis_client.exists(purge_epoch_key(GUILD))
+    assert api.acks[0]["detail"] == ("purge: postgres:purged v1:unpurged v1:tombstoned")
+    assert api.acks[0]["stores"] == ["proactive_agent_histories"]
+    assert not leaks(json.dumps(api.durable[GUILD].history))
+    assert leaks(await stored_v1(redis_client))  # still there, but unusable
+    assert await redis_client.exists(history_invalid_key(GUILD))
+    assert await redis_client.get(purge_epoch_key(GUILD)) == b"1"
+    loaded = await GuildHistoryRepository(redis_client, api).load(GUILD)
+    assert loaded == api.durable[GUILD]
+    # Loading re-cached the purged copy over v1 and cleared the tombstone.
+    assert not leaks(await stored_v1(redis_client))
+    assert not await redis_client.exists(history_invalid_key(GUILD))
     await replica.writer.close(timeout=1)
 
 

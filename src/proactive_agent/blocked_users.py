@@ -13,8 +13,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from uuid import uuid4
 
-from proactive_agent.keys import privacy_enforcing_key
+from proactive_agent.keys import (
+    privacy_enforcing_key,
+    privacy_enforcing_replica_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +39,9 @@ class BlockedUsers:
         retry_base_seconds: float = RETRY_BASE_SECONDS,
         retry_max_seconds: float = RETRY_MAX_SECONDS,
         clock=time.monotonic,
+        replica_id: str | None = None,
     ):
+        self.replica_id = replica_id or uuid4().hex
         self._api = api
         self._redis = redis_client
         self._component = component
@@ -78,27 +84,53 @@ class BlockedUsers:
             )
             return False
         if self.revision is not None and listing.revision < self.revision:
+            # A database restore can move the revision back. The server's
+            # answer is still the list to enforce; freezing on the old one
+            # would stop following it for good.
             logger.warning(
-                "blocked users refresh ignored an older revision=%d current=%d",
+                "blocked users revision went back revision=%d previous=%d",
                 listing.revision,
                 self.revision,
             )
-        else:
-            self._user_ids = frozenset(listing.user_ids)
-            self.revision = listing.revision
+        self._user_ids = frozenset(listing.user_ids)
+        self.revision = listing.revision
         self._last_success = self._clock()
         self.loaded.set()
         try:
-            await self._redis.set(
-                privacy_enforcing_key(self._component),
-                str(self.revision),
-                ex=ENFORCING_TTL_SECONDS,
-            )
+            await self._report_enforcing()
         except Exception as error:
             logger.warning(
                 "blocked users enforcing marker failed type=%s", type(error).__name__
             )
         return True
+
+    async def _report_enforcing(self) -> None:
+        """Report this replica, then publish the minimum over live replicas.
+
+        The purge job reads only the component key, so it must never claim
+        a revision some live replica has not loaded yet. Replica keys expire
+        after ENFORCING_TTL_SECONDS, the same window after which a replica
+        that cannot fetch stops taking wakes.
+        """
+        own = privacy_enforcing_replica_key(self._component, self.replica_id)
+        await self._redis.set(own, str(self.revision), ex=ENFORCING_TTL_SECONDS)
+        pattern = f"{privacy_enforcing_key(self._component)}:*"
+        keys = [key async for key in self._redis.scan_iter(match=pattern)]
+        revisions = []
+        for value in await self._redis.mget(keys) if keys else ():
+            if value is None:
+                continue
+            try:
+                revisions.append(int(value))
+            except ValueError:
+                continue
+        if not revisions:
+            revisions = [self.revision]
+        await self._redis.set(
+            privacy_enforcing_key(self._component),
+            str(min(revisions)),
+            ex=ENFORCING_TTL_SECONDS,
+        )
 
     async def run(self, stop: asyncio.Event) -> None:
         failures = 0
