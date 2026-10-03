@@ -4,13 +4,15 @@ Today a privacy purge adds its user here so a wake cannot re-ingest the
 messages that were just purged; the opt-out feature (#74) takes the same list
 over. The list is refreshed in the background; a failed refresh keeps the
 last list read, and until the first fetch succeeds the worker processes no
-wakes at all. Logs never name a user on the list.
+wakes at all. The same holds whenever this process has gone longer than
+ENFORCING_TTL_SECONDS without a successful fetch. Logs never name a user on the list.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from proactive_agent.keys import privacy_enforcing_key
 
@@ -32,6 +34,7 @@ class BlockedUsers:
         refresh_seconds: float = REFRESH_SECONDS,
         retry_base_seconds: float = RETRY_BASE_SECONDS,
         retry_max_seconds: float = RETRY_MAX_SECONDS,
+        clock=time.monotonic,
     ):
         self._api = api
         self._redis = redis_client
@@ -42,6 +45,21 @@ class BlockedUsers:
         self._user_ids: frozenset[str] = frozenset()
         self.revision: int | None = None
         self.loaded = asyncio.Event()
+        self._clock = clock
+        self._last_success: float | None = None
+
+    @property
+    def enforcing(self) -> bool:
+        """True while THIS process's last successful fetch is fresh.
+
+        The shared enforcing key can be kept alive by another replica, so
+        each replica judges itself: past ENFORCING_TTL_SECONDS without a
+        successful fetch it must stop taking wakes until one succeeds.
+        """
+        return (
+            self._last_success is not None
+            and self._clock() - self._last_success < ENFORCING_TTL_SECONDS
+        )
 
     def is_blocked(self, user_id: str | int | None) -> bool:
         return user_id is not None and str(user_id) in self._user_ids
@@ -68,6 +86,7 @@ class BlockedUsers:
         else:
             self._user_ids = frozenset(listing.user_ids)
             self.revision = listing.revision
+        self._last_success = self._clock()
         self.loaded.set()
         try:
             await self._redis.set(
@@ -89,28 +108,27 @@ class BlockedUsers:
                 delay = self._refresh_seconds
             else:
                 failures += 1
-                delay = (
-                    self._refresh_seconds
-                    if self.loaded.is_set()
-                    else min(
-                        self._retry_max_seconds,
-                        self._retry_base_seconds * 2 ** (failures - 1),
-                    )
+                # Retry faster than the refresh interval so a short outage
+                # does not cost the replica its enforcing window.
+                delay = min(
+                    self._refresh_seconds,
+                    self._retry_max_seconds,
+                    self._retry_base_seconds * 2 ** (failures - 1),
                 )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=delay)
             except TimeoutError:
                 pass
 
-    async def wait_loaded(self, stop: asyncio.Event) -> bool:
-        """Block until the first list is loaded; False if stopped first."""
-        if self.loaded.is_set():
-            return True
-        loaded = asyncio.create_task(self.loaded.wait())
-        stopped = asyncio.create_task(stop.wait())
-        try:
-            await asyncio.wait({loaded, stopped}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            loaded.cancel()
-            stopped.cancel()
-        return self.loaded.is_set()
+    async def wait_enforcing(
+        self, stop: asyncio.Event, *, poll_seconds: float = 1
+    ) -> bool:
+        """Block until this process is enforcing; False if stopped first."""
+        while not self.enforcing:
+            if stop.is_set():
+                return False
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
+            except TimeoutError:
+                pass
+        return True

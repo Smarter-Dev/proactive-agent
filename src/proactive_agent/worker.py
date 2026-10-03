@@ -38,8 +38,9 @@ class ProactiveWorker:
         self._queue = queue
         # Long-running side loops (privacy purges, ...) with run(stop).
         self._services = tuple(services)
-        # No wake runs before the blocked-users list has been read once.
+        # No wake runs unless this process holds a fresh blocked-users list.
         self._blocked_users = blocked_users
+        self._enforcing_poll_seconds = 1.0
         self._runtimes = runtimes
         self._semaphore = asyncio.Semaphore(concurrency)
         self._max_attempts = max_attempts
@@ -56,13 +57,21 @@ class ProactiveWorker:
             stop.set()
             await asyncio.gather(*services, return_exceptions=True)
 
+    async def _wait_enforcing(self, stop: asyncio.Event) -> bool:
+        if self._blocked_users is None or self._blocked_users.enforcing:
+            return True
+        logger.warning("proactive worker paused until the blocked users list loads")
+        return await self._blocked_users.wait_enforcing(
+            stop, poll_seconds=self._enforcing_poll_seconds
+        )
+
     async def _run_wakes(self, stop: asyncio.Event) -> None:
-        if self._blocked_users is not None:
-            logger.info("proactive worker waiting for the blocked users list")
-            if not await self._blocked_users.wait_loaded(stop):
-                return
+        if not await self._wait_enforcing(stop):
+            return
         await self._queue.initialize()
         while not stop.is_set():
+            if not await self._wait_enforcing(stop):
+                return
             reclaimed = await self._queue.reclaim_ready()
             ready = reclaimed or await self._queue.read_ready(block_ms=5_000)
             by_guild: dict[str, list[ReadyRecord]] = {}
@@ -80,6 +89,10 @@ class ProactiveWorker:
             if not await self._queue.externally_owned(guild_id):
                 await self._queue.discard_embedded_ready(guild_id, ready)
                 return
+            if self._blocked_users is not None and not self._blocked_users.enforcing:
+                # Not enforcing the blocked-users list: take no wake lease.
+                await asyncio.sleep(self._enforcing_poll_seconds)
+                continue
             async with self._semaphore:
                 lease = await self._queue.acquire_lease(guild_id)
                 if lease is not None:
