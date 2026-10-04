@@ -223,6 +223,7 @@ async def test_purge_leaves_no_trace_of_the_target_and_keeps_the_bystander(
     assert set(api.acks[0]["stores"]) == {
         "proactive:v1:history",
         "proactive_agent_histories",
+        "proactive:guild-history",
         "watch_instructions",
     }
     assert not leaks(api.acks[0]["detail"])
@@ -240,13 +241,19 @@ async def test_legacy_history_cannot_come_back_after_a_purge(redis_client, world
     await submit(redis_client, command())
     await replica.consumer.poll_once()
 
-    # Lose both newer stores: only the legacy key (with kai) is left.
+    # The worker owned the legacy key and deleted it once v1 and Postgres
+    # held the purged history.
+    assert not await redis_client.exists(legacy_history_key(GUILD))
+    # Even if a raw legacy copy reappears and both newer stores are lost,
+    # it is never restored once the guild has a purge epoch.
+    await redis_client.set(
+        legacy_history_key(GUILD), json.dumps(dump(raw_history_with_target()))
+    )
     await redis_client.delete(history_key(GUILD))
     api.durable.pop(GUILD)
     loaded = await replica.repository.load(GUILD)
 
     assert loaded.history == []
-    assert await redis_client.exists(legacy_history_key(GUILD))
     await replica.writer.close(timeout=1)
 
 
@@ -531,7 +538,7 @@ async def test_v1_write_failing_after_the_put_falls_back_to_postgres(
     async def broken_cache(_snapshot):
         raise ConnectionError("redis write lost")
 
-    replica.repository.cache = broken_cache
+    replica.repository.write_purged = broken_cache
     await replica.consumer.initialize()
     await submit(redis_client, command())
 
@@ -554,8 +561,13 @@ async def test_v1_write_and_delete_both_failing_acks_failed(redis_client, world)
     async def broken(*_args):
         raise ConnectionError("redis down")
 
-    replica.repository.cache = broken
+    real_write, real_forget = (
+        replica.repository.write_purged,
+        replica.repository.forget,
+    )
+    replica.repository.write_purged = broken
     replica.repository.forget = broken
+    replica.consumer._reclaim_idle_ms = 0
     await replica.consumer.initialize()
     await submit(redis_client, command())
 
@@ -570,11 +582,22 @@ async def test_v1_write_and_delete_both_failing_acks_failed(redis_client, world)
     assert leaks(await stored_v1(redis_client))  # still there, but unusable
     assert await redis_client.exists(history_invalid_key(GUILD))
     assert await redis_client.get(purge_epoch_key(GUILD)) == b"1"
+    # Forced retry: the entry stays pending and no done record was kept.
+    assert await pending_count(redis_client) == 1
     loaded = await GuildHistoryRepository(redis_client, api).load(GUILD)
     assert loaded == api.durable[GUILD]
-    # Loading re-cached the purged copy over v1 and cleared the tombstone.
+    # A load never clears the tombstone; only the purge's own write does.
+    assert leaks(await stored_v1(redis_client))
+    assert await redis_client.exists(history_invalid_key(GUILD))
+
+    replica.repository.write_purged = real_write
+    replica.repository.forget = real_forget
+    await replica.consumer.poll_once()  # the reclaimed retry
+
+    assert api.acks[-1]["outcome"] == "purged"
     assert not leaks(await stored_v1(redis_client))
     assert not await redis_client.exists(history_invalid_key(GUILD))
+    assert await pending_count(redis_client) == 0
     await replica.writer.close(timeout=1)
 
 

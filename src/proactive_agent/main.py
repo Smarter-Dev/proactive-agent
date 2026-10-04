@@ -139,6 +139,7 @@ async def run() -> None:
         model=build_model(settings.proactive_agent_model),
         consumer_name=queue.consumer_name,
         blocked_users=blocked_users,
+        replica_id=replica_id,
     )
     worker = ProactiveWorker(
         queue,

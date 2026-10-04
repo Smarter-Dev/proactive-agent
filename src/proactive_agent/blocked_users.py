@@ -18,6 +18,7 @@ from uuid import uuid4
 from proactive_agent.keys import (
     privacy_enforcing_key,
     privacy_enforcing_replica_key,
+    privacy_enforcing_replicas_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,25 @@ REFRESH_SECONDS = 60
 ENFORCING_TTL_SECONDS = 180
 RETRY_BASE_SECONDS = 1
 RETRY_MAX_SECONDS = 30
+
+# KEYS: own replica key, registry set of replica keys, component key.
+# Replica keys are read by name from the registry (single-node Redis).
+_REPORT_ENFORCING_LUA = """
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+redis.call('SADD', KEYS[2], KEYS[1])
+redis.call('EXPIRE', KEYS[2], 86400)
+local lowest = nil
+for _, key in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  local value = tonumber(redis.call('GET', key))
+  if value == nil then
+    redis.call('SREM', KEYS[2], key)
+  elseif lowest == nil or value < lowest then
+    lowest = value
+  end
+end
+redis.call('SET', KEYS[3], tostring(lowest), 'EX', ARGV[2])
+return lowest
+"""
 
 
 class BlockedUsers:
@@ -94,42 +114,39 @@ class BlockedUsers:
             )
         self._user_ids = frozenset(listing.user_ids)
         self.revision = listing.revision
-        self._last_success = self._clock()
-        self.loaded.set()
+        # Taken before the report, so this replica's enforcing window never
+        # outlives the key it wrote.
+        reported_at = self._clock()
         try:
             await self._report_enforcing()
         except Exception as error:
+            # Unreported means not enforcing: the purge job could not see
+            # this replica, so it must not take wakes on the strength of it.
             logger.warning(
                 "blocked users enforcing marker failed type=%s", type(error).__name__
             )
+            return False
+        self._last_success = reported_at
+        self.loaded.set()
         return True
 
     async def _report_enforcing(self) -> None:
-        """Report this replica, then publish the minimum over live replicas.
+        """Report this replica and publish the minimum over live replicas.
 
-        The purge job reads only the component key, so it must never claim
-        a revision some live replica has not loaded yet. Replica keys expire
-        after ENFORCING_TTL_SECONDS, the same window after which a replica
-        that cannot fetch stops taking wakes.
+        One script, so no concurrent report can overwrite the aggregate with
+        a minimum computed before this replica's key existed: the aggregate
+        never exceeds the revision of a replica that is taking wakes.
+        Replica keys expire after ENFORCING_TTL_SECONDS, the same window
+        after which a replica that cannot report stops taking wakes.
         """
-        own = privacy_enforcing_replica_key(self._component, self.replica_id)
-        await self._redis.set(own, str(self.revision), ex=ENFORCING_TTL_SECONDS)
-        pattern = f"{privacy_enforcing_key(self._component)}:*"
-        keys = [key async for key in self._redis.scan_iter(match=pattern)]
-        revisions = []
-        for value in await self._redis.mget(keys) if keys else ():
-            if value is None:
-                continue
-            try:
-                revisions.append(int(value))
-            except ValueError:
-                continue
-        if not revisions:
-            revisions = [self.revision]
-        await self._redis.set(
+        await self._redis.eval(
+            _REPORT_ENFORCING_LUA,
+            3,
+            privacy_enforcing_replica_key(self._component, self.replica_id),
+            privacy_enforcing_replicas_key(self._component),
             privacy_enforcing_key(self._component),
-            str(min(revisions)),
-            ex=ENFORCING_TTL_SECONDS,
+            str(self.revision),
+            ENFORCING_TTL_SECONDS,
         )
 
     async def run(self, stop: asyncio.Event) -> None:

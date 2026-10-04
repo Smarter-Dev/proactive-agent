@@ -54,6 +54,7 @@ from proactive_agent.history import (
     build_snapshot,
 )
 from proactive_agent.keys import (
+    PRIVACY_PURGE_STREAM_KEY,
     READY_STREAM_KEY,
     history_key,
     legacy_history_key,
@@ -186,53 +187,170 @@ def real_runtime(redis_client, api, queue, seen, blocked_users):
     return runtime
 
 
-async def test_queued_notifications_about_the_user_never_reach_the_model(
+OTHER_GUILD = "666666666666666666"
+
+
+def envelope_for(guild_id: str, body: str, *, kind="mention", wakes=True):
+    item = envelope(body, wakes=wakes)
+    return item.model_copy(update={"guild_id": guild_id, "kind": kind})
+
+
+async def publish_to(redis_client, item: NotificationEnvelope) -> None:
+    await redis_client.xadd(
+        wake_stream_key(item.guild_id), {"payload": item.model_dump_json()}
+    )
+    await redis_client.xadd(READY_STREAM_KEY, {"guild_id": item.guild_id})
+
+
+def draining_runtime(redis_client, api, queue, seen, blocked_users, *, arriving):
+    """A real wake whose agent reads notifications once, mid-run, after
+    ``arriving`` notifications were queued while it worked."""
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(list(messages))
+        if len(seen) == 1:
+            for item in arriving:
+                await publish_to(redis_client, item)
+            return ModelResponse(parts=[ToolCallPart("read_notifications", {}, "r1")])
+        return ModelResponse(parts=[TextPart("stayed quiet")])
+
+    runtime = real_runtime(redis_client, api, queue, [], blocked_users)
+    runtime.engine.agent_runner.agent = build_proactive_agent(
+        FunctionModel(respond), system_prompt="s"
+    )
+    return runtime
+
+
+def model_input(seen) -> str:
+    return ModelMessagesTypeAdapter.dump_json(
+        [m for messages in seen for m in messages if isinstance(m, ModelRequest)]
+    ).decode()
+
+
+WILL_ID = "111111111111111111"  # the target, known as "Will"
+BYSTANDER_WILL = (
+    f"You were @mentioned by nia (username nia, id {BYSTANDER}) in message "
+    "id=700000000000000009:\n> Will someone check the build?"
+)
+
+
+async def test_a_purge_discards_everything_queued_before_it_and_nothing_else(
     redis_client, world
 ):
     api = ListAPI()
     api.addenda = world.addenda
+    api.durable = world.durable
+    api.blocked = {"revision": 1, "user_ids": [WILL_ID]}
+    blocked = BlockedUsers(api, redis_client)
+    await blocked.refresh()
+    queue = RedisWakeQueue(redis_client, consumer_name="w")
+    await queue.initialize()
+    # Queued before the purge: a waking mention, a bystander's mention, a
+    # watcher summary naming the user only by an unlisted nickname (pending
+    # and in a claimed batch), and a bystander's "Will" in another guild.
+    await publish_to(redis_client, envelope(KAI_MENTION))
+    await publish_to(redis_client, envelope(NIA_MENTION))
+    nickname_summary = envelope_for(
+        GUILD,
+        "Watcher summary: Billy-boy asked about the vet (relevant message ids: 1)",
+        kind="watcher_summary",
+        wakes=False,
+    )
+    await redis_client.rpush(pending_key(GUILD), nickname_summary.model_dump_json())
+    batch_list = f"proactive:v1:{{guild:{GUILD}}}:batch:crashed"
+    await redis_client.rpush(batch_list, nickname_summary.model_dump_json())
+    await redis_client.set(batch_list + ":dropped", "2")
+    other = envelope_for(OTHER_GUILD, "Will you review my PR?")
+    await publish_to(redis_client, other)
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    await replica.consumer.initialize()
+    will_purge = dict(command(), names=["Will"])
+    await submit(redis_client, will_purge)
+
+    await replica.consumer.poll_once()
+
+    assert api.acks[0]["outcome"] == "purged"
+    assert "notifications_dropped=4" in api.acks[0]["detail"]
+    assert await redis_client.xlen(wake_stream_key(GUILD)) == 0
+    assert await redis_client.llen(pending_key(GUILD)) == 0
+    assert not await redis_client.exists(batch_list)
+    assert not await redis_client.exists(batch_list + ":dropped")
+    # Another guild's queue is untouched, "Will" or not.
+    [(_id, fields)] = await redis_client.xrange(wake_stream_key(OTHER_GUILD))
+    assert b"Will you review my PR?" in fields[b"payload"]
+
+    # After the purge: a bystander's "Will" reaches the model (no name
+    # matching), a notification carrying the user's id does not.
+    await publish_to(redis_client, envelope(BYSTANDER_WILL))
+    await publish_to(redis_client, envelope(f"<@{WILL_ID}> ping"))
+    seen: list = []
+    runtime = real_runtime(redis_client, api, queue, seen, blocked)
+    runtime.history_writer = replica.writer
+    ready = await queue.read_ready(block_ms=1)
+    batch = await queue.build_batch(
+        GUILD, tuple(r for r in ready if r.guild_id == GUILD)
+    )
+    await runtime.process(batch)
+
+    text = model_input(seen)
+    assert "Will someone check the build?" in text
+    assert WILL_ID not in text
+    assert "Billy-boy" not in text and "Miso" not in text
+    assert "release notes are up" not in text  # queued before: discarded
+    await replica.writer.close(timeout=1)
+
+
+async def test_a_notification_queued_during_the_purge_is_filtered_mid_run(
+    redis_client, world
+):
+    api = ListAPI()
+    api.addenda = world.addenda
+    api.durable = world.durable
     api.blocked = {"revision": 1, "user_ids": [TARGET]}
     blocked = BlockedUsers(api, redis_client)
     await blocked.refresh()
     queue = RedisWakeQueue(redis_client, consumer_name="w")
     await queue.initialize()
-    # Queued before the user was blocked: a waking mention, a pending
-    # summary naming them, a claimed batch from a crashed wake, and nia.
-    await publish(redis_client, envelope(KAI_MENTION))
-    await publish(redis_client, envelope(NIA_MENTION))
-    await redis_client.rpush(
-        pending_key(GUILD), envelope(KAI_SUMMARY, wakes=False).model_dump_json()
-    )
-    batch_list = f"proactive:v1:{{guild:{GUILD}}}:batch:crashed"
-    await redis_client.rpush(
-        batch_list, envelope(KAI_SUMMARY, wakes=False).model_dump_json()
-    )
     replica = Replica(redis_client, api, honest_model([]), name="a")
+    real_compact = replica.consumer._compact
+    late_mention = envelope(f"<@{TARGET}> are you there? my cat Miso", wakes=False)
+
+    async def compact(messages, **kwargs):
+        # A producer that has not applied the block list yet queues a
+        # notification while the purge runs (after the discard step).
+        await redis_client.rpush(pending_key(GUILD), late_mention.model_dump_json())
+        return await real_compact(messages, **kwargs)
+
+    replica.consumer._compact = compact
     await replica.consumer.initialize()
     await submit(redis_client, command())
-
     await replica.consumer.poll_once()
+    assert await redis_client.llen(pending_key(GUILD)) == 1  # survived the discard
 
-    assert api.acks[0]["outcome"] == "purged"
-    assert "notifications_dropped=3" in api.acks[0]["detail"]
-    assert await redis_client.llen(pending_key(GUILD)) == 0
-    assert await redis_client.llen(batch_list) == 0
-
-    # A mention queued after the purge by a producer that missed the block.
-    await publish(redis_client, envelope(f"<@{TARGET}> ping from kai"))
+    # A wake starts; while it runs, more arrives and the agent drains it.
+    await publish_to(redis_client, envelope(NIA_MENTION))
     seen: list = []
-    runtime = real_runtime(redis_client, api, queue, seen, blocked)
+    runtime = draining_runtime(
+        redis_client,
+        api,
+        queue,
+        seen,
+        blocked,
+        arriving=[
+            envelope(f"You were @mentioned by kai (id {TARGET}): Miso again"),
+            envelope(BYSTANDER_WILL),
+        ],
+    )
     runtime.history_writer = replica.writer
     ready = await queue.read_ready(block_ms=1)
     batch = await queue.build_batch(GUILD, ready)
     await runtime.process(batch)
 
-    model_input = ModelMessagesTypeAdapter.dump_json(
-        [m for messages in seen for m in messages if isinstance(m, ModelRequest)]
-    ).decode()
-    assert "release notes are up" in model_input
-    assert TARGET not in model_input
-    assert "Miso" not in model_input and "Kai" not in model_input
+    text = model_input(seen)
+    assert "read_notifications" in text  # the drain path ran
+    assert "release notes are up" in text
+    assert "Will someone check the build?" in text  # drained mid-run
+    assert TARGET not in text and "Miso" not in text
     assert not leaks(await stored_v1(redis_client))
     await replica.writer.close(timeout=1)
 
@@ -334,14 +452,46 @@ async def test_deliveries_are_capped(redis_client, world):
     replica.consumer._reclaim_idle_ms = 0
     replica.consumer._max_deliveries = 2
     await replica.consumer.initialize()
-    await submit(redis_client, command())
+    run = command()
+    await submit(redis_client, run)
 
     for _ in range(2):
         await replica.consumer.poll_once()
         assert await pending_count(redis_client) == 1
+    api.ack_status = 404  # the ack endpoint is no help either
     await replica.consumer.poll_once()
 
+    # Dropped for good even though no ack got through: XDELed (it holds
+    # the id and names) and XACKed, with a content-free failed record.
     assert await pending_count(redis_client) == 0
+    assert await redis_client.xlen(PRIVACY_PURGE_STREAM_KEY) == 0
+    done = await redis_client.hgetall(f"privacy:v1:purge-done:worker:{run['run_id']}")
+    assert json.loads(done[GUILD.encode()])["outcome"] in {"purged", "failed"}
+    await replica.writer.close(timeout=1)
+
+
+async def test_delivery_limit_reports_failed_for_unfinished_guilds(redis_client, world):
+    api = world
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    replica.consumer._reclaim_idle_ms = 0
+    replica.consumer._max_deliveries = 0  # the first delivery is over the cap
+    await replica.consumer.initialize()
+    run = command()
+    await submit(redis_client, run)
+
+    await replica.consumer.poll_once()
+
+    assert [(a["outcome"], a["detail"]) for a in api.acks] == [
+        ("failed", "delivery limit reached")
+    ]
+    assert await redis_client.xlen(PRIVACY_PURGE_STREAM_KEY) == 0
+    assert await pending_count(redis_client) == 0
+    done = await redis_client.hgetall(f"privacy:v1:purge-done:worker:{run['run_id']}")
+    assert json.loads(done[GUILD.encode()]) == {
+        "outcome": "failed",
+        "stores": [],
+        "detail": "delivery limit reached",
+    }
     await replica.writer.close(timeout=1)
 
 
@@ -389,12 +539,14 @@ async def test_pre_uid_history_is_folded_once_per_request(redis_client):
     await submit(redis_client, rerun)
     await replica.consumer.poll_once()
 
+    # A new run inspects the history again: it is now a clean memory note,
+    # so nothing is folded or written.
     assert calls == ["note"]  # no model call
     assert json.loads(await stored_v1(redis_client))["revision"] == revision
     assert await redis_client.get(purge_epoch_key(GUILD)) == b"1"
     assert [(ack["run_id"], ack["outcome"]) for ack in api.acks] == [
         (first_run["run_id"], "purged"),
-        (rerun["run_id"], "purged"),
+        (rerun["run_id"], "unchanged"),
     ]
     await replica.writer.close(timeout=1)
 
@@ -476,8 +628,8 @@ async def test_name_hits_after_retry_are_reported(redis_client, world):
 
     ack = api.acks[0]
     assert ack["outcome"] == "purged"
-    assert "history folded attempts=2 name_hits=1" in ack["detail"]
-    assert "watch channels_rewritten=0 name_hits=2" in ack["detail"]
+    assert "history folded attempts=2 history_name_hits=1" in ack["detail"]
+    assert "watch channels_rewritten=0 watch_name_hits=2" in ack["detail"]
     assert TARGET_NAME not in ack["detail"].lower().replace("name_hits", "")
     await replica.writer.close(timeout=1)
 
@@ -518,9 +670,10 @@ async def test_legacy_key_left_alone_once_an_epoch_exists(redis_client, world):
 
     await replica.consumer.poll_once()
 
+    # Never migrated back in; the worker owns the key and deletes it.
     assert not await redis_client.exists(history_key(GUILD))
-    assert await redis_client.exists(legacy_history_key(GUILD))
-    assert api.acks[0]["detail"].startswith("history empty")
+    assert not await redis_client.exists(legacy_history_key(GUILD))
+    assert api.acks[0]["detail"].startswith("history empty; legacy history deleted")
     await replica.writer.close(timeout=1)
 
 

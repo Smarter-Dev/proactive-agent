@@ -109,10 +109,24 @@ def privacy_enforcing_replica_key(component: str, replica_id: str) -> str:
     return f"{privacy_enforcing_key(component)}:{replica_id}"
 
 
-def purge_done_key(component: str, request_id: str) -> str:
-    """Hash guild_id -> outcome JSON of guilds this component finished."""
-    return f"privacy:v1:purge-done:{component}:{request_id}"
+def privacy_enforcing_replicas_key(component: str) -> str:
+    """Set of live replica keys (outside the replica key pattern)."""
+    return f"privacy:v1:enforcing-replicas:{component}"
+
+
+def purge_done_key(component: str, run_id: str) -> str:
+    """Hash guild_id -> outcome JSON of guilds finished in this purge run.
+
+    Keyed by run: only a redelivery of the same run replays it; a new run
+    of the same request inspects every guild again.
+    """
+    return f"privacy:v1:purge-done:{component}:{run_id}"
 
 
 def purge_deliveries_key(run_id: str) -> str:
     return f"privacy:v1:purge-deliveries:{run_id}"
+
+
+def privacy_consumer_key(component: str, replica_id: str) -> str:
+    """Set (EX 180) by a live purge consumer on every loop iteration."""
+    return f"privacy:v1:consumer:{component}:{replica_id}"

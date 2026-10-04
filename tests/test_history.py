@@ -181,7 +181,7 @@ async def test_replace_purged_discards_dirty_copy_and_writes_postgres_first(
         guild_id="111", history=[{"raw": "kai said x"}], previous_revision=0
     )
 
-    purged = await writer.replace_purged(
+    purged, _v1 = await writer.replace_purged(
         "111", [{"note": "clean"}], previous_revision=stale.revision
     )
     await asyncio.sleep(0.1)
@@ -199,7 +199,7 @@ async def test_replace_purged_goes_above_a_newer_postgres_revision(redis_client)
     repository = GuildHistoryRepository(redis_client, api)
     writer = DebouncedHistoryWriter(repository, api)
 
-    purged = await writer.replace_purged(
+    purged, _v1 = await writer.replace_purged(
         "111", [{"note": "clean"}], previous_revision=3
     )
 

@@ -19,10 +19,15 @@ from proactive_agent.keys import (
 
 logger = logging.getLogger(__name__)
 
-# Set the v1 snapshot only over an older revision. HistorySnapshot JSON puts
-# "revision" before "history", so the first match is the snapshot's own
-# field, read without decoding a potentially large history in Lua.
+# Set the v1 snapshot only over an older revision, and never while the
+# guild's history-invalid tombstone exists (only a purge's own write may
+# replace v1 then). HistorySnapshot JSON puts "revision" before "history",
+# so the first match is the snapshot's own field, read without decoding a
+# potentially large history in Lua.
 _CACHE_IF_NEWER_LUA = """
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
 local current = redis.call('GET', KEYS[1])
 if current then
   local revision = tonumber(string.match(current, '"revision":(%d+)'))
@@ -30,6 +35,13 @@ if current then
     return 0
   end
 end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+"""
+
+# A privacy purge's own v1 write: unconditional, and the only write that
+# clears the tombstone.
+_WRITE_PURGED_LUA = """
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('DEL', KEYS[2])
 return 1
@@ -48,6 +60,13 @@ class PartialPurgeError(RuntimeError):
 
     The message names exactly which stores were touched; it holds no
     content and is used as the purge ack detail.
+    """
+
+
+class HistoryUnavailableError(RuntimeError):
+    """The guild's v1 history is tombstoned after a partial purge.
+
+    No wake may run until the purge is retried and clears it.
     """
 
 
@@ -114,7 +133,8 @@ class GuildHistoryRepository:
         """v1 Redis, else the Postgres copy (cached into v1); never legacy.
 
         A history-invalid tombstone skips v1: it may hold history a purge
-        already removed from Postgres.
+        already removed from Postgres. (The Postgres copy is then not cached:
+        only the purge's own write may replace v1.)
         """
         if not await self._redis.exists(history_invalid_key(guild_id)):
             cached = await self._load_redis(guild_id)
@@ -164,6 +184,24 @@ class GuildHistoryRepository:
             await self._drop_unreadable(guild_id, raw)
             return None
         return snapshot
+
+    async def write_purged(self, snapshot: HistorySnapshot) -> None:
+        """The purge's own v1 write: replaces v1 and clears the tombstone."""
+        if not snapshot_is_valid(snapshot):
+            raise ValueError("refusing to cache history with an invalid checksum")
+        await self._redis.eval(
+            _WRITE_PURGED_LUA,
+            2,
+            history_key(snapshot.guild_id),
+            history_invalid_key(snapshot.guild_id),
+            snapshot.model_dump_json(),
+        )
+
+    async def is_invalid(self, guild_id: str) -> bool:
+        return bool(await self._redis.exists(history_invalid_key(guild_id)))
+
+    async def forget_legacy(self, guild_id: str) -> None:
+        await self._redis.delete(legacy_history_key(guild_id))
 
     async def forget(self, guild_id: str) -> None:
         """Delete the v1 key so the next load reads the Postgres copy."""
@@ -275,7 +313,7 @@ class DebouncedHistoryWriter:
 
     async def replace_purged(
         self, guild_id: str, history: list[dict], *, previous_revision: int
-    ) -> HistorySnapshot:
+    ) -> tuple[HistorySnapshot, bool]:
         """Synchronously replace the guild's history after a privacy purge.
 
         Any dirty copy is discarded, the Postgres recovery copy is written
@@ -283,9 +321,11 @@ class DebouncedHistoryWriter:
         - The PUT fails: nothing was written; the error propagates.
         - The PUT hits 409 (a stale flush landed after the revision read):
           the revision is read again and the PUT retried once.
-        - The v1 SET fails or is refused after the PUT: the v1 key is
-          deleted so loads fall back to the purged Postgres copy; only if
-          that delete fails too does the error propagate.
+        - The v1 SET fails after the PUT: the v1 key is deleted so loads
+          fall back to the purged Postgres copy. If that delete fails too,
+          a history-invalid tombstone is set (loads skip v1, every other
+          v1 write is refused) and PartialPurgeError is raised.
+        Returns the snapshot and whether v1 now holds it.
         """
         self.discard(guild_id)
         for attempt in range(2):
@@ -304,7 +344,8 @@ class DebouncedHistoryWriter:
                 raise
             break
         try:
-            cached = await self._repository.cache(snapshot)
+            await self._repository.write_purged(snapshot)
+            cached = True
         except Exception as error:
             logger.warning(
                 "proactive purged history cache failed guild=%s type=%s",
@@ -329,7 +370,7 @@ class DebouncedHistoryWriter:
             logger.warning(
                 "proactive purged history left only in Postgres guild=%s", guild_id
             )
-        return snapshot
+        return snapshot, cached
 
     async def flush(self, guild_id: str) -> None:
         attempt = 0

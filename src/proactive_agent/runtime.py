@@ -24,11 +24,13 @@ from proactive_agent.environment import ChannelEnvironment, InstructionStore
 from proactive_agent.history import (
     DebouncedHistoryWriter,
     GuildHistoryRepository,
+    HistoryUnavailableError,
     StaleHistoryError,
 )
 from proactive_agent.keys import (
     checkpoint_key,
     control_stream_key,
+    history_invalid_key,
     history_key,
     purge_epoch_key,
 )
@@ -48,7 +50,8 @@ local revision = ''
 if current then
   revision = string.match(current, '"revision":(%d+)') or ''
 end
-return {epoch, revision}
+local invalid = tostring(redis.call('EXISTS', KEYS[3]))
+return {epoch, revision, invalid}
 """
 HISTORY_FETCH_LIMIT = 60
 # One dropped wake is worth saying out loud; a broken model or a poisoned
@@ -347,19 +350,31 @@ class GuildRuntime:
         - The purge epoch moved: a purge replaced the guild's history, so
           history AND memory are reloaded (saving on the stale in-RAM copy
           would bring the purged user's words back).
+        - The history-invalid tombstone exists: the in-RAM copy is dropped
+          and the wake refused before the model runs.
         - The stored v1 revision differs from the one this runtime holds:
           another replica ran the guild's last wake, so history is reloaded.
           Without this the wake would run and only then have its save
           refused by the compare-on-revision backstop.
         """
-        raw_epoch, raw_revision = await self.redis.eval(
+        raw_epoch, raw_revision, raw_invalid = await self.redis.eval(
             _STORE_STATE_LUA,
-            2,
+            3,
             purge_epoch_key(self.guild_id),
             history_key(self.guild_id),
+            history_invalid_key(self.guild_id),
         )
         epoch = _decode_or_none(raw_epoch)
         revision = _decode_or_none(raw_revision)
+        if _decode_or_none(raw_invalid) == "1":
+            # A purge rewrote Postgres but could not replace v1. Drop
+            # everything held in RAM and run no wake (no model call, no
+            # Discord action) until the purge's retry clears the tombstone.
+            self.forget_history()
+            self.store_synced = False
+            raise HistoryUnavailableError(
+                f"proactive history tombstoned for guild {self.guild_id}"
+            )
         if self.store_synced and epoch != self.purge_epoch:
             # Also when history is not loaded: a cached memory block from
             # before the purge must be refetched too.

@@ -323,7 +323,15 @@ async def test_a_wake_with_nothing_to_process_is_not_logged_as_completed(caplog)
 
 
 async def test_services_run_beside_the_wake_loop_and_stop_with_it():
-    queue = SimpleNamespace(initialize=AsyncMock())
+    async def read_ready(**_kwargs):
+        await asyncio.sleep(0.005)
+        return ()
+
+    queue = SimpleNamespace(
+        initialize=AsyncMock(),
+        reclaim_ready=AsyncMock(return_value=()),
+        read_ready=AsyncMock(side_effect=read_ready),
+    )
     started = []
 
     class Service:
@@ -332,9 +340,40 @@ async def test_services_run_beside_the_wake_loop_and_stop_with_it():
             await stop.wait()
 
     stop = asyncio.Event()
-    stop.set()
     worker = ProactiveWorker(queue, SimpleNamespace(), services=(Service(),))
-
-    await asyncio.wait_for(worker.run(stop), timeout=1)
+    task = asyncio.create_task(worker.run(stop))
+    await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, timeout=1)
 
     assert started == [True]
+
+
+async def test_a_dead_service_is_restarted():
+    async def read_ready(**_kwargs):
+        await asyncio.sleep(0.005)
+        return ()
+
+    queue = SimpleNamespace(
+        initialize=AsyncMock(),
+        reclaim_ready=AsyncMock(return_value=()),
+        read_ready=AsyncMock(side_effect=read_ready),
+    )
+    runs = []
+
+    class Crashing:
+        async def run(self, stop):
+            runs.append(True)
+            if len(runs) < 3:
+                raise RuntimeError("task died")
+            await stop.wait()
+
+    stop = asyncio.Event()
+    worker = ProactiveWorker(queue, SimpleNamespace(), services=(Crashing(),))
+    worker._service_restart_seconds = 0.001
+    task = asyncio.create_task(worker.run(stop))
+    await asyncio.sleep(0.1)
+    stop.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert len(runs) == 3

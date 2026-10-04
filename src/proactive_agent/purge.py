@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -32,20 +33,21 @@ from proactive_agent.agent import (
     OPERATING_POLICY_BRIEF,
     PrivacyCompactionError,
     PrivacyNote,
-    mentions_target,
     name_hits,
     privacy_compaction_summary,
     privacy_watch_decisions,
     purge_agent_history,
 )
-from proactive_agent.contracts import NotificationEnvelope, PurgeCommand
+from proactive_agent.contracts import PurgeCommand
 from proactive_agent.environment import InstructionStore
 from proactive_agent.history import PartialPurgeError, canonical_history
 from proactive_agent.keys import (
     PRIVACY_PURGE_STREAM_KEY,
     batch_key_pattern,
     lease_key,
+    pending_dropped_key,
     pending_key,
+    privacy_consumer_key,
     privacy_lock_key,
     purge_deliveries_key,
     purge_done_key,
@@ -67,10 +69,12 @@ PRIVACY_LOCK_SECONDS = 600
 # "failed" and is acknowledged, so an outage cannot loop it forever.
 MAX_DELIVERIES = 5
 DONE_TTL_SECONDS = 7 * 24 * 60 * 60
-# Finished guilds are remembered per request, so a re-run of the same
-# request (a new run id) never folds a guild's memory twice.
+# Finished guilds are remembered per run, so a redelivery of the same run
+# never folds a guild twice. A new run of the request inspects every guild
+# again (rule (b) in history_needs_no_fold decides whether to fold).
 PURGE_DONE_TTL_SECONDS = 30 * 24 * 60 * 60
 LIST_WAIT_SECONDS = 5 * 60
+CONSUMER_ALIVE_SECONDS = 180
 LIST_POLL_SECONDS = 5
 FENCE_WAIT_SECONDS = 15 * 60
 FENCE_POLL_SECONDS = 0.5
@@ -79,6 +83,7 @@ STORE_REDIS_HISTORY = "proactive:v1:history"
 STORE_POSTGRES_HISTORY = "proactive_agent_histories"
 STORE_WATCH = "watch_instructions"
 STORE_NOTIFICATIONS = "proactive:v1:notifications"
+STORE_LEGACY_HISTORY = "proactive:guild-history"
 
 _RENEW_LOCK_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -95,7 +100,12 @@ return 0
 """
 
 CompactFn = Callable[..., Awaitable[PrivacyNote]]
-WatchFn = Callable[..., Awaitable[dict[str, str | None]]]
+WatchFn = Callable[..., Awaitable[tuple[dict[str, str | None], int]]]
+
+
+# A transcript line for one member's Discord message, as rendered by
+# render_transcript_line (or the skim model's `[id=…] name (user id …)`).
+_MEMBER_LINE = re.compile(r"^\[id=[0-9]+\] ")
 
 
 def _raw_parts(history: list[dict]):
@@ -114,12 +124,13 @@ def _raw_parts(history: list[dict]):
 def history_needs_no_fold(history: list[dict], user_id: str, names: list[str]) -> bool:
     """True only if folding could not remove anything about the user.
 
-    The whole serialized history must hold neither the id nor a checked
-    name, and every raw line (anything that came from outside the model,
-    except the agent's own memory notes) must carry `uid=` attribution.
-    A raw line without it might name the user under a nickname nobody
-    listed, so it is folded. In practice every wake brief has such lines,
-    so this only skips histories that are already a memory note.
+    - Nothing anywhere may hold the user id or a checked name. That search
+      covers host-written text too: wake briefs, notification bodies and
+      tool output that is not a member's message.
+    - Every member-message line (`[id=…] …`) must carry its author's id
+      (`(uid=…)`, or `(user id …)` in skim output). A member line without
+      it predates author ids and could name the user under a nickname
+      nobody listed, so the history is folded.
     """
     serialized = canonical_history(history).decode()
     if user_id in serialized or name_hits(serialized, names):
@@ -127,7 +138,11 @@ def history_needs_no_fold(history: list[dict], user_id: str, names: list[str]) -
     for text in _raw_parts(history):
         for line in text.splitlines():
             line = line.strip()
-            if line and "(uid=" not in line and line != "[BLOCKED BY USER]":
+            if (
+                _MEMBER_LINE.match(line)
+                and "(uid=" not in line
+                and "(user id " not in line
+            ):
                 return False
     return True
 
@@ -141,6 +156,9 @@ class GuildOutcome:
     outcome: str
     stores: list[str] = field(default_factory=list)
     detail: str = ""
+    # Set when Postgres was purged but v1 could not be replaced: the entry
+    # is kept pending so the purge is retried, and no done record is kept.
+    retry: bool = False
 
 
 class PrivacyLock:
@@ -176,6 +194,10 @@ class Fence:
     holder: object
     external: bool
     lost: bool = False
+
+
+def _join(detail: str, extra: str) -> str:
+    return ("; ".join(item for item in (detail, extra) if item))[:500]
 
 
 def _decode(value) -> str:
@@ -215,6 +237,7 @@ class PrivacyPurgeConsumer:
         max_deliveries: int = MAX_DELIVERIES,
         list_wait_seconds: float = LIST_WAIT_SECONDS,
         list_poll_seconds: float = LIST_POLL_SECONDS,
+        replica_id: str | None = None,
     ):
         if model is None and (compact is None or decide_watch is None):
             raise ValueError("a model is required unless both steps are injected")
@@ -241,6 +264,8 @@ class PrivacyPurgeConsumer:
         self._max_deliveries = max_deliveries
         self._list_wait_seconds = list_wait_seconds
         self._list_poll_seconds = list_poll_seconds
+        self._replica_id = replica_id or consumer_name
+        self._error_backoff_seconds = 5.0
 
     async def initialize(self) -> None:
         try:
@@ -255,6 +280,8 @@ class PrivacyPurgeConsumer:
         initialized = False
         while not stop.is_set():
             try:
+                # Alive marker for the web admin, idle polls included.
+                await self._mark_alive()
                 if not initialized:
                     await self.initialize()
                     initialized = True
@@ -268,7 +295,9 @@ class PrivacyPurgeConsumer:
                     "privacy purge consumer error type=%s", type(error).__name__
                 )
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=5)
+                    await asyncio.wait_for(
+                        stop.wait(), timeout=self._error_backoff_seconds
+                    )
                 except TimeoutError:
                     pass
 
@@ -280,7 +309,9 @@ class PrivacyPurgeConsumer:
             self._consumer_name,
             self._reclaim_idle_ms,
             "0-0",
-            count=10,
+            # One at a time: only the entry in hand is heartbeated, so
+            # nothing else may sit claimed and idle behind it.
+            count=1,
         )
         entries = list(reclaimed[1]) if reclaimed else []
         if not entries:
@@ -306,11 +337,20 @@ class PrivacyPurgeConsumer:
                 await asyncio.gather(heartbeat, return_exceptions=True)
         return len(entries)
 
+    async def _mark_alive(self) -> None:
+        await self._redis.set(
+            privacy_consumer_key(PURGE_COMPONENT, self._replica_id),
+            "1",
+            ex=CONSUMER_ALIVE_SECONDS,
+        )
+
     async def _heartbeat(self, stream_id: str) -> None:
-        """Keep the owned entry's idle time near zero while it is handled."""
+        """Keep the owned entry's idle time near zero while it is handled,
+        and the consumer's alive marker fresh during a long purge."""
         while True:
             await asyncio.sleep(self._heartbeat_seconds)
             try:
+                await self._mark_alive()
                 await self._redis.xclaim(
                     PRIVACY_PURGE_STREAM_KEY,
                     PURGE_GROUP,
@@ -350,7 +390,7 @@ class PrivacyPurgeConsumer:
             len(guild_ids),
             deliveries,
         )
-        done = await self._done(command)
+        done = await self._done(run_id)
         if deliveries > self._max_deliveries:
             await self._give_up(stream_id, command, guild_ids, done)
             return
@@ -364,13 +404,18 @@ class PrivacyPurgeConsumer:
         all_acked = True
         for guild_id in guild_ids:
             if guild_id in done:
-                # Finished on an earlier delivery or run of this request:
-                # never fold again, just re-post the ack for this run.
+                # Finished on an earlier delivery of this run: never fold
+                # again, just re-post the ack.
                 result = done[guild_id]
             else:
                 result = await self.purge_guild(command, guild_id)
-                if result.outcome != "failed":
-                    await self._record_done(command, guild_id, result)
+                if result.retry:
+                    # Forced retry: keep the entry pending, no done record.
+                    all_acked = False
+                elif result.outcome != "failed" and not await self._record_done(
+                    run_id, guild_id, result
+                ):
+                    result.detail = _join(result.detail, "done_record=unsaved")
             logger.info(
                 "privacy purge guild finished run=%s guild=%s outcome=%s",
                 run_id,
@@ -418,6 +463,13 @@ class PrivacyPurgeConsumer:
         return count
 
     async def _give_up(self, stream_id, command, guild_ids, done) -> None:
+        """Delivery limit reached: report what we can, then drop the entry.
+
+        The entry is XDELed even when the ack endpoint is down or the run
+        is unknown, so it never stays stranded holding the id and names.
+        What is left is content-free: this log line and a "failed" done
+        record per unfinished guild.
+        """
         run_id = str(command.run_id)
         logger.error(
             "privacy purge delivery limit reached run=%s limit=%d",
@@ -425,17 +477,16 @@ class PrivacyPurgeConsumer:
             self._max_deliveries,
         )
         for guild_id in guild_ids:
-            result = done.get(guild_id) or GuildOutcome(
-                "failed", [], "delivery limit reached"
-            )
+            result = done.get(guild_id)
+            if result is None:
+                result = GuildOutcome("failed", [], "delivery limit reached")
+                await self._record_done(run_id, guild_id, result)
             if await self._post_ack(run_id, guild_id, result) is False:
                 break
-        await self._ack(stream_id)
+        await self._drop(stream_id)
 
-    async def _done(self, command: PurgeCommand) -> dict[str, GuildOutcome]:
-        raw = await self._redis.hgetall(
-            purge_done_key(PURGE_COMPONENT, str(command.request_id))
-        )
+    async def _done(self, run_id: str) -> dict[str, GuildOutcome]:
+        raw = await self._redis.hgetall(purge_done_key(PURGE_COMPONENT, run_id))
         done = {}
         for guild_id, value in raw.items():
             try:
@@ -448,28 +499,29 @@ class PrivacyPurgeConsumer:
         return done
 
     async def _record_done(
-        self, command: PurgeCommand, guild_id: str, result: GuildOutcome
-    ) -> None:
-        key = purge_done_key(PURGE_COMPONENT, str(command.request_id))
-        try:
-            await self._redis.hset(
-                key,
-                guild_id,
-                json.dumps(
-                    {
-                        "outcome": result.outcome,
-                        "stores": result.stores,
-                        "detail": result.detail,
-                    }
-                ),
-            )
-            await self._redis.expire(key, PURGE_DONE_TTL_SECONDS)
-        except Exception as error:
-            logger.warning(
-                "privacy purge done record failed guild=%s type=%s",
-                guild_id,
-                type(error).__name__,
-            )
+        self, run_id: str, guild_id: str, result: GuildOutcome
+    ) -> bool:
+        """Record a finished guild (tried twice). False if it was not saved."""
+        key = purge_done_key(PURGE_COMPONENT, run_id)
+        value = json.dumps(
+            {
+                "outcome": result.outcome,
+                "stores": result.stores,
+                "detail": result.detail,
+            }
+        )
+        for _attempt in range(2):
+            try:
+                await self._redis.hset(key, guild_id, value)
+                await self._redis.expire(key, PURGE_DONE_TTL_SECONDS)
+                return True
+            except Exception as error:
+                logger.warning(
+                    "privacy purge done record failed guild=%s type=%s",
+                    guild_id,
+                    type(error).__name__,
+                )
+        return False
 
     async def _enforcing_target(self, command: PurgeCommand) -> bool:
         """Wait until THIS process's own list blocks the target.
@@ -500,10 +552,14 @@ class PrivacyPurgeConsumer:
         await self._redis.xack(PRIVACY_PURGE_STREAM_KEY, PURGE_GROUP, stream_id)
 
     async def _drop(self, stream_id: str) -> None:
-        """XACK and XDEL an entry no producer will clean up (malformed or an
-        unknown run): it may still carry a target's id and names."""
-        await self._ack(stream_id)
+        """XDEL, then XACK, an entry no producer will clean up (malformed,
+        unknown run, delivery limit): it may still carry the id and names.
+
+        XDEL goes first: if it fails the entry stays pending and is
+        reclaimed and dropped again, never acknowledged but left behind.
+        """
         await self._redis.xdel(PRIVACY_PURGE_STREAM_KEY, stream_id)
+        await self._ack(stream_id)
 
     async def purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         """Purge one guild. Never raises; failures come back as an outcome."""
@@ -522,7 +578,12 @@ class PrivacyPurgeConsumer:
                 guild_id,
                 type(error).__name__,
             )
-            return GuildOutcome("failed", stores, _error_detail("purge", error))
+            return GuildOutcome(
+                "failed",
+                stores,
+                _error_detail("purge", error),
+                retry=isinstance(error, PartialPurgeError),
+            )
         finally:
             renew_task.cancel()
             await asyncio.gather(renew_task, return_exceptions=True)
@@ -544,7 +605,7 @@ class PrivacyPurgeConsumer:
         stores: list[str],
     ) -> str:
         details: list[str] = []
-        dropped = await self._scrub_notifications(command, guild_id)
+        dropped = await self._discard_notifications(guild_id)
         if dropped:
             stores.append(STORE_NOTIFICATIONS)
             details.append(f"notifications_dropped={dropped}")
@@ -581,48 +642,35 @@ class PrivacyPurgeConsumer:
                 raise
         self._runtimes.forget(guild_id)
 
-    async def _scrub_notifications(self, command: PurgeCommand, guild_id: str) -> int:
-        """Drop queued raw notifications about the user (stream, pending, batches).
+    async def _discard_notifications(self, guild_id: str) -> int:
+        """Discard every notification queued for the guild before the purge.
 
-        They are verbatim copies made before the user was blocked; a later
-        wake would otherwise put them into the freshly purged history.
+        Wake stream entries, the pending list and claimed batch lists are
+        raw copies of channel activity made before the user was blocked,
+        and pending triggers rather than memory, so all of them go, without
+        trying to recognise the user by name. Anything queued after this
+        point was produced under the block list. The dead-letter stream is
+        not touched.
         """
-        names = list(command.names)
-
-        def involves_target(payload) -> bool:
-            text = _decode(payload) if payload is not None else ""
-            try:
-                body = NotificationEnvelope.model_validate_json(text).body
-            except (ValidationError, ValueError):
-                body = text
-            return mentions_target(text, command.user_id, names) or mentions_target(
-                body, command.user_id, names
-            )
-
         dropped = 0
         stream = wake_stream_key(guild_id)
-        entries = await self._redis.xrange(stream)
-        drop_ids = [
-            _decode(stream_id)
-            for stream_id, fields in entries
-            if involves_target(fields.get(b"payload", fields.get("payload")))
+        entry_ids = [
+            _decode(entry_id) for entry_id, _fields in await self._redis.xrange(stream)
         ]
-        if drop_ids:
+        if entry_ids:
             try:
-                await self._redis.xack(stream, WAKE_GROUP, *drop_ids)
+                await self._redis.xack(stream, WAKE_GROUP, *entry_ids)
             except ResponseError:
                 pass  # no consumer group yet: nothing was delivered
-            await self._redis.xdel(stream, *drop_ids)
-            dropped += len(drop_ids)
-        list_keys = [pending_key(guild_id)]
+            await self._redis.xdel(stream, *entry_ids)
+            dropped += len(entry_ids)
+        keys = [pending_key(guild_id), pending_dropped_key(guild_id)]
         async for key in self._redis.scan_iter(match=batch_key_pattern(guild_id)):
-            key = _decode(key)
-            if not key.endswith(":dropped"):
-                list_keys.append(key)
-        for key in list_keys:
-            for value in await self._redis.lrange(key, 0, -1):
-                if involves_target(value):
-                    dropped += int(await self._redis.lrem(key, 0, value))
+            keys.append(_decode(key))
+        for key in keys:
+            if not key.endswith("dropped"):
+                dropped += int(await self._redis.llen(key))
+            await self._redis.delete(key)
         return dropped
 
     async def _purge_history(
@@ -633,37 +681,48 @@ class PrivacyPurgeConsumer:
         stores: list[str],
     ) -> tuple[str, bool]:
         """Returns (detail, whether the stored history was rewritten)."""
+        names = list(command.names)
+        tombstoned = await self._repository.is_invalid(guild_id)
+        legacy = await self._repository.load_legacy(guild_id)
         snapshot = await self._repository.load_canonical(guild_id)
         migrated = False
-        if snapshot is None and not await self._redis.exists(purge_epoch_key(guild_id)):
+        if (
+            snapshot is None
+            and legacy is not None
+            and not await self._redis.exists(purge_epoch_key(guild_id))
+        ):
             # Only the pre-split legacy key holds this guild's memory. Bumping
             # the epoch without carrying it over would reset the agent's
             # memory, so it is migrated (folded first if needed).
-            snapshot = await self._repository.load_legacy(guild_id)
-            migrated = snapshot is not None
+            snapshot = legacy
+            migrated = True
+        # The worker owns the legacy key of an external guild: it is deleted
+        # once v1 and Postgres both hold the purged history.
+        drop_legacy = fence.external and legacy is not None
         if snapshot is None or not snapshot.history:
+            if drop_legacy:
+                await self._repository.forget_legacy(guild_id)
+                stores.append(STORE_LEGACY_HISTORY)
+                return "history empty; legacy history deleted", False
             return "history empty", False
-        if not migrated and history_needs_no_fold(
-            snapshot.history, command.user_id, list(command.names)
-        ):
+        clean = history_needs_no_fold(snapshot.history, command.user_id, names)
+        # A clean history is still written when the write itself is needed:
+        # to migrate legacy, to clear a tombstone, or before deleting legacy.
+        if clean and not (migrated or tombstoned or drop_legacy):
             return "history already attributed and clean", False
-        history: list[ModelMessage] = list(
-            ModelMessagesTypeAdapter.validate_json(json.dumps(snapshot.history))
-        )
         notes: list[PrivacyNote] = []
 
         async def summarize(messages: list[ModelMessage]) -> str:
-            note = await self._compact(
-                messages, user_id=command.user_id, names=list(command.names)
-            )
+            note = await self._compact(messages, user_id=command.user_id, names=names)
             notes.append(note)
             return note.text
 
-        if migrated and history_needs_no_fold(
-            snapshot.history, command.user_id, list(command.names)
-        ):
+        if clean:
             serialized = snapshot.history
         else:
+            history: list[ModelMessage] = list(
+                ModelMessagesTypeAdapter.validate_json(json.dumps(snapshot.history))
+            )
             purged = await purge_agent_history(history, summarize=summarize)
             serialized = json.loads(ModelMessagesTypeAdapter.dump_json(purged))
         # Belt and braces over the note validator: nothing written may hold
@@ -672,19 +731,26 @@ class PrivacyPurgeConsumer:
             raise PurgeFailed("purged history still held the user id")
         if fence.lost:
             raise PurgeFailed("fence lost before the history write")
-        await self._writer.replace_purged(
+        _snapshot, v1_written = await self._writer.replace_purged(
             guild_id, serialized, previous_revision=snapshot.revision
         )
         stores.extend([STORE_POSTGRES_HISTORY, STORE_REDIS_HISTORY])
+        details = []
+        if migrated:
+            details.append("legacy history migrated")
         note = notes[-1] if notes else None
-        prefix = "legacy history migrated; " if migrated else ""
         if note is None:
-            return f"{prefix}history kept", True
-        return (
-            f"{prefix}history folded attempts={note.attempts} "
-            f"name_hits={note.name_hits}",
-            True,
-        )
+            details.append("history kept")
+        else:
+            details.append(
+                f"history folded attempts={note.attempts} "
+                f"history_name_hits={note.name_hits}"
+            )
+        if drop_legacy and v1_written:
+            await self._repository.forget_legacy(guild_id)
+            stores.append(STORE_LEGACY_HISTORY)
+            details.append("legacy history deleted")
+        return "; ".join(details), True
 
     async def _purge_watch(
         self,
@@ -729,7 +795,9 @@ class PrivacyPurgeConsumer:
         if changed:
             stores.append(STORE_WATCH)
         if changed or name_hits_kept:
-            return f"watch channels_rewritten={changed} name_hits={name_hits_kept}"
+            return (
+                f"watch channels_rewritten={changed} watch_name_hits={name_hits_kept}"
+            )
         return ""
 
     async def _acquire_fence(self, guild_id: str) -> Fence:
