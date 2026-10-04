@@ -13,8 +13,8 @@ from test_purge import Replica, command, honest_model, submit
 from proactive_agent.api import ApplicationAPI
 
 # sha256 of smarter-dev's contracts/privacy/v1/purge_ack.schema.json
-# (build/privacy-agent-purge 70d895b2). Update only by copying that file.
-SMARTER_DEV_SHA256 = "00879077dd732d6babdf8658d7b15269b962049576622d7ca9abd67d7b10d0c3"
+# (build/privacy-agent-purge 47e1cd0f). Update only by copying that file.
+SMARTER_DEV_SHA256 = "145aa55471e522afa55a04e16e13bbf7a14cb4304e3fe2483fa4b7d0de8e7492"
 
 
 def test_schema_is_the_byte_identical_smarter_dev_copy():
@@ -53,6 +53,9 @@ async def test_the_api_client_sends_a_schema_valid_body():
         await api.close()
 
     ACK_VALIDATOR.validate(bodies[0])
+    # The web answers 400 to any field the schema does not list.
+    assert set(bodies[0]) <= set(ACK_VALIDATOR.schema["properties"])
+    assert "mixed_segments" not in bodies[0]
     assert set(bodies[0]) == {
         "component",
         "guild_id",
