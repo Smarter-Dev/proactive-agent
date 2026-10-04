@@ -367,14 +367,21 @@ class GuildRuntime:
         epoch = _decode_or_none(raw_epoch)
         revision = _decode_or_none(raw_revision)
         if _decode_or_none(raw_invalid) == "1":
-            # A purge rewrote Postgres but could not replace v1. Drop
-            # everything held in RAM and run no wake (no model call, no
-            # Discord action) until the purge's retry clears the tombstone.
+            # A purge rewrote Postgres but could not replace v1. The Postgres
+            # copy is the purged one: under this wake's guild lease, restore
+            # v1 from it and carry on. Only when Postgres does not hold the
+            # purged revision does the wake defer (no model call, no Discord
+            # action) and the guild stay tombstoned.
             self.forget_history()
             self.store_synced = False
-            raise HistoryUnavailableError(
-                f"proactive history tombstoned for guild {self.guild_id}"
-            )
+            self.history_writer.discard(self.guild_id)
+            if not await self.history_repository.recover_tombstone(self.guild_id):
+                raise HistoryUnavailableError(
+                    f"proactive history tombstoned for guild {self.guild_id}"
+                )
+            self.purge_epoch = epoch
+            self.store_synced = True
+            return
         if self.store_synced and epoch != self.purge_epoch:
             # Also when history is not loaded: a cached memory block from
             # before the purge must be refetched too.

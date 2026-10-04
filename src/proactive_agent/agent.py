@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import logging
 import math
 import re
@@ -874,41 +873,120 @@ def mentions_target(text: str, user_id: str, names: list[str]) -> bool:
 #
 # A purge must never become a reset: an output that refuses, says nothing,
 # or drops everyone else is rejected (asked again; when retries run out the
-# step fails and every stored byte stays as it was). See purge-contract.md.
+# step fails and every stored byte stays as it was). The rule is specified
+# in purge-contract.md ("Fold plausibility rule privacy:v1") and exercised
+# by contracts/privacy/v1/fold_plausibility_vectors.json.
 
 PRIVACY_MODEL_TIMEOUT_SECONDS = 120
 PRIVACY_MAX_PLAUSIBILITY_RETRIES = 2
 FOLD_MIN_CHARS = 40
+FOLD_REFUSAL_WINDOW = 200
+# Matched on the normalised text (see _normalise_prose) at word boundaries,
+# within the first FOLD_REFUSAL_WINDOW characters only.
 FOLD_REFUSALS = (
-    "i can't",
-    "i cannot",
-    "i'm sorry",
-    "i am sorry",
-    "i'm unable",
-    "i am unable",
     "as an ai",
+    "i am not able to",
+    "i am sorry, but",
+    "i am unable to",
+    "i can't assist",
+    "i can't comply",
+    "i can't do that",
+    "i can't fulfill",
+    "i can't help",
+    "i can't provide",
+    "i cannot assist",
+    "i cannot do that",
+    "i cannot fulfill",
+    "i cannot help",
+    "i cannot provide",
+    "i must decline",
+    "i will not be able",
+    "i will not help",
+    "i won't assist",
+    "i won't be able",
+    "i won't do that",
+    "i won't help",
+    "i won't provide",
+    "i'm afraid i can't",
+    "i'm afraid i cannot",
+    "i'm not able to",
+    "i'm sorry but",
+    "i'm sorry, but",
+    "i'm unable to",
 )
 FOLD_BYSTANDER_MIN = 200
 FOLD_LENGTH_RATIO = 0.05
 FOLD_LENGTH_CAP = 400
 FOLD_RETENTION_SHARE = 0.5
+FOLD_RETENTION_CAP = 8
+FOLD_TOKEN_SAMPLE = 12
+FOLD_TOKEN_SHARE = 0.25
+FOLD_RARE_WORD_MIN = 6
+FOLD_DISPLAY_MIN = 3
 
 # The prefix render_transcript_line writes for a member's message:
 # `[id=<msg>] [BOT] <TAG>·<display> (uid=<author>)( (reply to id=<msg>))?: `
+# The display may not contain ": ", so a pre-uid line whose text happens to
+# hold " (uid=N): " never matches.
 MEMBER_LINE_PREFIX = re.compile(
-    r"^\[id=[0-9]+\] (\[BOT\] )?[A-Z]+·(.*?) \(uid=([0-9]{1,22})\)"
+    r"^\[id=[0-9]+\] (\[BOT\] )?[A-Z]+·((?:(?!: )[^\n])*?) \(uid=([0-9]{1,22})\)"
     r"(?: \(reply to id=[0-9]+\))?: "
 )
+# A member line from before author ids: `[id=<msg>] [BOT] <TAG>·<display>: `.
+_LEGACY_MEMBER_PREFIX = re.compile(
+    r"^\[id=[0-9]+\] (\[BOT\] )?[A-Z]+·((?:(?!: )[^\n])+?): "
+)
 _UID_VALUE = re.compile(r"uid=([0-9]{1,22})")
-# `<display> (uid=N)` anywhere: the display name rendered beside a uid.
-_NAME_BESIDE_UID = re.compile(r"·([^\n·]*?) \(uid=([0-9]{1,22})\)")
+_RARE_WORD = re.compile(r"[^\W\d_]{6,}")  # FOLD_RARE_WORD_MIN letters
+_APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "ʼ": "'", "`": "'", "´": "'"})
+_WHITESPACE = re.compile(r"\s+")
 
 PRIVACY_PLAUSIBILITY_RETRY_PROMPT = """\
-That note cannot replace your memory: {reason}. Your memory of everyone else
+That note cannot replace your memory ({reason}). Your memory of everyone else
 must survive the purge. Write the whole note again: keep every other person,
 conversation, commitment and fact from the transcript, attributed as
 `Name (uid=N)`, leaving out only the person being forgotten. Reply with the
 complete note only."""
+
+
+@functools.cache
+def common_words() -> frozenset[str]:
+    """contracts/privacy/v1/common_words.txt (packaged copy, same bytes)."""
+    from importlib.resources import files
+
+    text = (files("proactive_agent") / "privacy_data" / "common_words.txt").read_text(
+        encoding="utf-8"
+    )
+    return frozenset(line.strip() for line in text.splitlines() if line.strip())
+
+
+@dataclass(frozen=True)
+class FoldRejection:
+    """Why a fold output was rejected: a category and numbers, no content
+    (a refusal names the phrase from the fixed FOLD_REFUSALS list)."""
+
+    category: str
+    detail: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.category} {self.detail}".strip()
+
+
+def _normalise_prose(text: str) -> str:
+    text = unicodedata.normalize("NFC", text).translate(_APOSTROPHES)
+    return _WHITESPACE.sub(" ", text).strip().casefold()
+
+
+def _phrase_at_boundary(haystack: str, phrase: str) -> bool:
+    start = 0
+    while (index := haystack.find(phrase, start)) != -1:
+        end = index + len(phrase)
+        if (index == 0 or not haystack[index - 1].isalnum()) and (
+            end == len(haystack) or not haystack[end].isalnum()
+        ):
+            return True
+        start = index + 1
+    return False
 
 
 def _contains_id(text: str, user_id: str) -> bool:
@@ -924,86 +1002,146 @@ def _contains_id(text: str, user_id: str) -> bool:
     return False
 
 
+def string_leaves(value) -> list[str]:
+    """Every string inside a JSON-like value, decoded (never re-escaped)."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in string_leaves(item)]
+    if isinstance(value, list | tuple):
+        return [leaf for item in value for leaf in string_leaves(item)]
+    return []
+
+
 def fold_input_texts(messages: list[ModelMessage]) -> list[str]:
     """The input parts a fold rule reads: user prompts (briefs, memory notes,
     notifications), tool returns and the agent's text. System prompts and
-    tool-call arguments are not memory and are left out."""
+    tool-call arguments are not memory and are left out; structured content
+    contributes its string leaves, one part each."""
     texts = []
     for message in messages:
         for part in message.parts:
             kind = getattr(part, "part_kind", "")
             if kind not in ("user-prompt", "tool-return", "text"):
                 continue
-            content = getattr(part, "content", None)
-            if isinstance(content, str):
-                texts.append(content)
-            elif content is not None:
-                texts.append(json.dumps(content, ensure_ascii=False, default=str))
+            texts.extend(string_leaves(getattr(part, "content", None)))
     return texts
+
+
+def _credit_display(display: str) -> str | None:
+    folded = normalise_for_match(display.strip())
+    if len(folded) < FOLD_DISPLAY_MIN or folded in common_words():
+        return None
+    return display.strip()
 
 
 def fold_plausibility_problem(
     input_texts: list[str], user_id: str, names: list[str], output: str
-) -> str | None:
-    """Why a fold output cannot replace its input store, or None (privacy:v1).
+) -> FoldRejection | None:
+    """Why a fold output cannot replace its input store, or None.
 
-    1. A non-empty input requires an output (an empty input, empty output).
-    2. Reject a refusal (any FOLD_REFUSALS phrase, case-insensitive), or an
-       output shorter than 40 chars after stripping or without letters,
-       unless the bystander text B is empty (input wholly about the target).
-    3. B = "\\n".join of the input lines (each part split into lines) that
-       contain neither the target id (as a whole number) nor a checked name
-       (whole word, case-insensitive). If len(B) >= 200 the output needs at
-       least max(40, min(0.05 * len(B), 400)) chars.
-    4. U = distinct `uid=N` values in the input other than the target's. If
-       U is not empty, ceil(0.5 * |U|) of them must appear in the output as
-       `uid=N` or as the display name rendered beside that uid in the input
-       (`·<name> (uid=N)`, whole word). The output must never hold the
-       target's id.
+    Shared rule privacy:v1; the normative text is purge-contract.md, section
+    "Fold plausibility rule privacy:v1", in the same order as the code:
+    1. empty input -> output must be empty; the output never holds the
+       target id; 2. B = input lines without the id or a name, B empty ->
+    accept; 3. refusal phrase in the first 200 normalised chars -> reject;
+    4. no bystander lines in B -> accept; 5. too short; 6. length floor;
+    7. retention by members (U) or 8. by sampled tokens (legacy lines).
     """
     text = output.strip()
-    has_input = any(part.strip() for part in input_texts)
-    if not has_input:
-        return "the input was empty but the output is not" if text else None
+    if not any(part.strip() for part in input_texts):
+        return FoldRejection("input_empty_output_not") if text else None
     if _contains_id(output, user_id):
-        return "it still contains the user id"
+        return FoldRejection("target_id")
     lines = [line for part in input_texts for line in part.splitlines()]
-    bystander = "\n".join(
+    b_lines = [
         line
         for line in lines
-        if not _contains_id(line, user_id) and not name_hits(line, names)
-    )
-    folded = text.casefold()
-    if any(phrase in folded for phrase in FOLD_REFUSALS):
-        return "it reads as a refusal"
-    if bystander:
-        if len(text) < FOLD_MIN_CHARS or not any(c.isalpha() for c in text):
-            return "it is too short to carry any memory"
-        if len(bystander) >= FOLD_BYSTANDER_MIN:
-            floor = max(
-                FOLD_MIN_CHARS,
-                min(math.ceil(FOLD_LENGTH_RATIO * len(bystander)), FOLD_LENGTH_CAP),
-            )
-            if len(text) < floor:
-                return f"it is far shorter than what it replaces (needs {floor} chars)"
-    joined = "\n".join(input_texts)
-    uids = {uid for uid in _UID_VALUE.findall(joined) if uid != user_id}
+        if line.strip()
+        and not _contains_id(line, user_id)
+        and not name_hits(line, names)
+    ]
+    if not b_lines:
+        return None
+    bystander = "\n".join(b_lines)
+    head = _normalise_prose(text)[:FOLD_REFUSAL_WINDOW]
+    for phrase in FOLD_REFUSALS:
+        if _phrase_at_boundary(head, phrase):
+            return FoldRejection("refusal", f'phrase="{phrase}"')
+    uids: dict[str, None] = {}
+    displays: dict[str, list[str]] = {}
+    legacy_displays: list[str] = []
+    for line in b_lines:
+        stripped = line.strip()
+        member = MEMBER_LINE_PREFIX.match(stripped)
+        legacy = None if member else _LEGACY_MEMBER_PREFIX.match(stripped)
+        prefix = member or legacy
+        is_bot = bool(prefix and prefix.group(1))
+        for uid in _UID_VALUE.findall(stripped):
+            if uid == user_id or (is_bot and member and uid == member.group(3)):
+                continue  # the target, or the agent's own line
+            uids.setdefault(uid)
+        if prefix and not is_bot:
+            display = _credit_display(prefix.group(2))
+            if member and display:
+                displays.setdefault(member.group(3), []).append(display)
+            if legacy:
+                # Seen even when not creditable: a legacy member line means
+                # bystander text exists without uid attribution.
+                legacy_displays.append(prefix.group(2).strip())
+    if not uids and not legacy_displays:
+        # No bystander has lines in B (host text only): neither the length
+        # floor nor retention applies, so "nothing to carry forward" passes.
+        return None
+    if len(text) < FOLD_MIN_CHARS or not any(c.isalpha() for c in text):
+        return FoldRejection("too_short", f"chars={len(text)} needs={FOLD_MIN_CHARS}")
+    if len(bystander) >= FOLD_BYSTANDER_MIN:
+        floor = max(
+            FOLD_MIN_CHARS,
+            min(math.ceil(FOLD_LENGTH_RATIO * len(bystander)), FOLD_LENGTH_CAP),
+        )
+        if len(text) < floor:
+            return FoldRejection("length_floor", f"chars={len(text)} needs={floor}")
     if uids:
-        displays: dict[str, set[str]] = {}
-        for name, uid in _NAME_BESIDE_UID.findall(joined):
-            if name.strip():
-                displays.setdefault(uid, set()).add(name.strip())
+        members = list(uids)
         kept = sum(
             1
-            for uid in uids
+            for uid in members
             if f"uid={uid}" in text
             or any(name_hits(text, [name]) for name in displays.get(uid, ()))
         )
-        required = math.ceil(FOLD_RETENTION_SHARE * len(uids))
+        required = min(
+            FOLD_RETENTION_CAP, math.ceil(FOLD_RETENTION_SHARE * len(members))
+        )
         if kept < required:
-            return (
-                f"it keeps {kept} of the {len(uids)} other members (needs {required})"
+            return FoldRejection(
+                "retention_members", f"kept={kept} of={len(members)} needs={required}"
             )
+        return None
+    if len(bystander) < FOLD_BYSTANDER_MIN:
+        return None
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for display in legacy_displays:
+        credit = _credit_display(display)
+        if credit and normalise_for_match(credit) not in seen:
+            seen.add(normalise_for_match(credit))
+            tokens.append(credit)
+    for word in _RARE_WORD.findall(bystander):
+        folded = normalise_for_match(word)
+        if folded in seen or folded in common_words():
+            continue
+        seen.add(folded)
+        tokens.append(word)
+    tokens = tokens[:FOLD_TOKEN_SAMPLE]
+    if not tokens:
+        return FoldRejection("no_retention_signal")
+    kept = sum(1 for token in tokens if name_hits(text, [token]))
+    required = math.ceil(FOLD_TOKEN_SHARE * len(tokens))
+    if kept < required:
+        return FoldRejection(
+            "retention_tokens", f"kept={kept} of={len(tokens)} needs={required}"
+        )
     return None
 
 
@@ -1064,7 +1202,7 @@ async def privacy_compaction_summary(
         if problem is not None:
             if plausibility_retries >= max_plausibility_retries:
                 raise PrivacyCompactionError(
-                    f"purged note implausible after {attempts} attempts"
+                    f"purged note implausible after {attempts} attempts: {problem}"
                 )
             plausibility_retries += 1
             history = result.all_messages()

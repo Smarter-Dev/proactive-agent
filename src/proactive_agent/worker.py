@@ -39,7 +39,8 @@ class ProactiveWorker:
         self._queue = queue
         # Long-running side loops (privacy purges, ...) with run(stop).
         self._services = tuple(services)
-        # No wake runs unless this process holds a fresh blocked-users list.
+        # No wake runs until this process has loaded the blocked-users list
+        # once; after that it keeps going on the last list it loaded.
         self._blocked_users = blocked_users
         self._enforcing_poll_seconds = 1.0
         self._service_restart_seconds = 1.0

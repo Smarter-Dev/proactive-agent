@@ -38,8 +38,6 @@ from test_purge import (
 import proactive_agent.agent as agent_module
 from proactive_agent.agent import (
     PrivacyCompactionError,
-    fold_input_texts,
-    fold_plausibility_problem,
     privacy_compaction_summary,
     privacy_watch_decisions,
 )
@@ -99,7 +97,11 @@ async def test_an_implausible_note_fails_and_leaves_every_store(
     assert api.durable[GUILD] == durable_before
     assert not await redis_client.exists(purge_epoch_key(GUILD))
     assert api.acks[0]["outcome"] == "failed"
-    assert api.acks[0]["detail"] == ("purge: purged note implausible after 3 attempts")
+    assert api.acks[0]["detail"].startswith(
+        "purge: purged note implausible after 3 attempts: "
+    )
+    category = api.acks[0]["detail"].split(": ")[2].split()[0]
+    assert category in {"too_short", "refusal", "retention_members"}
     await replica.writer.close(timeout=1)
 
 
@@ -115,94 +117,8 @@ def member_history(*members: tuple[str, str]) -> list[ModelMessage]:
     ]
 
 
-def rule(output, history, names=("kai",)):
-    return fold_plausibility_problem(
-        fold_input_texts(history), TARGET, list(names), output
-    )
-
-
-def test_fold_rule_retention():
-    history = member_history(
-        (BYSTANDER, "nia"),
-        ("333333333333333301", "zed"),
-        ("333333333333333302", "omar"),
-        (TARGET, "kai"),
-    )
-    # U = 3 other uids -> ceil(0.5 * 3) = 2 must appear (uid=N or the name).
-    assert (
-        rule("nia and zed shipped compiler releases 0 and 1 with notes.", history)
-        is None
-    )
-    assert "keeps 1 of the 3" in rule(
-        "nia shipped compiler release 0 with notes; that was all.", history
-    )
-    assert (
-        rule(f"uid={BYSTANDER} and zed shipped compiler releases with notes.", history)
-        is None
-    )
-    # `uid N` without the `uid=` form does not count.
-    assert "keeps 1 of the 3" in rule(
-        f"uid {BYSTANDER} and Zed shipped compiler releases, no one else.", history
-    )
-    assert "user id" in rule(
-        f"nia (uid={BYSTANDER}) and zed shipped; {TARGET} too.", history
-    )
-
-
-def test_fold_rule_trivial_and_refusal():
-    history = member_history((BYSTANDER, "nia"))
-    for refusal in (
-        "As an AI language model I will not rewrite nia's memories here.",
-        "I'm sorry, nia (uid=222222222222222222) cannot be summarised by me.",
-        "I am unable to do this for nia, who shipped compiler release 0.",
-    ):
-        assert "refusal" in rule(refusal, history)
-    assert "too short" in rule("nia ok.", history)
-    assert "too short" in rule(
-        "... --- ... 1234567890 1234567890 1234567890 !!", history
-    )
-
-
-def test_fold_rule_length_floor():
-    # len(B) >= 200 -> output >= max(40, min(0.05 * len(B), 400)) chars.
-    history = member_history((BYSTANDER, "nia"))
-    history[1].parts[0].content += "\nfiller text about compilers" * 400
-    note = "nia shipped compiler release 0 with notes, and talked compilers."
-    assert "needs 400 chars" in rule(note, history)
-    assert rule(note + " " + "x" * 400, history) is None
-
-
-def test_fold_rule_input_wholly_about_the_target():
-    history = [
-        ModelRequest(
-            parts=[
-                ToolReturnPart(
-                    "channel_history",
-                    f"[id=1] A·kai (uid={TARGET}): my cat Miso is sick",
-                    "c1",
-                )
-            ]
-        )
-    ]
-    # B is empty: an empty or short output is allowed, a refusal is not.
-    assert rule("", history) is None
-    assert rule("quiet.", history) is None
-    assert "refusal" in rule("I cannot do that.", history)
-
-
-def test_fold_rule_empty_input_requires_empty_output():
-    assert fold_plausibility_problem([], TARGET, [], "") is None
-    assert "input was empty" in fold_plausibility_problem([], TARGET, [], "note")
-
-
-def test_host_written_parts_count_toward_bystander_text():
-    history = [
-        ModelRequest(parts=[UserPromptPart("Watcher summary: build talk " * 300)]),
-    ]
-    # Host-written text that does not mention the target is bystander text.
-    assert "needs 400 chars" in rule(
-        "The watcher saw build talk again and again, all day long.", history
-    )
+# The rule itself is covered by tests/test_fold_plausibility.py (shared
+# vectors).
 
 
 # Timeouts on the fold and watch calls.
@@ -262,15 +178,16 @@ async def test_a_tombstone_names_its_run_and_is_never_given_up(redis_client, wor
         attempts.append(len(api.acks) - before)
 
     raw = await redis_client.get(history_invalid_key(GUILD))
-    assert json.loads(raw) == {
-        "run_id": run["run_id"],
-        "request_id": run["request_id"],
-    }
+    value = json.loads(raw)
+    assert value["run_id"] == run["run_id"]
+    assert value["request_id"] == run["request_id"]
+    assert value["revision"] == api.durable[GUILD].revision
+    assert set(value) == {"run_id", "request_id", "revision"}
     assert TARGET.encode() not in raw
     assert await redis_client.ttl(history_invalid_key(GUILD)) == -1  # no TTL
-    # Deliveries 1, 2 (= cap + 2^0), 3 (cap + 2^1), then 5 (cap + 2^2):
-    # backoff past the cap, never a give-up, never an XACK.
-    assert attempts == [1, 1, 1, 0, 1, 0]
+    # Retried on every delivery past the cap (backoff capped at the 10 min
+    # reclaim interval), never given up, never XACKed.
+    assert attempts == [1, 1, 1, 1, 1, 1]
     assert await pending_count(redis_client) == 1
     assert all(a["outcome"] == "failed" for a in api.acks)
     assert all(a["detail"].startswith("tombstoned=1; ") for a in api.acks)

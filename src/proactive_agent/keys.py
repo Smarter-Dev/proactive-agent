@@ -130,3 +130,8 @@ def purge_deliveries_key(run_id: str) -> str:
 def privacy_consumer_key(component: str, replica_id: str) -> str:
     """Set (EX 180) by a live purge consumer on every loop iteration."""
     return f"privacy:v1:consumer:{component}:{replica_id}"
+
+
+def tombstone_cleared_key(run_id: str) -> str:
+    """Hash guild_id -> how the tombstone left by this run was cleared."""
+    return f"privacy:v1:tombstone-cleared:{run_id}"

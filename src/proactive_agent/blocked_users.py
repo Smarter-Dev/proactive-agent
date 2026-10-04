@@ -2,10 +2,11 @@
 
 Today a privacy purge adds its user here so a wake cannot re-ingest the
 messages that were just purged; the opt-out feature (#74) takes the same list
-over. The list is refreshed in the background; a failed refresh keeps the
-last list read, and until the first fetch succeeds the worker processes no
-wakes at all. The same holds whenever this process has gone longer than
-ENFORCING_TTL_SECONDS without a successful fetch. Logs never name a user on the list.
+over. The list is refreshed in the background. Until the first fetch (and
+this process's enforcing report) succeeds the worker processes no wakes at
+all; after that it keeps going on the last list it loaded however long
+fetches fail (Zech's decision), still renewing its per-process enforcing key
+with the revision it holds. Logs never name a user on the list.
 """
 
 from __future__ import annotations

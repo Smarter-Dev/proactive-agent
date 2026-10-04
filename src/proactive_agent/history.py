@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 
 from pydantic import ValidationError
 
@@ -219,6 +220,45 @@ class GuildHistoryRepository:
     async def is_invalid(self, guild_id: str) -> bool:
         return bool(await self._redis.exists(history_invalid_key(guild_id)))
 
+    async def tombstone(self, guild_id: str) -> dict | None:
+        """The tombstone's value ({} when unreadable), or None if absent."""
+        raw = await self._redis.get(history_invalid_key(guild_id))
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    async def recover_tombstone(self, guild_id: str) -> bool:
+        """Restore v1 from the Postgres copy and clear the tombstone.
+
+        A tombstone means Postgres was rewritten by a purge while v1 could not
+        be replaced, so the Postgres copy is already the purged one; recovery
+        needs neither the purge run nor the block list. It happens only when
+        Postgres holds at least the tombstone's revision (or, for a tombstone
+        without one, more than v1). The caller holds the guild's fence.
+        Returns True when the tombstone is gone afterwards.
+        """
+        value = await self.tombstone(guild_id)
+        if value is None:
+            return True
+        durable = await self._api.get_history(guild_id)
+        if durable is None or not snapshot_is_valid(durable):
+            return False
+        purged_revision = value.get("revision")
+        if isinstance(purged_revision, int):
+            if durable.revision < purged_revision:
+                return False
+        else:
+            raw = await self._redis.get(history_key(guild_id))
+            match = re.search(rb'"revision":([0-9]+)', raw) if raw else None
+            if match and durable.revision <= int(match.group(1)):
+                return False
+        await self.write_purged(durable)
+        return True
+
     async def forget_legacy(self, guild_id: str) -> None:
         await self._redis.delete(legacy_history_key(guild_id))
 
@@ -240,10 +280,16 @@ class GuildHistoryRepository:
         The value names the purge run and request (never the target) so the
         web can list outstanding tombstones; the key has no TTL.
         """
+        tombstone = tombstone or {}
         value = json.dumps(
             {
-                "run_id": (tombstone or {}).get("run_id", ""),
-                "request_id": (tombstone or {}).get("request_id", ""),
+                "run_id": tombstone.get("run_id", ""),
+                "request_id": tombstone.get("request_id", ""),
+                **(
+                    {"revision": tombstone["revision"]}
+                    if "revision" in tombstone
+                    else {}
+                ),
             }
         )
         try:
@@ -264,18 +310,23 @@ class GuildHistoryRepository:
 
     async def load_legacy(self, guild_id: str) -> HistorySnapshot | None:
         """The pre-split embedded bot's history key, as a revision-1 snapshot."""
+        state, snapshot = await self.legacy_state(guild_id)
+        return snapshot
+
+    async def legacy_state(self, guild_id: str) -> tuple[str, HistorySnapshot | None]:
+        """("absent" | "unreadable" | "ok", snapshot) for the legacy key."""
         raw = await self._redis.get(legacy_history_key(guild_id))
         if not raw:
-            return None
+            return "absent", None
         try:
             history = json.loads(raw)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
-            return None
+            return "unreadable", None
         if not isinstance(history, list) or not all(
             isinstance(item, dict) for item in history
         ):
-            return None
-        return build_snapshot(guild_id, history, revision=1)
+            return "unreadable", None
+        return "ok", build_snapshot(guild_id, history, revision=1)
 
 
 class DebouncedHistoryWriter:
@@ -407,7 +458,9 @@ class DebouncedHistoryWriter:
                     guild_id,
                     type(error).__name__,
                 )
-                tombstoned = await self._repository.invalidate(guild_id, tombstone)
+                tombstoned = await self._repository.invalidate(
+                    guild_id, {**(tombstone or {}), "revision": snapshot.revision}
+                )
                 raise PartialPurgeError(
                     "postgres:purged v1:unpurged "
                     + ("v1:tombstoned" if tombstoned else "v1:not-tombstoned")

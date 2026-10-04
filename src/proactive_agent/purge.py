@@ -38,11 +38,12 @@ from proactive_agent.agent import (
     privacy_compaction_summary,
     privacy_watch_decisions,
     purge_agent_history,
+    string_leaves,
     unchecked_names,
 )
 from proactive_agent.contracts import PurgeCommand
 from proactive_agent.environment import InstructionStore
-from proactive_agent.history import PartialPurgeError, canonical_history
+from proactive_agent.history import PartialPurgeError
 from proactive_agent.keys import (
     DEAD_LETTER_STREAM_KEY,
     PRIVACY_PURGE_STREAM_KEY,
@@ -55,6 +56,7 @@ from proactive_agent.keys import (
     purge_deliveries_key,
     purge_done_key,
     purge_epoch_key,
+    tombstone_cleared_key,
     wake_stream_key,
 )
 from proactive_agent.queue import WAKE_GROUP
@@ -131,16 +133,18 @@ def history_needs_no_fold(history: list[dict], user_id: str, names: list[str]) -
     - Member lines inside structured (non-string) tool output cannot be
       checked line by line and count as unattributed.
     """
-    serialized = canonical_history(history).decode()
-    if user_id in serialized or name_hits(serialized, names):
-        return False
+    # Searched over the decoded strings, never the JSON text: escaping would
+    # hide a name holding a quote, backslash, tab or newline.
+    for leaf in string_leaves(history):
+        if user_id in leaf or name_hits(leaf, names):
+            return False
     for message in history:
         for part in message.get("parts", ()):
             if part.get("part_kind") not in ("user-prompt", "tool-return"):
                 continue
             content = part.get("content")
             if not isinstance(content, str):
-                if "[id=" in json.dumps(content, ensure_ascii=False):
+                if any("[id=" in leaf for leaf in string_leaves(content)):
                     return False
                 continue
             if content.startswith("[COMPACTION MEMORY NOTE"):
@@ -459,27 +463,36 @@ class PrivacyPurgeConsumer:
             deliveries,
         )
         done = await self._done(run_id)
-        if deliveries > self._max_deliveries:
-            if await self._any_tombstoned(guild_ids):
-                # A guild's v1 is tombstoned: never give up, keep retrying
-                # with backoff (attempts at deliveries 2^k past the cap,
-                # one delivery per reclaim interval), never XACK.
-                over = deliveries - self._max_deliveries
-                if over & (over - 1):
-                    logger.warning(
-                        "privacy purge backing off, tombstone outstanding run=%s",
-                        run_id,
-                    )
-                    return
-            else:
-                await self._give_up(stream_id, command, guild_ids, done)
-                return
+        # Tombstones first, independent of the run and of the block list: the
+        # Postgres copy of a tombstoned guild is already the purged one.
+        await self._recover_tombstones(guild_ids)
+        tombstoned = await self._tombstoned(guild_ids)
+        if deliveries > self._max_deliveries and not tombstoned:
+            await self._give_up(stream_id, command, guild_ids, done)
+            return
+        # Past the cap with a guild still tombstoned: never given up, never
+        # XACKed; retried on every delivery, i.e. every reclaim interval
+        # (10 min), which is also the backoff cap.
         if not await self._enforcing_target(command):
-            # Leave the entry pending: it is reclaimed and retried, and the
-            # delivery cap ends it if the list never catches up.
             logger.warning(
                 "privacy purge waiting for the blocked users list run=%s", run_id
             )
+            # A guild that stays tombstoned is reported failed, visibly.
+            for guild_id in tombstoned:
+                accepted = await self._post_ack(
+                    run_id,
+                    guild_id,
+                    GuildOutcome(
+                        "failed",
+                        [],
+                        _join("tombstoned=1", "postgres copy not the purged revision"),
+                    ),
+                )
+                if accepted is False:
+                    await self._drop(stream_id, unknown_run=True)
+                    return
+            # Otherwise the entry stays pending and is retried; the delivery
+            # cap ends it if the list never catches up.
             return
         all_acked = True
         for guild_id in guild_ids:
@@ -508,6 +521,9 @@ class PrivacyPurgeConsumer:
                 continue
             if not accepted:
                 logger.warning("privacy purge run unknown, dropped run=%s", run_id)
+                # The run is gone, the purged Postgres copies are not: recover
+                # any tombstone before forgetting the command.
+                await self._recover_tombstones(guild_ids)
                 await self._drop(stream_id, unknown_run=True)
                 return
         if all_acked:
@@ -536,14 +552,60 @@ class PrivacyPurgeConsumer:
             )
             return None
 
-    async def _any_tombstoned(self, guild_ids: list[str]) -> bool:
+    async def _tombstoned(self, guild_ids: list[str]) -> list[str]:
+        found = []
         for guild_id in guild_ids:
             try:
                 if await self._repository.is_invalid(guild_id):
-                    return True
+                    found.append(guild_id)
             except Exception:
-                return True  # cannot tell: never give up on a guild then
-        return False
+                found.append(guild_id)  # cannot tell: never give up on it
+        return found
+
+    async def _recover_tombstones(self, guild_ids: list[str]) -> None:
+        """Restore v1 from the purged Postgres copy wherever a tombstone is
+        found, under the guild's fence. Failures leave it tombstoned."""
+        for guild_id in await self._tombstoned(guild_ids):
+            try:
+                await self._recover_tombstone(guild_id)
+            except Exception as error:
+                logger.warning(
+                    "privacy purge tombstone recovery failed guild=%s type=%s",
+                    guild_id,
+                    type(error).__name__,
+                )
+
+    async def _recover_tombstone(self, guild_id: str) -> bool:
+        fence = await self._acquire_fence(guild_id)
+        try:
+            old = await self._repository.tombstone(guild_id)
+            if old is None:
+                return True
+            self._writer.discard(guild_id)
+            if not await self._repository.recover_tombstone(guild_id):
+                return False
+            self._runtimes.forget(guild_id)
+            await self._note_tombstone_cleared(old, guild_id, "recovered from postgres")
+            logger.info("privacy purge tombstone recovered guild=%s", guild_id)
+            return True
+        finally:
+            await fence.holder.release()
+
+    async def _note_tombstone_cleared(self, old: dict, guild_id: str, how: str) -> None:
+        """Remember, for the run that left a tombstone, how it was cleared."""
+        run_id = old.get("run_id") if isinstance(old, dict) else None
+        if not run_id:
+            return
+        key = tombstone_cleared_key(str(run_id))
+        try:
+            await self._redis.hset(key, guild_id, how)
+            await self._redis.expire(key, PURGE_DONE_TTL_SECONDS)
+        except Exception as error:
+            logger.warning(
+                "privacy purge tombstone note failed guild=%s type=%s",
+                guild_id,
+                type(error).__name__,
+            )
 
     async def _count_delivery(self, stream_id: str) -> int:
         """Deliveries of this stream entry (a re-published entry starts at 1)."""
@@ -703,6 +765,21 @@ class PrivacyPurgeConsumer:
     async def purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         """Purge one guild. Never raises; failures come back as an outcome."""
         result = await self._purge_guild(command, guild_id)
+        if result.outcome == "unchanged":
+            try:
+                how = await self._redis.hget(
+                    tombstone_cleared_key(str(command.run_id)), guild_id
+                )
+            except Exception:
+                how = None
+            if how is not None:
+                cleared = _decode(how)
+                label = (
+                    "purged by a later run"
+                    if cleared == "later run"
+                    else "recovered from postgres"
+                )
+                result.detail = _join(label, result.detail)
         unchecked = unchecked_names(list(command.names))
         if unchecked:
             # Names too short to match deterministically: the model saw
@@ -871,9 +948,20 @@ class PrivacyPurgeConsumer:
     ) -> tuple[str, bool]:
         """Returns (detail, whether the stored history was rewritten)."""
         names = list(command.names)
-        tombstoned = await self._repository.is_invalid(guild_id)
-        legacy = await self._repository.load_legacy(guild_id)
+        old_tombstone = await self._repository.tombstone(guild_id)
+        tombstoned = old_tombstone is not None
+        legacy_state, legacy = await self._repository.legacy_state(guild_id)
         snapshot = await self._repository.load_canonical(guild_id)
+        if legacy_state == "unreadable" and (
+            fence.external
+            or (
+                snapshot is None
+                and not await self._redis.exists(purge_epoch_key(guild_id))
+            )
+        ):
+            # Its bytes may hold the user, but nothing can be folded from
+            # them; never deleted, never acked purged.
+            raise PurgeFailed("unreadable legacy store")
         migrated = False
         if (
             snapshot is None
@@ -916,7 +1004,7 @@ class PrivacyPurgeConsumer:
             serialized = json.loads(ModelMessagesTypeAdapter.dump_json(purged))
         # Belt and braces over the note validator: nothing written may hold
         # the id, whichever summarizer produced it.
-        if command.user_id.encode() in canonical_history(serialized):
+        if any(command.user_id in leaf for leaf in string_leaves(serialized)):
             raise PurgeFailed("purged history still held the user id")
         if fence.lost:
             raise PurgeFailed("fence lost before the history write")
@@ -930,6 +1018,8 @@ class PrivacyPurgeConsumer:
             },
         )
         stores.extend([STORE_POSTGRES_HISTORY, STORE_REDIS_HISTORY])
+        if tombstoned and str(old_tombstone.get("run_id", "")) != str(command.run_id):
+            await self._note_tombstone_cleared(old_tombstone, guild_id, "later run")
         details = []
         if migrated:
             details.append("legacy history migrated")
