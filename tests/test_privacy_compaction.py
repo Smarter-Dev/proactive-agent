@@ -64,13 +64,13 @@ def scripted(*notes: str):
 
 
 async def test_prompt_names_the_user_and_the_whole_history_rides_along():
-    model, seen = scripted("nia ships Rust 1.95 on friday")
+    model, seen = scripted("nia ships Rust 1.95 on friday, she said so in #general.")
 
     note = await privacy_compaction_summary(
         model, history(), user_id=TARGET, names=["kai"]
     )
 
-    assert note.text == "nia ships Rust 1.95 on friday"
+    assert note.text == "nia ships Rust 1.95 on friday, she said so in #general."
     assert note.attempts == 1 and note.name_hits == 0
     prompt = last_prompt(seen[0])
     assert TARGET in prompt and '"kai"' in prompt
@@ -78,13 +78,16 @@ async def test_prompt_names_the_user_and_the_whole_history_rides_along():
 
 
 async def test_id_in_note_is_asked_again_then_accepted_when_clean():
-    model, seen = scripted(f"<@{TARGET}> has a cat", "nia ships Rust")
+    model, seen = scripted(
+        f"<@{TARGET}> has a cat",
+        "nia ships Rust 1.95 on friday, she said so in #general.",
+    )
 
     note = await privacy_compaction_summary(
         model, history(), user_id=TARGET, names=["kai"]
     )
 
-    assert note.text == "nia ships Rust"
+    assert note.text == "nia ships Rust 1.95 on friday, she said so in #general."
     assert note.attempts == 2
     assert "still contains the user id" in last_prompt(seen[1])
 
@@ -111,14 +114,17 @@ async def test_empty_note_never_becomes_a_blank_memory():
 
 
 async def test_name_is_asked_about_once_then_reported():
-    model, seen = scripted("Kai likes cats", "KAI still here")
+    model, seen = scripted(
+        "Kai likes cats; nia ships Rust 1.95 on friday in #general.",
+        "KAI still here; nia ships Rust 1.95 on friday in #general.",
+    )
 
     note = await privacy_compaction_summary(
         model, history(), user_id=TARGET, names=["kai"]
     )
 
     assert len(seen) == 2
-    assert note.text == "KAI still here"
+    assert note.text.startswith("KAI still here")
     assert note.name_hits == 1
 
 

@@ -187,7 +187,7 @@ async def test_replace_purged_discards_dirty_copy_and_writes_postgres_first(
     await asyncio.sleep(0.1)
 
     assert [snapshot.history for snapshot in api.puts] == [[{"note": "clean"}]]
-    assert purged.revision == stale.revision + 1
+    assert purged.revision == stale.revision + 1000
     assert (await repository.load("111")).history == [{"note": "clean"}]
     await writer.close(timeout=1)
     assert [snapshot.history for snapshot in api.attempts] == [[{"note": "clean"}]]
@@ -203,7 +203,7 @@ async def test_replace_purged_goes_above_a_newer_postgres_revision(redis_client)
         "111", [{"note": "clean"}], previous_revision=3
     )
 
-    assert purged.revision == 8
+    assert purged.revision == 7 + 1000
     await writer.close(timeout=1)
 
 

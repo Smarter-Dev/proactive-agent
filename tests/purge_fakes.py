@@ -245,3 +245,22 @@ def watch_addendum() -> str:
             },
         ]
     )
+
+
+async def bot_group_done(redis_client) -> None:
+    """The bot's purge group exists, has read every entry and acked it."""
+    from proactive_agent.keys import PRIVACY_PURGE_STREAM_KEY
+
+    try:
+        await redis_client.xgroup_create(
+            PRIVACY_PURGE_STREAM_KEY, "smarter-dev-bot", id="0", mkstream=True
+        )
+    except Exception:
+        pass
+    records = await redis_client.xreadgroup(
+        "smarter-dev-bot", "bot", {PRIVACY_PURGE_STREAM_KEY: ">"}
+    )
+    for _stream, entries in records or ():
+        ids = [entry_id for entry_id, _fields in entries]
+        if ids:
+            await redis_client.xack(PRIVACY_PURGE_STREAM_KEY, "smarter-dev-bot", *ids)

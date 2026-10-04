@@ -16,6 +16,7 @@ from purge_fakes import (
     TARGET,
     TARGET_NAME,
     batch,
+    bot_group_done,
     dump,
     make_runtime,
     raw_history_with_target,
@@ -436,13 +437,14 @@ async def test_malformed_command_is_dropped_without_logging_it(
     bad["unexpected"] = "field"
     await submit(redis_client, bad)
     await submit(redis_client, "not json " + TARGET)
+    await bot_group_done(redis_client)
 
     assert await replica.consumer.poll_once() == 1
     assert await replica.consumer.poll_once() == 1
 
     assert api.acks == []
     assert await pending_count(redis_client) == 0
-    # Nobody else will XDEL a malformed entry: the consumer does.
+    # The bot's group is done with them too, so the consumer deletes them.
     assert await redis_client.xlen(PRIVACY_PURGE_STREAM_KEY) == 0
     assert not any(leaks(record.getMessage()) for record in caplog.records)
     await replica.writer.close(timeout=1)
@@ -576,7 +578,9 @@ async def test_v1_write_and_delete_both_failing_acks_failed(redis_client, world)
     # Postgres was purged, v1 could be neither written nor deleted: v1 is
     # tombstoned so loads skip it, and the ack names the exact state.
     assert api.acks[0]["outcome"] == "failed"
-    assert api.acks[0]["detail"] == ("purge: postgres:purged v1:unpurged v1:tombstoned")
+    assert api.acks[0]["detail"] == (
+        "tombstoned=1; purge: postgres:purged v1:unpurged v1:tombstoned"
+    )
     assert api.acks[0]["stores"] == ["proactive_agent_histories"]
     assert not leaks(json.dumps(api.durable[GUILD].history))
     assert leaks(await stored_v1(redis_client))  # still there, but unusable
@@ -615,7 +619,7 @@ async def test_purge_put_conflict_is_retried_once_with_a_fresh_revision(
         if len(reads) == 1:
             # A stale flush lands between the purge's read and its PUT.
             api.durable[guild_id] = build_snapshot(
-                guild_id, dump(raw_history_with_target()), revision=4
+                guild_id, dump(raw_history_with_target()), revision=1003
             )
         return snapshot
 
@@ -625,10 +629,10 @@ async def test_purge_put_conflict_is_retried_once_with_a_fresh_revision(
 
     await replica.consumer.poll_once()
 
-    assert reads == [2, 4]
-    assert api.durable[GUILD].revision == 5
+    assert reads == [2, 1003]
+    assert api.durable[GUILD].revision == 2003
     assert not leaks(json.dumps(api.durable[GUILD].history))
-    assert json.loads(await stored_v1(redis_client))["revision"] == 5
+    assert json.loads(await stored_v1(redis_client))["revision"] == 2003
     assert api.acks[0]["outcome"] == "purged"
     await replica.writer.close(timeout=1)
 

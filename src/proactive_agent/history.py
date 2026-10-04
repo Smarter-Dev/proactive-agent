@@ -47,6 +47,25 @@ redis.call('DEL', KEYS[2])
 return 1
 """
 
+# Postgres wins over a v1 copy that fell behind it: delete v1 only if its
+# revision is below the durable one (a newer v1 is left alone).
+_DELETE_IF_OLDER_LUA = """
+local current = redis.call('GET', KEYS[1])
+if not current then
+  return 0
+end
+local revision = tonumber(string.match(current, '"revision":(%d+)'))
+if revision and revision < tonumber(ARGV[1]) then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+# A purged history is written this many revisions above both stores, so a
+# writer still holding the pre-purge v1 copy can never reach the purged
+# Postgres revision: its flushes get 409 and Postgres wins (see flush).
+PURGE_REVISION_GAP = 1000
+
 _DELETE_IF_EQUAL_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
@@ -207,10 +226,28 @@ class GuildHistoryRepository:
         """Delete the v1 key so the next load reads the Postgres copy."""
         await self._redis.delete(history_key(guild_id))
 
-    async def invalidate(self, guild_id: str) -> bool:
-        """Best effort: mark v1 unreadable until the next successful write."""
+    async def forget_if_older(self, guild_id: str, revision: int) -> bool:
+        """Delete v1 if it holds a revision below ``revision``."""
+        return bool(
+            await self._redis.eval(
+                _DELETE_IF_OLDER_LUA, 1, history_key(guild_id), revision
+            )
+        )
+
+    async def invalidate(self, guild_id: str, tombstone: dict | None = None) -> bool:
+        """Best effort: mark v1 unreadable until the purge's own write.
+
+        The value names the purge run and request (never the target) so the
+        web can list outstanding tombstones; the key has no TTL.
+        """
+        value = json.dumps(
+            {
+                "run_id": (tombstone or {}).get("run_id", ""),
+                "request_id": (tombstone or {}).get("request_id", ""),
+            }
+        )
         try:
-            await self._redis.set(history_invalid_key(guild_id), "1")
+            await self._redis.set(history_invalid_key(guild_id), value)
         except Exception as error:
             logger.error(
                 "proactive history tombstone failed guild=%s type=%s",
@@ -312,7 +349,12 @@ class DebouncedHistoryWriter:
         )
 
     async def replace_purged(
-        self, guild_id: str, history: list[dict], *, previous_revision: int
+        self,
+        guild_id: str,
+        history: list[dict],
+        *,
+        previous_revision: int,
+        tombstone: dict | None = None,
     ) -> tuple[HistorySnapshot, bool]:
         """Synchronously replace the guild's history after a privacy purge.
 
@@ -330,7 +372,10 @@ class DebouncedHistoryWriter:
         self.discard(guild_id)
         for attempt in range(2):
             durable = await self._api.get_history(guild_id)
-            revision = max(previous_revision, durable.revision if durable else 0) + 1
+            revision = (
+                max(previous_revision, durable.revision if durable else 0)
+                + PURGE_REVISION_GAP
+            )
             snapshot = build_snapshot(guild_id, history, revision=revision)
             try:
                 await self._api.put_history(snapshot)
@@ -362,7 +407,7 @@ class DebouncedHistoryWriter:
                     guild_id,
                     type(error).__name__,
                 )
-                tombstoned = await self._repository.invalidate(guild_id)
+                tombstoned = await self._repository.invalidate(guild_id, tombstone)
                 raise PartialPurgeError(
                     "postgres:purged v1:unpurged "
                     + ("v1:tombstoned" if tombstoned else "v1:not-tombstoned")
@@ -379,14 +424,16 @@ class DebouncedHistoryWriter:
                 await self._api.put_history(snapshot)
             except Exception as error:
                 if getattr(error, "status_code", None) == 409:
-                    # Postgres already holds a newer revision (for example a
-                    # purge written by another replica). Retrying an older
-                    # copy can never succeed; Redis keeps the live history.
+                    # Postgres already holds a newer or conflicting revision
+                    # (a purge). Retrying can never succeed, and a v1 copy
+                    # below the durable revision is stale: Postgres wins, so
+                    # v1 is deleted and the next wake reloads from Postgres.
                     logger.warning(
                         "proactive history flush superseded guild=%s revision=%d",
                         guild_id,
                         snapshot.revision,
                     )
+                    await self._postgres_wins(guild_id)
                     latest = self._dirty.get(guild_id)
                     if latest is not None and latest.revision == snapshot.revision:
                         self._dirty.pop(guild_id, None)
@@ -405,6 +452,23 @@ class DebouncedHistoryWriter:
             if latest is not None and latest.revision == snapshot.revision:
                 self._dirty.pop(guild_id, None)
             attempt = 0
+
+    async def _postgres_wins(self, guild_id: str) -> None:
+        try:
+            durable = await self._api.get_history(guild_id)
+            if durable is not None and await self._repository.forget_if_older(
+                guild_id, durable.revision
+            ):
+                logger.warning(
+                    "proactive v1 history behind postgres, dropped guild=%s",
+                    guild_id,
+                )
+        except Exception as error:
+            logger.warning(
+                "proactive history postgres check failed guild=%s type=%s",
+                guild_id,
+                type(error).__name__,
+            )
 
     async def close(self, *, timeout: float = 10) -> None:
         self._closed = True

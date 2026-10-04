@@ -18,6 +18,7 @@ from purge_fakes import (
     TARGET_NAME,
     FakeAPI,
     batch,
+    bot_group_done,
     dump,
     make_runtime,
     raw_history_with_target,
@@ -87,7 +88,14 @@ def counting_note_model(calls: list[str]) -> FunctionModel:
                 parts=[ToolCallPart(info.output_tools[0].name, {"decisions": []})]
             )
         calls.append("note")
-        return ModelResponse(parts=[TextPart(f"note {len(calls)}: nia ships Rust")])
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    f"note {len(calls)}: nia (uid={BYSTANDER}) ships Rust 1.95 "
+                    "on friday, as she said in #general."
+                )
+            ]
+        )
 
     return FunctionModel(respond)
 
@@ -109,7 +117,8 @@ async def test_a_legacy_only_guild_is_folded_into_v1_and_postgres(redis_client, 
     assert not leaks(v1) and "ship Rust 1.95" in v1
     assert not leaks(json.dumps(api.durable[GUILD].history))
     assert api.acks[0]["outcome"] == "purged"
-    assert api.acks[0]["detail"].startswith("legacy history migrated; history folded")
+    assert "legacy history migrated" in api.acks[0]["detail"]
+    assert "history folded attempts=1" in api.acks[0]["detail"]
     assert await redis_client.get(purge_epoch_key(GUILD)) == b"1"
     # The guild keeps its (folded) memory instead of starting empty.
     loaded = await GuildHistoryRepository(redis_client, api).load(GUILD)
@@ -458,7 +467,8 @@ async def test_deliveries_are_capped(redis_client, world):
     for _ in range(2):
         await replica.consumer.poll_once()
         assert await pending_count(redis_client) == 1
-    api.ack_status = 404  # the ack endpoint is no help either
+    api.ack_status = 500  # the ack endpoint is still down
+    await bot_group_done(redis_client)
     await replica.consumer.poll_once()
 
     # Dropped for good even though no ack got through: XDELed (it holds
@@ -478,6 +488,7 @@ async def test_delivery_limit_reports_failed_for_unfinished_guilds(redis_client,
     await replica.consumer.initialize()
     run = command()
     await submit(redis_client, run)
+    await bot_group_done(redis_client)
 
     await replica.consumer.poll_once()
 
@@ -614,7 +625,14 @@ async def test_name_hits_after_retry_are_reported(redis_client, world):
     api = world
 
     def stubborn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        return ModelResponse(parts=[TextPart(f"{TARGET_NAME.upper()} liked Rust")])
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    f"{TARGET_NAME.upper()} liked Rust; nia (uid={BYSTANDER}) "
+                    "ships Rust 1.95 on friday in #general."
+                )
+            ]
+        )
 
     async def decide_watch(entries, **_kwargs):
         return dict(entries), 2
@@ -628,8 +646,9 @@ async def test_name_hits_after_retry_are_reported(redis_client, world):
 
     ack = api.acks[0]
     assert ack["outcome"] == "purged"
-    assert "history folded attempts=2 history_name_hits=1" in ack["detail"]
-    assert "watch channels_rewritten=0 watch_name_hits=2" in ack["detail"]
+    assert ack["detail"].startswith("history_name_hits=1; watch_name_hits=2; ")
+    assert "history folded attempts=2" in ack["detail"]
+    assert "watch channels_rewritten=0" in ack["detail"]
     assert TARGET_NAME not in ack["detail"].lower().replace("name_hits", "")
     await replica.writer.close(timeout=1)
 
@@ -673,7 +692,7 @@ async def test_legacy_key_left_alone_once_an_epoch_exists(redis_client, world):
     # Never migrated back in; the worker owns the key and deletes it.
     assert not await redis_client.exists(history_key(GUILD))
     assert not await redis_client.exists(legacy_history_key(GUILD))
-    assert api.acks[0]["detail"].startswith("history empty; legacy history deleted")
+    assert "history empty; legacy history deleted" in api.acks[0]["detail"]
     await replica.writer.close(timeout=1)
 
 

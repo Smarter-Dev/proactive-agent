@@ -9,8 +9,13 @@ active ingest and the 15-minute passive sweep.
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import json
 import logging
+import math
+import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from inspect import isawaitable
@@ -726,7 +731,8 @@ with one overriding difference: leave this person out entirely.
 or from them.
 - Never write their user id, any of their names, a mention of them, or a
 description that would identify them.
-- Keep everyone else: their conversations, commitments, preferences and facts.
+- Keep everyone else: their conversations, commitments, preferences and facts,
+attributed as `Name (uid=N)` with the user id you saw for them.
 Where someone else's words only made sense as a reply to this person, keep
 what the other person said or decided without attributing anything to the
 person being forgotten.
@@ -778,47 +784,218 @@ def build_privacy_purge_prompt(user_id: str, names: list[str]) -> str:
     )
 
 
-def _word_char(character: str) -> bool:
-    return character.isalnum() or character == "_"
+# -- Name matcher (shared spec privacy:v1, identical in the bot and web) ----
+#
+# Text and names are NFC-normalised and casefolded; names are stripped and
+# empty ones dropped. A name made only of ASCII [a-z0-9_] and spaces matches
+# where it is neither preceded nor followed by an ASCII letter (so alice2,
+# alice_dev and 2alice hit, malice and alicea do not), and is not matched at
+# all below 2 characters ("unchecked"). Any other name (CJK, emoji, accents,
+# punctuation) matches as a plain substring, at any length.
+
+MIN_CHECKED_ASCII_NAME_CHARS = 2
+_ASCII_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_ ")
+_ASCII_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyz")
 
 
-# Same rule as smarter-dev's PurgeTarget.checked_names: shorter names match
-# too much ordinary text to be checked deterministically (the model still
-# sees them in the purge prompt).
-MIN_CHECKED_NAME_CHARS = 2
+def normalise_for_match(text: str) -> str:
+    return unicodedata.normalize("NFC", text).casefold()
+
+
+def _normalised_names(names: list[str]) -> list[tuple[str, str]]:
+    """(original, normalised) pairs, stripped, empty and duplicates dropped."""
+    seen: dict[str, str] = {}
+    for name in names:
+        needle = normalise_for_match(name.strip())
+        if needle and needle not in seen:
+            seen[needle] = name.strip()
+    return [(original, needle) for needle, original in seen.items()]
+
+
+def _is_ascii_name(needle: str) -> bool:
+    return all(character in _ASCII_NAME_CHARS for character in needle)
 
 
 def checked_names(names: list[str]) -> list[str]:
-    """Names with whitespace collapsed, deduplicated, at least 2 characters."""
-    seen: dict[str, str] = {}
-    for name in names:
-        cleaned = " ".join(name.split())
-        if len(cleaned) >= MIN_CHECKED_NAME_CHARS and cleaned.casefold() not in seen:
-            seen[cleaned.casefold()] = cleaned
-    return list(seen.values())
+    """Names the matcher checks (every name but ASCII ones under 2 chars)."""
+    return [
+        original
+        for original, needle in _normalised_names(names)
+        if not _is_ascii_name(needle) or len(needle) >= MIN_CHECKED_ASCII_NAME_CHARS
+    ]
 
 
-def mentions_target(text: str, user_id: str, names: list[str]) -> bool:
-    """The user id anywhere, or a checked name as a whole word."""
-    return user_id in text or bool(name_hits(text, names))
+def unchecked_names(names: list[str]) -> int:
+    """How many names are too short to match (reported, never matched)."""
+    return len(_normalised_names(names)) - len(checked_names(names))
+
+
+def _name_occurs(haystack: str, needle: str) -> bool:
+    if not _is_ascii_name(needle):
+        return needle in haystack
+    if len(needle) < MIN_CHECKED_ASCII_NAME_CHARS:
+        return False
+    start = 0
+    while (index := haystack.find(needle, start)) != -1:
+        end = index + len(needle)
+        before = index == 0 or haystack[index - 1] not in _ASCII_LETTERS
+        after = end == len(haystack) or haystack[end] not in _ASCII_LETTERS
+        if before and after:
+            return True
+        start = index + 1
+    return False
 
 
 def name_hits(text: str, names: list[str]) -> list[str]:
-    """Checked names occurring in ``text`` as whole words, case-insensitively."""
+    """The names (as given) that occur in ``text`` under the privacy:v1 matcher."""
+    haystack = normalise_for_match(text)
+    return [
+        original
+        for original, needle in _normalised_names(names)
+        if _name_occurs(haystack, needle)
+    ]
+
+
+def mentions_target(text: str, user_id: str, names: list[str]) -> bool:
+    """The user id anywhere, or a name under the privacy:v1 matcher."""
+    return user_id in text or bool(name_hits(text, names))
+
+
+# -- Fold plausibility (shared rule privacy:v1, identical in the bot) --------
+#
+# A purge must never become a reset: an output that refuses, says nothing,
+# or drops everyone else is rejected (asked again; when retries run out the
+# step fails and every stored byte stays as it was). See purge-contract.md.
+
+PRIVACY_MODEL_TIMEOUT_SECONDS = 120
+PRIVACY_MAX_PLAUSIBILITY_RETRIES = 2
+FOLD_MIN_CHARS = 40
+FOLD_REFUSALS = (
+    "i can't",
+    "i cannot",
+    "i'm sorry",
+    "i am sorry",
+    "i'm unable",
+    "i am unable",
+    "as an ai",
+)
+FOLD_BYSTANDER_MIN = 200
+FOLD_LENGTH_RATIO = 0.05
+FOLD_LENGTH_CAP = 400
+FOLD_RETENTION_SHARE = 0.5
+
+# The prefix render_transcript_line writes for a member's message:
+# `[id=<msg>] [BOT] <TAG>·<display> (uid=<author>)( (reply to id=<msg>))?: `
+MEMBER_LINE_PREFIX = re.compile(
+    r"^\[id=[0-9]+\] (\[BOT\] )?[A-Z]+·(.*?) \(uid=([0-9]{1,22})\)"
+    r"(?: \(reply to id=[0-9]+\))?: "
+)
+_UID_VALUE = re.compile(r"uid=([0-9]{1,22})")
+# `<display> (uid=N)` anywhere: the display name rendered beside a uid.
+_NAME_BESIDE_UID = re.compile(r"·([^\n·]*?) \(uid=([0-9]{1,22})\)")
+
+PRIVACY_PLAUSIBILITY_RETRY_PROMPT = """\
+That note cannot replace your memory: {reason}. Your memory of everyone else
+must survive the purge. Write the whole note again: keep every other person,
+conversation, commitment and fact from the transcript, attributed as
+`Name (uid=N)`, leaving out only the person being forgotten. Reply with the
+complete note only."""
+
+
+def _contains_id(text: str, user_id: str) -> bool:
+    """The id as a whole number (not part of a longer digit run)."""
+    start = 0
+    while (index := text.find(user_id, start)) != -1:
+        end = index + len(user_id)
+        if (index == 0 or not text[index - 1].isdigit()) and (
+            end == len(text) or not text[end].isdigit()
+        ):
+            return True
+        start = index + 1
+    return False
+
+
+def fold_input_texts(messages: list[ModelMessage]) -> list[str]:
+    """The input parts a fold rule reads: user prompts (briefs, memory notes,
+    notifications), tool returns and the agent's text. System prompts and
+    tool-call arguments are not memory and are left out."""
+    texts = []
+    for message in messages:
+        for part in message.parts:
+            kind = getattr(part, "part_kind", "")
+            if kind not in ("user-prompt", "tool-return", "text"):
+                continue
+            content = getattr(part, "content", None)
+            if isinstance(content, str):
+                texts.append(content)
+            elif content is not None:
+                texts.append(json.dumps(content, ensure_ascii=False, default=str))
+    return texts
+
+
+def fold_plausibility_problem(
+    input_texts: list[str], user_id: str, names: list[str], output: str
+) -> str | None:
+    """Why a fold output cannot replace its input store, or None (privacy:v1).
+
+    1. A non-empty input requires an output (an empty input, empty output).
+    2. Reject a refusal (any FOLD_REFUSALS phrase, case-insensitive), or an
+       output shorter than 40 chars after stripping or without letters,
+       unless the bystander text B is empty (input wholly about the target).
+    3. B = "\\n".join of the input lines (each part split into lines) that
+       contain neither the target id (as a whole number) nor a checked name
+       (whole word, case-insensitive). If len(B) >= 200 the output needs at
+       least max(40, min(0.05 * len(B), 400)) chars.
+    4. U = distinct `uid=N` values in the input other than the target's. If
+       U is not empty, ceil(0.5 * |U|) of them must appear in the output as
+       `uid=N` or as the display name rendered beside that uid in the input
+       (`·<name> (uid=N)`, whole word). The output must never hold the
+       target's id.
+    """
+    text = output.strip()
+    has_input = any(part.strip() for part in input_texts)
+    if not has_input:
+        return "the input was empty but the output is not" if text else None
+    if _contains_id(output, user_id):
+        return "it still contains the user id"
+    lines = [line for part in input_texts for line in part.splitlines()]
+    bystander = "\n".join(
+        line
+        for line in lines
+        if not _contains_id(line, user_id) and not name_hits(line, names)
+    )
     folded = text.casefold()
-    found = []
-    for name in checked_names(names):
-        needle = name.casefold()
-        start = 0
-        while (index := folded.find(needle, start)) != -1:
-            end = index + len(needle)
-            before = index == 0 or not _word_char(folded[index - 1])
-            after = end == len(folded) or not _word_char(folded[end])
-            if before and after:
-                found.append(name)
-                break
-            start = index + 1
-    return found
+    if any(phrase in folded for phrase in FOLD_REFUSALS):
+        return "it reads as a refusal"
+    if bystander:
+        if len(text) < FOLD_MIN_CHARS or not any(c.isalpha() for c in text):
+            return "it is too short to carry any memory"
+        if len(bystander) >= FOLD_BYSTANDER_MIN:
+            floor = max(
+                FOLD_MIN_CHARS,
+                min(math.ceil(FOLD_LENGTH_RATIO * len(bystander)), FOLD_LENGTH_CAP),
+            )
+            if len(text) < floor:
+                return f"it is far shorter than what it replaces (needs {floor} chars)"
+    joined = "\n".join(input_texts)
+    uids = {uid for uid in _UID_VALUE.findall(joined) if uid != user_id}
+    if uids:
+        displays: dict[str, set[str]] = {}
+        for name, uid in _NAME_BESIDE_UID.findall(joined):
+            if name.strip():
+                displays.setdefault(uid, set()).add(name.strip())
+        kept = sum(
+            1
+            for uid in uids
+            if f"uid={uid}" in text
+            or any(name_hits(text, [name]) for name in displays.get(uid, ()))
+        )
+        required = math.ceil(FOLD_RETENTION_SHARE * len(uids))
+        if kept < required:
+            return (
+                f"it keeps {kept} of the {len(uids)} other members (needs {required})"
+            )
+    return None
 
 
 async def privacy_compaction_summary(
@@ -829,6 +1006,8 @@ async def privacy_compaction_summary(
     names: list[str],
     max_id_retries: int = PRIVACY_MAX_ID_RETRIES,
     max_name_retries: int = PRIVACY_MAX_NAME_RETRIES,
+    max_plausibility_retries: int = PRIVACY_MAX_PLAUSIBILITY_RETRIES,
+    timeout_seconds: float = PRIVACY_MODEL_TIMEOUT_SECONDS,
 ) -> PrivacyNote:
     """The agent's own memory note, rewritten by its own model without one user.
 
@@ -836,20 +1015,34 @@ async def privacy_compaction_summary(
     again up to ``max_id_retries`` times, then PrivacyCompactionError is
     raised and the caller must leave the stored history untouched. A
     whole-word name match is asked about once more and then accepted (and
-    reported), because a name can be an ordinary word.
+    reported), because a name can be an ordinary word. A note failing
+    fold_plausibility_problem (privacy:v1: a refusal, too short, or dropping
+    the other members) is
+    asked again up to ``max_plausibility_retries`` times, then raises.
+    Each model call is capped at ``timeout_seconds``.
     """
     compaction_agent = Agent(model, output_type=str)
+    input_texts = fold_input_texts(list(messages))
     prompt = build_privacy_purge_prompt(user_id, names)
     history: list[ModelMessage] = list(messages)
     usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
-    id_retries = name_retries = attempts = 0
+    id_retries = name_retries = plausibility_retries = attempts = 0
     while True:
         attempts += 1
-        result = await compaction_agent.run(prompt, message_history=history or None)
+        try:
+            result = await asyncio.wait_for(
+                compaction_agent.run(prompt, message_history=history or None),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError as error:
+            raise PrivacyCompactionError(
+                f"model call timed out after {timeout_seconds:g} s"
+            ) from error
         for key, value in usage_dict(result.usage).items():
             usage[key] += value
         note = str(result.output)
-        if user_id in note or not note.strip():
+        problem = fold_plausibility_problem(input_texts, user_id, names, note)
+        if user_id in note or (not note.strip() and problem is not None):
             if id_retries >= max_id_retries:
                 raise PrivacyCompactionError(
                     f"purged note still held the user id or was empty after "
@@ -858,6 +1051,15 @@ async def privacy_compaction_summary(
             id_retries += 1
             history = result.all_messages()
             prompt = PRIVACY_ID_RETRY_PROMPT.format(user_id=user_id)
+            continue
+        if problem is not None:
+            if plausibility_retries >= max_plausibility_retries:
+                raise PrivacyCompactionError(
+                    f"purged note implausible after {attempts} attempts"
+                )
+            plausibility_retries += 1
+            history = result.all_messages()
+            prompt = PRIVACY_PLAUSIBILITY_RETRY_PROMPT.format(reason=problem)
             continue
         hits = name_hits(note, names)
         if hits and name_retries < max_name_retries:
@@ -948,7 +1150,15 @@ async def privacy_watch_decisions(
     decision_agent = Agent(model, output_type=WatchDecisions)
     history: list[ModelMessage] | None = None
     for attempt in range(2):
-        result = await decision_agent.run(prompt, message_history=history)
+        try:
+            result = await asyncio.wait_for(
+                decision_agent.run(prompt, message_history=history),
+                timeout=PRIVACY_MODEL_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as error:
+            raise PrivacyCompactionError(
+                f"model call timed out after {PRIVACY_MODEL_TIMEOUT_SECONDS} s"
+            ) from error
         by_id = {item.instruction_id: item for item in result.output.decisions}
         outcome: dict[str, str | None] = {}
         for key, text in entries.items():

@@ -30,6 +30,7 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from proactive_agent.agent import (
+    MEMBER_LINE_PREFIX,
     OPERATING_POLICY_BRIEF,
     PrivacyCompactionError,
     PrivacyNote,
@@ -37,11 +38,13 @@ from proactive_agent.agent import (
     privacy_compaction_summary,
     privacy_watch_decisions,
     purge_agent_history,
+    unchecked_names,
 )
 from proactive_agent.contracts import PurgeCommand
 from proactive_agent.environment import InstructionStore
 from proactive_agent.history import PartialPurgeError, canonical_history
 from proactive_agent.keys import (
+    DEAD_LETTER_STREAM_KEY,
     PRIVACY_PURGE_STREAM_KEY,
     batch_key_pattern,
     lease_key,
@@ -60,6 +63,9 @@ logger = logging.getLogger(__name__)
 
 PURGE_GROUP = "proactive-agent-workers-v1-privacy"
 PURGE_COMPONENT = "worker"
+# Every consumer group of privacy:v1:purge; an entry is deleted only once all
+# of them are done with it (unless its run is unknown to the server).
+EXPECTED_GROUPS = ("smarter-dev-bot", PURGE_GROUP)
 RECLAIM_IDLE_MS = 10 * 60 * 1000
 # Re-claim the entry being worked on this often, well inside RECLAIM_IDLE_MS,
 # so a long multi-guild purge is never reclaimed by another replica.
@@ -84,6 +90,7 @@ STORE_POSTGRES_HISTORY = "proactive_agent_histories"
 STORE_WATCH = "watch_instructions"
 STORE_NOTIFICATIONS = "proactive:v1:notifications"
 STORE_LEGACY_HISTORY = "proactive:guild-history"
+STORE_DEAD_LETTERS = "proactive:v1:dead-letter"
 
 _RENEW_LOCK_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -103,22 +110,10 @@ CompactFn = Callable[..., Awaitable[PrivacyNote]]
 WatchFn = Callable[..., Awaitable[tuple[dict[str, str | None], int]]]
 
 
-# A transcript line for one member's Discord message, as rendered by
-# render_transcript_line (or the skim model's `[id=…] name (user id …)`).
-_MEMBER_LINE = re.compile(r"^\[id=[0-9]+\] ")
-
-
-def _raw_parts(history: list[dict]):
-    """Text of every part that came from outside the model, by part."""
-    for message in history:
-        for part in message.get("parts", ()):
-            if part.get("part_kind") not in ("user-prompt", "tool-return"):
-                continue
-            content = part.get("content")
-            text = content if isinstance(content, str) else json.dumps(content)
-            if text.startswith("[COMPACTION MEMORY NOTE"):
-                continue  # the agent's own note, written about named people
-            yield text
+# The skim model's verbatim line shape: `[id=<msg>] <name> (user id <author>): `.
+_SKIM_LINE_PREFIX = re.compile(
+    r"^\[id=[0-9]+\] [^\n]{1,200}? \(user id [0-9]{1,22}\): "
+)
 
 
 def history_needs_no_fold(history: list[dict], user_id: str, names: list[str]) -> bool:
@@ -127,28 +122,44 @@ def history_needs_no_fold(history: list[dict], user_id: str, names: list[str]) -
     - Nothing anywhere may hold the user id or a checked name. That search
       covers host-written text too: wake briefs, notification bodies and
       tool output that is not a member's message.
-    - Every member-message line (`[id=…] …`) must carry its author's id
-      (`(uid=…)`, or `(user id …)` in skim output). A member line without
-      it predates author ids and could name the user under a nickname
-      nobody listed, so the history is folded.
+    - Every member-message line (starting `[id=`) must carry its author's id
+      exactly where render_transcript_line writes it (MEMBER_LINE_PREFIX),
+      or in the skim model's `(user id …): ` prefix. `(uid=` anywhere else
+      on the line (say, in the message text) does not count. Such a line
+      without it predates author ids and could name the user under a
+      nickname nobody listed, so the history is folded.
+    - Member lines inside structured (non-string) tool output cannot be
+      checked line by line and count as unattributed.
     """
     serialized = canonical_history(history).decode()
     if user_id in serialized or name_hits(serialized, names):
         return False
-    for text in _raw_parts(history):
-        for line in text.splitlines():
-            line = line.strip()
-            if (
-                _MEMBER_LINE.match(line)
-                and "(uid=" not in line
-                and "(user id " not in line
-            ):
-                return False
+    for message in history:
+        for part in message.get("parts", ()):
+            if part.get("part_kind") not in ("user-prompt", "tool-return"):
+                continue
+            content = part.get("content")
+            if not isinstance(content, str):
+                if "[id=" in json.dumps(content, ensure_ascii=False):
+                    return False
+                continue
+            if content.startswith("[COMPACTION MEMORY NOTE"):
+                continue  # the agent's own note, written about named people
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("[id=") and not (
+                    MEMBER_LINE_PREFIX.match(line) or _SKIM_LINE_PREFIX.match(line)
+                ):
+                    return False
     return True
 
 
 class PurgeFailed(Exception):
     """A guild purge failed; the message is a content-free ack detail."""
+
+
+class PurgeRetry(PurgeFailed):
+    """Failed after Postgres was already purged: keep the entry pending."""
 
 
 @dataclass
@@ -201,8 +212,43 @@ def _stream_id_key(stream_id: str) -> tuple[int, int]:
     return int(milliseconds), int(sequence or 0)
 
 
-def _join(detail: str, extra: str) -> str:
-    return ("; ".join(item for item in (detail, extra) if item))[:500]
+# Detail segments the web parses; they go first and are never truncated.
+_CRITICAL_SEGMENTS = (
+    "tombstoned=",
+    "unchecked_names=",
+    "done_record=",
+    "history_name_hits=",
+    "watch_name_hits=",
+)
+DETAIL_LIMIT = 500
+
+
+def _join(*parts: str) -> str:
+    """`; `-joined ack detail, critical segments first, at most 500 chars.
+
+    Only the non-critical tail is ever cut.
+    """
+    segments = [
+        segment.strip()
+        for part in parts
+        if part
+        for segment in part.split("; ")
+        if segment.strip()
+    ]
+    critical = list(
+        dict.fromkeys(s for s in segments if s.startswith(_CRITICAL_SEGMENTS))
+    )
+    rest = [s for s in segments if not s.startswith(_CRITICAL_SEGMENTS)]
+    detail = "; ".join(critical)
+    for segment in rest:
+        candidate = f"{detail}; {segment}" if detail else segment
+        if len(candidate) > DETAIL_LIMIT:
+            room = DETAIL_LIMIT - len(detail) - (2 if detail else 0)
+            if room > 0:
+                detail = (f"{detail}; " if detail else "") + segment[:room]
+            break
+        detail = candidate
+    return detail
 
 
 def _decode(value) -> str:
@@ -212,7 +258,7 @@ def _decode(value) -> str:
 def _error_detail(prefix: str, error: BaseException) -> str:
     """Content-free description: the exception type and HTTP status only."""
     if isinstance(error, PurgeFailed | PrivacyCompactionError | PartialPurgeError):
-        return f"{prefix}: {error}"[:500]
+        return f"{prefix}: {error}"[:DETAIL_LIMIT]
     status = getattr(error, "status_code", None)
     suffix = f" status={status}" if status is not None else ""
     return f"{prefix}: {type(error).__name__}{suffix}"[:500]
@@ -285,16 +331,33 @@ class PrivacyPurgeConsumer:
         initialized = False
         while not stop.is_set():
             try:
-                # Alive marker for the web admin, idle polls included.
-                await self._mark_alive()
                 if not initialized:
                     await self.initialize()
                     initialized = True
                 await self.poll_once(block_ms=5_000)
+                # Alive marker for the web admin, written only after a
+                # successful poll (idle polls included).
+                await self._mark_alive()
                 # Let other tasks run even if the server answered at once.
                 await asyncio.sleep(0)
             except asyncio.CancelledError:
                 raise
+            except ResponseError as error:
+                if "NOGROUP" not in str(error):
+                    logger.error(
+                        "privacy purge consumer error type=%s", type(error).__name__
+                    )
+                else:
+                    # The stream or group vanished: recreate it (id 0,
+                    # MKSTREAM) before reporting alive again.
+                    logger.warning("privacy purge consumer group missing, recreating")
+                    initialized = False
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(), timeout=self._error_backoff_seconds
+                    )
+                except TimeoutError:
+                    pass
             except Exception as error:
                 logger.error(
                     "privacy purge consumer error type=%s", type(error).__name__
@@ -387,7 +450,7 @@ class PrivacyPurgeConsumer:
             return
         run_id = str(command.run_id)
         guild_ids = list(dict.fromkeys(command.guild_ids))
-        deliveries = await self._count_delivery(run_id)
+        deliveries = await self._count_delivery(stream_id)
         logger.info(
             "privacy purge started run=%s request=%s guilds=%d delivery=%d",
             run_id,
@@ -397,8 +460,20 @@ class PrivacyPurgeConsumer:
         )
         done = await self._done(run_id)
         if deliveries > self._max_deliveries:
-            await self._give_up(stream_id, command, guild_ids, done)
-            return
+            if await self._any_tombstoned(guild_ids):
+                # A guild's v1 is tombstoned: never give up, keep retrying
+                # with backoff (attempts at deliveries 2^k past the cap,
+                # one delivery per reclaim interval), never XACK.
+                over = deliveries - self._max_deliveries
+                if over & (over - 1):
+                    logger.warning(
+                        "privacy purge backing off, tombstone outstanding run=%s",
+                        run_id,
+                    )
+                    return
+            else:
+                await self._give_up(stream_id, command, guild_ids, done)
+                return
         if not await self._enforcing_target(command):
             # Leave the entry pending: it is reclaimed and retried, and the
             # delivery cap ends it if the list never catches up.
@@ -420,7 +495,7 @@ class PrivacyPurgeConsumer:
                 elif result.outcome != "failed" and not await self._record_done(
                     run_id, guild_id, result
                 ):
-                    result.detail = _join(result.detail, "done_record=unsaved")
+                    result.detail = _join("done_record=unsaved", result.detail)
             logger.info(
                 "privacy purge guild finished run=%s guild=%s outcome=%s",
                 run_id,
@@ -461,8 +536,18 @@ class PrivacyPurgeConsumer:
             )
             return None
 
-    async def _count_delivery(self, run_id: str) -> int:
-        key = purge_deliveries_key(run_id)
+    async def _any_tombstoned(self, guild_ids: list[str]) -> bool:
+        for guild_id in guild_ids:
+            try:
+                if await self._repository.is_invalid(guild_id):
+                    return True
+            except Exception:
+                return True  # cannot tell: never give up on a guild then
+        return False
+
+    async def _count_delivery(self, stream_id: str) -> int:
+        """Deliveries of this stream entry (a re-published entry starts at 1)."""
+        key = purge_deliveries_key(stream_id)
         count = int(await self._redis.incr(key))
         await self._redis.expire(key, DONE_TTL_SECONDS)
         return count
@@ -482,14 +567,24 @@ class PrivacyPurgeConsumer:
             self._max_deliveries,
         )
         unknown_run = False
+        unrecorded = False
         for guild_id in guild_ids:
             result = done.get(guild_id)
+            saved = True
             if result is None:
                 result = GuildOutcome("failed", [], "delivery limit reached")
-                await self._record_done(run_id, guild_id, result)
-            if await self._post_ack(run_id, guild_id, result) is False:
+                saved = await self._record_done(run_id, guild_id, result)
+            accepted = await self._post_ack(run_id, guild_id, result)
+            if accepted is False:
                 unknown_run = True
                 break
+            if accepted is None and not saved:
+                unrecorded = True
+        if unrecorded and not unknown_run:
+            # Neither an ack nor a done record exists for some guild: the
+            # failure would be invisible, so keep the entry pending.
+            logger.error("privacy purge give-up left pending run=%s", run_id)
+            return
         await self._drop(stream_id, unknown_run=unknown_run)
 
     async def _done(self, run_id: str) -> dict[str, GuildOutcome]:
@@ -574,13 +669,29 @@ class PrivacyPurgeConsumer:
         await self._ack(stream_id)
 
     async def _others_done_with(self, stream_id: str) -> bool:
-        """Every other group on the stream has delivered and acked the entry."""
+        """Every other expected group has delivered and acked the entry.
+
+        An expected group that does not exist is not done. A group counts as
+        having read the entry only if its last-delivered-id is at or past it,
+        it reports entries-read, it has at least one consumer, and the entry
+        is not in its PEL. Groups are always created at id 0; a group created
+        at `$` after the entry is indistinguishable from one that read it, so
+        a group with no consumers or no entries-read counts as not done.
+        """
         entry = _stream_id_key(stream_id)
-        for group in await self._redis.xinfo_groups(PRIVACY_PURGE_STREAM_KEY):
-            name = _decode(group["name"])
+        groups = {
+            _decode(group["name"]): group
+            for group in await self._redis.xinfo_groups(PRIVACY_PURGE_STREAM_KEY)
+        }
+        for name in EXPECTED_GROUPS:
             if name == PURGE_GROUP:
                 continue
+            group = groups.get(name)
+            if group is None:
+                return False
             if _stream_id_key(_decode(group["last-delivered-id"])) < entry:
+                return False
+            if group.get("entries-read") is None or not group.get("consumers"):
                 return False
             pending = await self._redis.xpending_range(
                 PRIVACY_PURGE_STREAM_KEY, name, min=stream_id, max=stream_id, count=1
@@ -591,6 +702,15 @@ class PrivacyPurgeConsumer:
 
     async def purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         """Purge one guild. Never raises; failures come back as an outcome."""
+        result = await self._purge_guild(command, guild_id)
+        unchecked = unchecked_names(list(command.names))
+        if unchecked:
+            # Names too short to match deterministically: the model saw
+            # them, the checks could not; the web shows the count.
+            result.detail = _join(f"unchecked_names={unchecked}", result.detail)
+        return result
+
+    async def _purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         stores: list[str] = []
         try:
             fence = await self._acquire_fence(guild_id)
@@ -606,12 +726,16 @@ class PrivacyPurgeConsumer:
                 guild_id,
                 type(error).__name__,
             )
-            return GuildOutcome(
-                "failed",
-                stores,
-                _error_detail("purge", error),
-                retry=isinstance(error, PartialPurgeError),
-            )
+            retry = isinstance(error, PartialPurgeError | PurgeRetry)
+            detail = _error_detail("purge", error)
+            try:
+                tombstoned = await self._repository.is_invalid(guild_id)
+            except Exception:
+                tombstoned = isinstance(error, PartialPurgeError)
+            if tombstoned:
+                retry = True
+                detail = _join("tombstoned=1", detail)
+            return GuildOutcome("failed", stores, detail, retry=retry)
         finally:
             renew_task.cancel()
             await asyncio.gather(renew_task, return_exceptions=True)
@@ -637,15 +761,21 @@ class PrivacyPurgeConsumer:
         if dropped:
             stores.append(STORE_NOTIFICATIONS)
             details.append(f"notifications_dropped={dropped}")
+        dead = await self._discard_dead_letters(guild_id)
+        if dead:
+            stores.append(STORE_DEAD_LETTERS)
+            details.append(f"dead_letters_dropped={dead}")
         taken = self._writer.discard(guild_id)
         try:
             history_detail, wrote = await self._purge_history(
                 command, guild_id, fence, stores
             )
-        except PartialPurgeError:
-            # Postgres already holds the purged copy: make every replica
-            # reload (best effort), then fail with the exact store state.
-            stores.append(STORE_POSTGRES_HISTORY)
+        except (PartialPurgeError, PurgeRetry) as error:
+            # Postgres already holds the purged copy: the discarded dirty
+            # copy is never restored, every replica reloads (best effort),
+            # and the step fails with the exact store state.
+            if isinstance(error, PartialPurgeError):
+                stores.append(STORE_POSTGRES_HISTORY)
             await self._bump_epoch(guild_id, best_effort=True)
             raise
         except BaseException:
@@ -660,7 +790,7 @@ class PrivacyPurgeConsumer:
             await self._bump_epoch(guild_id)
         if fence.external:
             details.append(await self._purge_watch(command, guild_id, fence, stores))
-        return "; ".join(item for item in details if item)[:500]
+        return _join(*details)
 
     async def _bump_epoch(self, guild_id: str, *, best_effort: bool = False) -> None:
         try:
@@ -670,6 +800,36 @@ class PrivacyPurgeConsumer:
                 raise
         self._runtimes.forget(guild_id)
 
+    async def _discard_dead_letters(self, guild_id: str) -> int:
+        """Discard the guild's dead-lettered wakes from before the purge.
+
+        Same rule as queued notifications, no name matching: every entry of
+        the dead-letter stream whose `guild_id` field is this guild and
+        that exists now. Only the `guild_id` field and the entry id are
+        read, so it works on the verbatim and on the ids-only shape.
+        """
+        dropped = 0
+        start = "-"
+        while True:
+            entries = await self._redis.xrange(
+                DEAD_LETTER_STREAM_KEY, min=start, max="+", count=500
+            )
+            if not entries:
+                return dropped
+            matching = [
+                _decode(entry_id)
+                for entry_id, fields in entries
+                if _decode(fields.get(b"guild_id", fields.get("guild_id", b"")))
+                == guild_id
+            ]
+            if matching:
+                dropped += int(
+                    await self._redis.xdel(DEAD_LETTER_STREAM_KEY, *matching)
+                )
+            if len(entries) < 500:
+                return dropped
+            start = "(" + _decode(entries[-1][0])
+
     async def _discard_notifications(self, guild_id: str) -> int:
         """Discard every notification queued for the guild before the purge.
 
@@ -677,8 +837,9 @@ class PrivacyPurgeConsumer:
         raw copies of channel activity made before the user was blocked,
         and pending triggers rather than memory, so all of them go, without
         trying to recognise the user by name. Anything queued after this
-        point was produced under the block list. The dead-letter stream is
-        not touched.
+        point was produced under the block list. They are not restored if
+        the fold then fails, and a retry discards whatever was queued after
+        the first attempt too. Dead letters: _discard_dead_letters.
         """
         dropped = 0
         stream = wake_stream_key(guild_id)
@@ -759,8 +920,14 @@ class PrivacyPurgeConsumer:
             raise PurgeFailed("purged history still held the user id")
         if fence.lost:
             raise PurgeFailed("fence lost before the history write")
-        _snapshot, v1_written = await self._writer.replace_purged(
-            guild_id, serialized, previous_revision=snapshot.revision
+        _snapshot, _v1_written = await self._writer.replace_purged(
+            guild_id,
+            serialized,
+            previous_revision=snapshot.revision,
+            tombstone={
+                "run_id": str(command.run_id),
+                "request_id": str(command.request_id),
+            },
         )
         stores.extend([STORE_POSTGRES_HISTORY, STORE_REDIS_HISTORY])
         details = []
@@ -770,15 +937,20 @@ class PrivacyPurgeConsumer:
         if note is None:
             details.append("history kept")
         else:
-            details.append(
-                f"history folded attempts={note.attempts} "
-                f"history_name_hits={note.name_hits}"
-            )
-        if drop_legacy and v1_written:
-            await self._repository.forget_legacy(guild_id)
+            details.append(f"history folded attempts={note.attempts}")
+            details.append(f"history_name_hits={note.name_hits}")
+        if drop_legacy:
+            # Postgres holds the purged copy and v1 holds it too or was
+            # deleted: the raw legacy key must not outlive a reported purge.
+            try:
+                await self._repository.forget_legacy(guild_id)
+            except Exception as error:
+                raise PurgeRetry(
+                    "legacy history delete failed after postgres:purged"
+                ) from error
             stores.append(STORE_LEGACY_HISTORY)
             details.append("legacy history deleted")
-        return "; ".join(details), True
+        return _join(*details), True
 
     async def _purge_watch(
         self,
@@ -823,8 +995,9 @@ class PrivacyPurgeConsumer:
         if changed:
             stores.append(STORE_WATCH)
         if changed or name_hits_kept:
-            return (
-                f"watch channels_rewritten={changed} watch_name_hits={name_hits_kept}"
+            return _join(
+                f"watch channels_rewritten={changed}",
+                f"watch_name_hits={name_hits_kept}",
             )
         return ""
 

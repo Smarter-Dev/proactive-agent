@@ -16,6 +16,7 @@ from purge_fakes import (
     TARGET,
     FakeAPI,
     batch,
+    bot_group_done,
     dump,
     make_runtime,
     raw_history_with_target,
@@ -258,6 +259,7 @@ async def test_drop_never_acks_an_entry_it_could_not_delete(redis_client, world)
     replica.consumer._reclaim_idle_ms = 0
     await replica.consumer.initialize()
     await submit(redis_client, "not json " + TARGET)
+    await bot_group_done(redis_client)
     real_xdel = redis_client.xdel
 
     async def broken_xdel(*_args):
@@ -289,7 +291,7 @@ async def test_a_lost_done_record_is_reported_in_the_ack(redis_client, world):
     await replica.consumer.poll_once()
 
     assert api.acks[0]["outcome"] == "purged"
-    assert api.acks[0]["detail"].endswith("done_record=unsaved")
+    assert api.acks[0]["detail"].startswith("done_record=unsaved; ")
     await replica.writer.close(timeout=1)
 
 
@@ -325,7 +327,11 @@ async def test_poll_claims_one_entry_at_a_time(redis_client, world):
 # I. The legacy key goes only once v1 and Postgres both hold the result.
 
 
-async def test_legacy_key_survives_when_v1_was_not_written(redis_client, world):
+async def test_legacy_key_goes_when_v1_was_deleted_instead_of_written(
+    redis_client, world
+):
+    # M3: v1 could not be written but was deleted; Postgres holds the purged
+    # copy, so the raw legacy key must go too.
     api = world
     replica = Replica(redis_client, api, honest_model([]), name="a")
 
@@ -339,8 +345,40 @@ async def test_legacy_key_survives_when_v1_was_not_written(redis_client, world):
     await replica.consumer.poll_once()
 
     assert api.acks[0]["outcome"] == "purged"  # v1 deleted, Postgres purged
+    assert not await redis_client.exists(history_key(GUILD))
+    assert not await redis_client.exists(legacy_history_key(GUILD))
+    assert "proactive:guild-history" in api.acks[0]["stores"]
+    await replica.writer.close(timeout=1)
+
+
+async def test_a_failed_legacy_delete_fails_and_retries(redis_client, world):
+    api = world
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    replica.consumer._reclaim_idle_ms = 0
+
+    async def broken(_guild_id):
+        raise ConnectionError("redis write lost")
+
+    real_forget_legacy = replica.repository.forget_legacy
+    replica.repository.forget_legacy = broken
+    await replica.consumer.initialize()
+    run = command()
+    await submit(redis_client, run)
+
+    await replica.consumer.poll_once()
+
+    assert api.acks[0]["outcome"] == "failed"
+    assert "legacy history delete failed" in api.acks[0]["detail"]
     assert await redis_client.exists(legacy_history_key(GUILD))
-    assert "proactive:guild-history" not in api.acks[0]["stores"]
+    assert await pending_count(redis_client) == 1  # kept for a retry
+    done_key = f"privacy:v1:purge-done:worker:{run['run_id']}"
+    assert not await redis_client.exists(done_key)
+
+    replica.repository.forget_legacy = real_forget_legacy
+    await replica.consumer.poll_once()
+    assert api.acks[-1]["outcome"] == "purged"
+    assert not await redis_client.exists(legacy_history_key(GUILD))
+    assert await pending_count(redis_client) == 0
     await replica.writer.close(timeout=1)
 
 
