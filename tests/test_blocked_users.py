@@ -200,39 +200,35 @@ class Clock:
         return self.now
 
 
-async def test_a_replica_with_failing_refreshes_stops_enforcing_alone(redis_client):
-    # Replica A keeps the shared enforcing key fresh; replica B's fetches
-    # fail. B must stop taking wakes once its own list is 180 s old.
-    api_a, api_b = ListAPI(), ListAPI()
+async def test_a_loaded_replica_keeps_going_through_a_long_outage(redis_client, caplog):
+    # Zech's decision: after the first load the worker keeps taking wakes on
+    # the last list however long fetches fail, and keeps reporting the
+    # revision it holds.
+    api = ListAPI()
+    api.blocked = {"revision": 4, "user_ids": [TARGET]}
     clock = Clock()
-    replica_a = BlockedUsers(api_a, redis_client, clock=clock)
-    replica_b = BlockedUsers(api_b, redis_client, clock=clock)
-    await replica_a.refresh()
-    await replica_b.refresh()
-    assert replica_a.enforcing and replica_b.enforcing
+    blocked = BlockedUsers(api, redis_client, clock=clock, replica_id="host-1")
+    assert await blocked.refresh()
+    api.blocked_failures = 10_000
+    own = privacy_enforcing_key("worker") + ":host-1"
 
-    api_b.blocked_failures = 100
-    clock.now += 179
-    assert not await replica_b.refresh()
-    assert replica_b.enforcing  # a short gap keeps the last list
-    clock.now += 2
-    await replica_a.refresh()
-    assert not await replica_b.refresh()
+    for _ in range(25):  # 12.5 minutes of failing 30 s cycles
+        clock.now += 30
+        # fakeredis does not follow the fake clock: expire the key by hand
+        # so each cycle has to renew it.
+        await redis_client.delete(own)
+        assert not await blocked.refresh()
 
-    assert await redis_client.exists(privacy_enforcing_key("worker"))
-    assert replica_a.enforcing
-    assert not replica_b.enforcing
+    assert blocked.enforcing
+    assert blocked.is_blocked(TARGET)
+    assert await redis_client.get(own) == b"4"
+    assert 170 < await redis_client.ttl(own) <= 180
+    assert await redis_client.get(privacy_enforcing_key("worker")) == b"4"
+    stale = [r.getMessage() for r in caplog.records if "list stale" in r.getMessage()]
+    assert len(stale) == 13  # at most once a minute
+    assert stale[-1].endswith("revision=4")
+    assert all(TARGET not in r.getMessage() for r in caplog.records)
 
-    api_b.blocked_failures = 0
-    assert await replica_b.refresh()
-    assert replica_b.enforcing
-
-
-async def test_a_non_enforcing_replica_takes_no_wake_lease(redis_client):
-    clock = Clock()
-    blocked = BlockedUsers(ListAPI(), redis_client, clock=clock)
-    await blocked.refresh()
-    clock.now += 181
     queue = SimpleNamespace(
         externally_owned=AsyncMock(return_value=True),
         acquire_lease=AsyncMock(return_value=None),
@@ -241,40 +237,46 @@ async def test_a_non_enforcing_replica_takes_no_wake_lease(redis_client):
     worker._enforcing_poll_seconds = 0.005
     ready = (SimpleNamespace(stream_id="1-0", guild_id="111"),)
     task = asyncio.create_task(worker._run_guild("111", ready))
-    await asyncio.sleep(0.05)
-
-    queue.acquire_lease.assert_not_awaited()
-    clock.now -= 181  # a fetch succeeded again
-    await asyncio.sleep(0.05)
-    queue.acquire_lease.assert_awaited()
+    await asyncio.sleep(0.02)
+    queue.acquire_lease.assert_awaited()  # still takes wakes
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_the_wake_loop_pauses_while_not_enforcing(redis_client):
-    clock = Clock()
-    blocked = BlockedUsers(ListAPI(), redis_client, clock=clock)
-    await blocked.refresh()
+async def test_a_stale_replica_holds_the_published_minimum_down(redis_client):
+    old, new = ListAPI(), ListAPI()
+    old.blocked = {"revision": 3, "user_ids": []}
+    new.blocked = {"revision": 5, "user_ids": [TARGET]}
+    stale = BlockedUsers(old, redis_client, replica_id="old")
+    fresh = BlockedUsers(new, redis_client, replica_id="new")
+    await stale.refresh()
+    old.blocked_failures = 100
 
-    async def read_ready(**_kwargs):
-        await asyncio.sleep(0.005)
-        return ()
+    for _ in range(10):
+        await redis_client.delete(privacy_enforcing_key("worker") + ":old")
+        await stale.refresh()  # fails, still renews revision 3
+        await fresh.refresh()
 
+    assert await redis_client.get(privacy_enforcing_key("worker")) == b"3"
+
+
+async def test_cold_start_still_takes_no_wakes(redis_client):
+    api = ListAPI()
+    api.blocked_failures = 100
+    blocked = BlockedUsers(api, redis_client, replica_id="host-1")
+    for _ in range(5):
+        assert not await blocked.refresh()
+    assert not blocked.enforcing
+    assert not await redis_client.exists(privacy_enforcing_key("worker") + ":host-1")
     queue = SimpleNamespace(
-        initialize=AsyncMock(),
-        reclaim_ready=AsyncMock(return_value=()),
-        read_ready=AsyncMock(side_effect=read_ready),
+        externally_owned=AsyncMock(return_value=True),
+        acquire_lease=AsyncMock(return_value=None),
     )
-    stop = asyncio.Event()
     worker = ProactiveWorker(queue, SimpleNamespace(), blocked_users=blocked)
     worker._enforcing_poll_seconds = 0.005
-    task = asyncio.create_task(worker.run(stop))
+    ready = (SimpleNamespace(stream_id="1-0", guild_id="111"),)
+    task = asyncio.create_task(worker._run_guild("111", ready))
     await asyncio.sleep(0.03)
-    clock.now += 181
-    await asyncio.sleep(0.03)
-    reads = queue.read_ready.await_count
-    await asyncio.sleep(0.05)
-
-    assert queue.read_ready.await_count == reads
-    stop.set()
-    await asyncio.wait_for(task, timeout=1)
+    queue.acquire_lease.assert_not_awaited()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)

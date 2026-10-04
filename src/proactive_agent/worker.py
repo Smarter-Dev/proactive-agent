@@ -94,7 +94,7 @@ class ProactiveWorker:
     async def _wait_enforcing(self, stop: asyncio.Event) -> bool:
         if self._blocked_users is None or self._blocked_users.enforcing:
             return True
-        logger.warning("proactive worker paused until the blocked users list loads")
+        logger.warning("proactive worker waiting for the first blocked users list")
         return await self._blocked_users.wait_enforcing(
             stop, poll_seconds=self._enforcing_poll_seconds
         )
@@ -124,12 +124,12 @@ class ProactiveWorker:
                 await self._queue.discard_embedded_ready(guild_id, ready)
                 return
             if self._blocked_users is not None and not self._blocked_users.enforcing:
-                # Not enforcing the blocked-users list: take no wake lease.
+                # No blocked-users list loaded yet: take no wake lease.
                 await asyncio.sleep(self._enforcing_poll_seconds)
                 continue
             async with self._semaphore:
                 # Checked again after the semaphore wait, right before the
-                # lease: the list may have gone stale while queued.
+                # lease: the list must have been loaded once.
                 if (
                     self._blocked_users is not None
                     and not self._blocked_users.enforcing

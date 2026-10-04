@@ -73,19 +73,18 @@ class BlockedUsers:
         self.loaded = asyncio.Event()
         self._clock = clock
         self._last_success: float | None = None
+        self._stale_logged_at: float | None = None
 
     @property
     def enforcing(self) -> bool:
-        """True while THIS process's last successful fetch is fresh.
+        """True once this process has loaded the list and reported it.
 
-        The shared enforcing key can be kept alive by another replica, so
-        each replica judges itself: past ENFORCING_TTL_SECONDS without a
-        successful fetch it must stop taking wakes until one succeeds.
+        Zech's decision: after the first load the worker always keeps going
+        on the last list it loaded, however long fetches fail (that only
+        happens in a broader failure). With no list ever loaded it takes no
+        wakes (cold start).
         """
-        return (
-            self._last_success is not None
-            and self._clock() - self._last_success < ENFORCING_TTL_SECONDS
-        )
+        return self._last_success is not None
 
     def is_blocked(self, user_id: str | int | None) -> bool:
         return user_id is not None and str(user_id) in self._user_ids
@@ -95,13 +94,14 @@ class BlockedUsers:
         try:
             listing = await self._api.get_blocked_users()
         except Exception as error:
-            status = getattr(error, "status_code", None)
-            logger.warning(
-                "blocked users refresh failed type=%s status=%s loaded=%s",
-                type(error).__name__,
-                status,
-                self.loaded.is_set(),
-            )
+            if self._last_success is None:
+                logger.warning(
+                    "blocked users refresh failed type=%s status=%s loaded=False",
+                    type(error).__name__,
+                    getattr(error, "status_code", None),
+                )
+                return False
+            await self._keep_reporting_stale()
             return False
         if self.revision is not None and listing.revision < self.revision:
             # A database restore can move the revision back. The server's
@@ -127,8 +127,33 @@ class BlockedUsers:
             )
             return False
         self._last_success = reported_at
+        self._stale_logged_at = None
         self.loaded.set()
         return True
+
+    async def _keep_reporting_stale(self) -> None:
+        """A fetch failed after the first load: keep the last list.
+
+        The per-process key is still renewed with the revision this process
+        actually holds, so it expires only when the process is gone or Redis
+        is unreachable, and the published minimum stays at that revision (a
+        purge needing a newer one waits). Logged at most once a minute,
+        with the age and revision only.
+        """
+        now = self._clock()
+        if self._stale_logged_at is None or now - self._stale_logged_at >= 60:
+            self._stale_logged_at = now
+            logger.warning(
+                "blocked users list stale age=%ds revision=%s",
+                int(now - self._last_success),
+                self.revision,
+            )
+        try:
+            await self._report_enforcing()
+        except Exception as error:
+            logger.debug(
+                "blocked users enforcing marker failed type=%s", type(error).__name__
+            )
 
     async def _report_enforcing(self) -> None:
         """Report this replica and publish the minimum over live replicas.
@@ -136,8 +161,9 @@ class BlockedUsers:
         One script, so no concurrent report can overwrite the aggregate with
         a minimum computed before this replica's key existed: the aggregate
         never exceeds the revision of a replica that is taking wakes.
-        Replica keys expire after ENFORCING_TTL_SECONDS, the same window
-        after which a replica that cannot report stops taking wakes.
+        Replica keys expire after ENFORCING_TTL_SECONDS and are renewed every
+        refresh cycle, fetch failures included, so one expires only when its
+        process is gone or Redis is unreachable.
         """
         await self._redis.eval(
             _REPORT_ENFORCING_LUA,
@@ -157,8 +183,8 @@ class BlockedUsers:
                 delay = self._refresh_seconds
             else:
                 failures += 1
-                # Retry faster than the refresh interval so a short outage
-                # does not cost the replica its enforcing window.
+                # Retry faster than the refresh interval; each failed cycle
+                # still renews this process's key with the held revision.
                 delay = min(
                     self._refresh_seconds,
                     self._retry_max_seconds,
