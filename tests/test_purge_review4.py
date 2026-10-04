@@ -366,3 +366,40 @@ async def test_structured_fields_when_a_tombstone_cannot_be_recovered(redis_clie
     assert ack["done_record"] == "not_written"
     assert ack["name_hits"] == {}
     await replica.writer.close(timeout=1)
+
+
+@pytest.mark.parametrize("with_legacy", [False, True])
+async def test_a_tombstone_without_a_postgres_row_is_never_acked_clean(
+    redis_client, world, with_legacy
+):
+    api = world
+    if not with_legacy:
+        await redis_client.delete(legacy_history_key(GUILD))
+    raw = build_snapshot(GUILD, dump(raw_history_with_target()), revision=3)
+    await redis_client.set(history_key(GUILD), raw.model_dump_json())
+    api.durable.pop(GUILD)  # no Postgres row at all
+    await redis_client.set(
+        history_invalid_key(GUILD),
+        json.dumps({"run_id": "old-run", "request_id": "req", "revision": 1003}),
+    )
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    await replica.consumer.initialize()
+    await submit(redis_client, command())
+
+    await replica.consumer.poll_once()
+
+    [ack] = api.acks
+    assert ack["outcome"] == "failed"
+    assert ack["tombstoned"] is True
+    assert ack["detail"].startswith("tombstoned=1; ")
+    assert await stored_v1(redis_client) == raw.model_dump_json()  # left as is
+    assert await redis_client.exists(history_invalid_key(GUILD))
+    assert await pending_count(redis_client) == 1  # kept for a retry
+
+    # Recovery has nothing to restore from, and a wake defers, not crashes.
+    assert await replica.consumer._recover_tombstone(GUILD) is False
+    with pytest.raises(HistoryUnavailableError):
+        await replica.runtime.process(batch())
+    assert replica.runtime.engine.seen_histories == []
+    assert await redis_client.exists(history_invalid_key(GUILD))
+    await replica.writer.close(timeout=1)

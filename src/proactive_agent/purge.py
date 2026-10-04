@@ -1010,6 +1010,14 @@ class PrivacyPurgeConsumer:
             # Its bytes may hold the user, but nothing can be folded from
             # them; never deleted, never acked purged.
             raise PurgeFailed("unreadable legacy store")
+        if tombstoned and (snapshot is None or not snapshot.history):
+            # Tombstoned, yet Postgres holds no purged copy: v1 (skipped while
+            # tombstoned) may still hold the user's raw messages, there is
+            # nothing to restore from, and migrating legacy over it would
+            # reset v1's memory. Never report clean: fail visibly with
+            # everything left as it is (the tombstone makes the step a
+            # forced retry, so the command stays pending).
+            raise PurgeFailed("tombstoned without a postgres copy")
         migrated = False
         if (
             snapshot is None
