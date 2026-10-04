@@ -203,3 +203,16 @@ async def test_failure_notice_window_reopens_once_it_expires(redis_client):
     await redis_client.delete(failure_notice_key("111"))
 
     assert await queue.claim_failure_notice("111", ttl_seconds=21_600)
+
+
+@pytest.mark.asyncio
+async def test_lease_is_refused_while_a_privacy_purge_fences_the_guild(redis_client):
+    from proactive_agent.keys import privacy_lock_key
+
+    queue = RedisWakeQueue(redis_client, consumer_name="worker")
+    await redis_client.set(ownership_key("111"), "external")
+    await redis_client.set(privacy_lock_key("111"), "purge", ex=600)
+
+    assert await queue.acquire_lease("111") is None
+    await redis_client.delete(privacy_lock_key("111"))
+    assert await queue.acquire_lease("111") is not None

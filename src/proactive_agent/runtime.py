@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,14 +21,38 @@ from proactive_agent.agent import OPERATING_POLICY_BRIEF
 from proactive_agent.contracts import ControlCommand, NotificationEnvelope
 from proactive_agent.engine import AgentEngine, render_notifications
 from proactive_agent.environment import ChannelEnvironment, InstructionStore
-from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
-from proactive_agent.keys import checkpoint_key, control_stream_key
+from proactive_agent.history import (
+    DebouncedHistoryWriter,
+    GuildHistoryRepository,
+    HistoryUnavailableError,
+    StaleHistoryError,
+)
+from proactive_agent.keys import (
+    checkpoint_key,
+    control_stream_key,
+    history_invalid_key,
+    history_key,
+    purge_epoch_key,
+)
 from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
 from proactive_agent.response_fitting import split_for_discord
 from proactive_agent.types import ActivationResult
 
 MEMORY_REFRESH_SECONDS = 3600
+_SNOWFLAKE_PATTERN = re.compile(r"(?<![0-9])([0-9]{15,22})(?![0-9])")
+# One round trip at wake start: the guild's purge epoch and the revision of
+# the v1 history snapshot (matched as text, never decoding the history).
+_STORE_STATE_LUA = """
+local epoch = redis.call('GET', KEYS[1]) or ''
+local current = redis.call('GET', KEYS[2])
+local revision = ''
+if current then
+  revision = string.match(current, '"revision":(%d+)') or ''
+end
+local invalid = tostring(redis.call('EXISTS', KEYS[3]))
+return {epoch, revision, invalid}
+"""
 HISTORY_FETCH_LIMIT = 60
 # One dropped wake is worth saying out loud; a broken model or a poisoned
 # history would otherwise repeat it every few minutes for hours.
@@ -45,6 +70,12 @@ def failure_notice_text(error: str) -> str:
         f"```{detail}```\n"
         "I'll stay quiet about any further failures for the next 6 hours."
     )
+
+
+def _decode_or_none(value) -> str | None:
+    if value is None or value in (b"", ""):
+        return None
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 def render_memory_block(memory: dict | None) -> str:
@@ -118,15 +149,22 @@ class GuildRuntime:
     history_revision: int = 0
     memory_block: str = ""
     memory_refreshed_at: float = 0
+    # The guild's purge-epoch value the in-RAM history was loaded under.
+    purge_epoch: str | None = None
+    store_synced: bool = False
+    # Anything with is_blocked(user_id); notification bodies naming a
+    # blocked user's id never reach the brief. None blocks nobody.
+    blocked_users: object = None
 
     async def process(self, batch: WakeBatch) -> ActivationResult:
         if batch.guild_id != self.guild_id:
             raise ValueError("wake batch crossed guild runtime boundary")
+        await self._sync_with_store()
         enabled_rows = await self.api.list_enabled_channels(self.guild_id)
         enabled_channels: dict[str, str] = {}
         instruction_stores: dict[str, InstructionStore] = {}
         persisted_addenda: dict[str, str] = {}
-        notifications = list(batch.notifications)
+        notifications = self._without_blocked(batch.notifications)
         for row in enabled_rows:
             channel = await self.discord.channel(row.channel_id)
             channel_name = channel.get("name") or row.channel_id
@@ -160,7 +198,10 @@ class GuildRuntime:
             )
 
         await self._load_history()
-        if time.monotonic() - self.memory_refreshed_at >= MEMORY_REFRESH_SECONDS:
+        if (
+            not self.memory_refreshed_at
+            or time.monotonic() - self.memory_refreshed_at >= MEMORY_REFRESH_SECONDS
+        ):
             self.memory_block = render_memory_block(
                 await self.api.get_memory(self.guild_id)
             )
@@ -193,6 +234,7 @@ class GuildRuntime:
 
         async def drain_notifications() -> str:
             arrived, dropped = await self.queue.drain_midrun(batch)
+            arrived = tuple(self._without_blocked(arrived))
             if not arrived:
                 return "No new notifications."
             return render_notifications(arrived, dropped)
@@ -228,11 +270,7 @@ class GuildRuntime:
         serialized_history = json.loads(
             ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
         )
-        snapshot = await self.history_writer.save(
-            guild_id=self.guild_id,
-            history=serialized_history,
-            previous_revision=self.history_revision,
-        )
+        snapshot = await self._save_history(serialized_history)
         self.history_revision = snapshot.revision
         await self._record_usage(batch, result, responses)
         return result
@@ -269,6 +307,90 @@ class GuildRuntime:
             (channel_id for channel_id in candidates if channel_id in enabled),
             enabled[0],
         )
+
+    async def _save_history(self, history: list[dict]):
+        try:
+            return await self.history_writer.save(
+                guild_id=self.guild_id,
+                history=history,
+                previous_revision=self.history_revision,
+            )
+        except StaleHistoryError:
+            # Someone else (another replica, or a purge) stored a newer
+            # revision; this copy is stale and must be reloaded, not kept.
+            self.forget_history()
+            raise
+
+    def _without_blocked(self, notifications) -> list[NotificationEnvelope]:
+        """Drop notifications whose body names a blocked user's id.
+
+        The producer stops emitting them; this is the backstop for anything
+        queued before the user was blocked.
+        """
+        if self.blocked_users is None:
+            return list(notifications)
+        kept = []
+        for notification in notifications:
+            ids = _SNOWFLAKE_PATTERN.findall(notification.body)
+            if any(self.blocked_users.is_blocked(user_id) for user_id in ids):
+                continue
+            kept.append(notification)
+        return kept
+
+    def forget_history(self) -> None:
+        """Drop the in-RAM history and memory so the next wake reloads both."""
+        self.history_loaded = False
+        self.engine.agent_runner.history = []
+        self.memory_block = ""
+        self.memory_refreshed_at = 0
+
+    async def _sync_with_store(self) -> None:
+        """One Redis call per wake, before the model runs.
+
+        - The purge epoch moved: a purge replaced the guild's history, so
+          history AND memory are reloaded (saving on the stale in-RAM copy
+          would bring the purged user's words back).
+        - The history-invalid tombstone exists: the in-RAM copy is dropped
+          and the wake refused before the model runs.
+        - The stored v1 revision differs from the one this runtime holds:
+          another replica ran the guild's last wake, so history is reloaded.
+          Without this the wake would run and only then have its save
+          refused by the compare-on-revision backstop.
+        """
+        raw_epoch, raw_revision, raw_invalid = await self.redis.eval(
+            _STORE_STATE_LUA,
+            3,
+            purge_epoch_key(self.guild_id),
+            history_key(self.guild_id),
+            history_invalid_key(self.guild_id),
+        )
+        epoch = _decode_or_none(raw_epoch)
+        revision = _decode_or_none(raw_revision)
+        if _decode_or_none(raw_invalid) == "1":
+            # A purge rewrote Postgres but could not replace v1. The Postgres
+            # copy is the purged one: under this wake's guild lease, restore
+            # v1 from it and carry on. Only when Postgres does not hold the
+            # purged revision does the wake defer (no model call, no Discord
+            # action) and the guild stay tombstoned.
+            self.forget_history()
+            self.store_synced = False
+            self.history_writer.discard(self.guild_id)
+            if not await self.history_repository.recover_tombstone(self.guild_id):
+                raise HistoryUnavailableError(
+                    f"proactive history tombstoned for guild {self.guild_id}"
+                )
+            self.purge_epoch = epoch
+            self.store_synced = True
+            return
+        if self.store_synced and epoch != self.purge_epoch:
+            # Also when history is not loaded: a cached memory block from
+            # before the purge must be refetched too.
+            self.forget_history()
+        elif self.history_loaded and revision != str(self.history_revision):
+            self.history_loaded = False
+            self.engine.agent_runner.history = []
+        self.purge_epoch = epoch
+        self.store_synced = True
 
     async def _load_history(self) -> None:
         if self.history_loaded:
@@ -317,10 +439,8 @@ class GuildRuntime:
             ModelRequest(parts=[UserPromptPart(note)]),
             ModelResponse(parts=[TextPart("Worker error recorded for the next wake.")]),
         ]
-        snapshot = await self.history_writer.save(
-            guild_id=self.guild_id,
-            history=json.loads(ModelMessagesTypeAdapter.dump_json(updated)),
-            previous_revision=self.history_revision,
+        snapshot = await self._save_history(
+            json.loads(ModelMessagesTypeAdapter.dump_json(updated))
         )
         self.engine.agent_runner.history = updated
         self.history_revision = snapshot.revision
@@ -485,6 +605,12 @@ class GuildRuntimeRegistry:
             runtime = await self._factory(guild_id)
             self._runtimes[guild_id] = runtime
         return runtime
+
+    def forget(self, guild_id: str) -> None:
+        """Make a cached runtime reload its history and memory next wake."""
+        runtime = self._runtimes.get(guild_id)
+        if runtime is not None:
+            runtime.forget_history()
 
     @property
     def guild_ids(self) -> frozenset[str]:

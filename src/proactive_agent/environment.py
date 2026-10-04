@@ -19,6 +19,7 @@ from proactive_agent.transcript import (
     speaker_tags,
 )
 from proactive_agent.types import (
+    BlockedMessage,
     ChannelMessage,
     ProposedReaction,
     ProposedResponse,
@@ -27,31 +28,41 @@ from proactive_agent.types import (
 
 @dataclass
 class ChannelEnvironment:
-    visible: list[ChannelMessage]
+    # BlockedMessage entries hold only their position: they render as the
+    # blocked line and are never addressable by id.
+    visible: list[ChannelMessage | BlockedMessage]
     bot_user_id: str
 
     def __post_init__(self) -> None:
-        self._by_id = {message.id: message for message in self.visible}
+        self._by_id = {
+            message.id: message
+            for message in self.visible
+            if not isinstance(message, BlockedMessage)
+        }
         self._tags = speaker_tags([m.to_record() for m in self.visible])
 
     def lookup(self, message_id: str) -> ChannelMessage | None:
         return self._by_id.get(message_id)
 
-    def history(self, limit: int, before_id: str | None = None) -> list[ChannelMessage]:
+    def history(
+        self, limit: int, before_id: str | None = None
+    ) -> list[ChannelMessage | BlockedMessage]:
         pool = self.visible
         if before_id is not None:
             positions = [i for i, m in enumerate(pool) if m.id == before_id]
             pool = pool[: positions[0]] if positions else []
         return pool[-limit:]
 
-    def slice_around(self, message_id: str, *, radius: int) -> list[ChannelMessage]:
+    def slice_around(
+        self, message_id: str, *, radius: int
+    ) -> list[ChannelMessage | BlockedMessage]:
         positions = [i for i, m in enumerate(self.visible) if m.id == message_id]
         if not positions:
             return []
         position = positions[0]
         return self.visible[max(0, position - radius) : position + radius + 1]
 
-    def render(self, messages: list[ChannelMessage]) -> str:
+    def render(self, messages: list[ChannelMessage | BlockedMessage]) -> str:
         """Transcript lines with speaker tags stable across the whole wake."""
         return (
             "\n".join(

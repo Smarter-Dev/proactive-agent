@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import socket
 
@@ -15,6 +16,7 @@ from proactive_agent.agent import (
     self_compaction_summary,
 )
 from proactive_agent.api import ApplicationAPI
+from proactive_agent.blocked_users import BlockedUsers
 from proactive_agent.capabilities import (
     HandlerAuthor,
     ImageCapabilities,
@@ -28,6 +30,7 @@ from proactive_agent.health import HealthServer
 from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
 from proactive_agent.models import build_model
 from proactive_agent.parity import build_proactive_agent
+from proactive_agent.purge import PrivacyPurgeConsumer
 from proactive_agent.queue import RedisWakeQueue
 from proactive_agent.runtime import ActionJournal, GuildRuntime, GuildRuntimeRegistry
 from proactive_agent.worker import ProactiveWorker
@@ -46,7 +49,13 @@ async def run() -> None:
         base_url=settings.api_base_url,
         api_key=settings.proactive_agent_api_key,
     )
-    discord = DiscordREST(bot_token=settings.discord_bot_token)
+    replica_id = f"{socket.gethostname()}-{os.getpid()}"
+    blocked_users = BlockedUsers(
+        api, redis_client, component="worker", replica_id=replica_id
+    )
+    discord = DiscordREST(
+        bot_token=settings.discord_bot_token, blocked_users=blocked_users
+    )
     history_repository = GuildHistoryRepository(redis_client, api)
     history_writer = DebouncedHistoryWriter(
         history_repository,
@@ -115,14 +124,30 @@ async def run() -> None:
             image_capabilities=image_capabilities,
             media_reader=media_reader,
             author_handler=author_handler,
+            blocked_users=blocked_users,
         )
 
     runtimes = GuildRuntimeRegistry(build_runtime)
+    privacy_purges = PrivacyPurgeConsumer(
+        redis_client,
+        api,
+        queue,
+        history_repository,
+        history_writer,
+        runtimes,
+        # The agent's own model rewrites its own memory.
+        model=build_model(settings.proactive_agent_model),
+        consumer_name=queue.consumer_name,
+        blocked_users=blocked_users,
+        replica_id=replica_id,
+    )
     worker = ProactiveWorker(
         queue,
         runtimes,
         concurrency=settings.proactive_worker_concurrency,
         max_attempts=settings.proactive_max_attempts,
+        services=(blocked_users, privacy_purges),
+        blocked_users=blocked_users,
     )
     health = HealthServer(redis_client, api, port=settings.proactive_health_port)
     await health.start()

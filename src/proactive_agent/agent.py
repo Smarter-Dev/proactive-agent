@@ -9,12 +9,17 @@ active ingest and the 15-minute passive sweep.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
+import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from inspect import isawaitable
+from typing import Literal
 
+from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
     ModelMessage,
@@ -666,25 +671,8 @@ def fold_boundary(history: list[ModelMessage], keep_messages: int) -> int | None
     return None
 
 
-async def compact_agent_history(
-    history: list[ModelMessage],
-    *,
-    token_limit: int,
-    summarize: Callable[[list[ModelMessage]], Awaitable[str]],
-    keep_messages: int = COMPACTION_KEEP_MESSAGES,
-) -> list[ModelMessage]:
-    """Fold old wakes into a summary once the history outgrows the limit.
-
-    Both halves are cut on a turn boundary, so neither the folded half nor
-    the kept tail ever splits a tool call from its return.
-    """
-    if estimated_history_tokens(history) <= token_limit:
-        return history
-    cut = fold_boundary(history, keep_messages)
-    if not cut:
-        return history
-    old, tail = history[:cut], history[cut:]
-    summary = await summarize(old)
+def memory_note_pair(summary: str) -> list[ModelMessage]:
+    """The standard two-message memory note that replaces folded history."""
     return [
         ModelRequest(
             parts=[
@@ -705,8 +693,377 @@ async def compact_agent_history(
                 )
             ]
         ),
-        *tail,
     ]
+
+
+async def compact_agent_history(
+    history: list[ModelMessage],
+    *,
+    token_limit: int,
+    summarize: Callable[[list[ModelMessage]], Awaitable[str]],
+    keep_messages: int = COMPACTION_KEEP_MESSAGES,
+) -> list[ModelMessage]:
+    """Fold old wakes into a summary once the history outgrows the limit.
+
+    Both halves are cut on a turn boundary, so neither the folded half nor
+    the kept tail ever splits a tool call from its return.
+    """
+    if estimated_history_tokens(history) <= token_limit:
+        return history
+    cut = fold_boundary(history, keep_messages)
+    if not cut:
+        return history
+    old, tail = history[:cut], history[cut:]
+    summary = await summarize(old)
+    return [*memory_note_pair(summary), *tail]
+
+
+PRIVACY_PURGE_PROMPT = """\
+PRIVACY PURGE. A member of this community has asked to be forgotten. Their
+Discord user id is {user_id}{names_clause}. Everything above this message will
+be replaced by the memory note you write now; nothing else of it survives.
+
+Write the note exactly as you would for a normal compaction (rules below),
+with one overriding difference: leave this person out entirely.
+- Nothing they said, asked, shared or did, and nothing you learned about them
+or from them.
+- Never write their user id, any of their names, a mention of them, or a
+description that would identify them.
+- Keep everyone else: their conversations, commitments, preferences and facts.
+Where someone else's words only made sense as a reply to this person, keep
+what the other person said or decided without attributing anything to the
+person being forgotten.
+- Do not say that anyone was removed, that a purge happened, or that anything
+is missing.
+
+Normal compaction rules:
+{compaction_rules}"""
+
+PRIVACY_ID_RETRY_PROMPT = """\
+Your note still contains the user id {user_id}. Write the whole note
+again, without that id and without anything else about the person being
+forgotten. Reply with the complete note only."""
+
+PRIVACY_NAME_RETRY_PROMPT = """\
+Your note still uses a name of the person being forgotten. Write the whole note
+again without any of their names and without anything else about them. If a
+word only coincides with one of the names and refers to something else, keep
+it. Reply with the complete note only."""
+
+PRIVACY_MAX_ID_RETRIES = 2
+PRIVACY_MAX_NAME_RETRIES = 1
+
+
+class PrivacyCompactionError(RuntimeError):
+    """The model could not write a valid purged note. Content-free message."""
+
+
+@dataclass(frozen=True)
+class PrivacyNote:
+    text: str
+    # Whole-word name matches left after the retry; allowed, but reported.
+    name_hits: int
+    attempts: int
+    usage: dict
+
+
+def build_privacy_purge_prompt(user_id: str, names: list[str]) -> str:
+    names_clause = (
+        "; they have appeared under these names: "
+        + ", ".join(f'"{name}"' for name in names)
+        if names
+        else ""
+    )
+    return PRIVACY_PURGE_PROMPT.format(
+        user_id=user_id,
+        names_clause=names_clause,
+        compaction_rules=COMPACTION_PROMPT,
+    )
+
+
+# -- Name matcher (shared spec privacy:v1, identical in the bot and web) ----
+#
+# Text and names are NFC-normalised and casefolded; names are stripped and
+# empty ones dropped. A name made only of ASCII [a-z0-9_] and spaces matches
+# where it is neither preceded nor followed by an ASCII letter (so alice2,
+# alice_dev and 2alice hit, malice and alicea do not), and is not matched at
+# all below 2 characters ("unchecked"). Any other name (CJK, emoji, accents,
+# punctuation) matches as a plain substring, at any length.
+
+MIN_CHECKED_ASCII_NAME_CHARS = 2
+_ASCII_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_ ")
+_ASCII_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyz")
+
+
+def normalise_for_match(text: str) -> str:
+    return unicodedata.normalize("NFC", text).casefold()
+
+
+def _normalised_names(names: list[str]) -> list[tuple[str, str]]:
+    """(original, normalised) pairs, stripped, empty and duplicates dropped."""
+    seen: dict[str, str] = {}
+    for name in names:
+        needle = normalise_for_match(name.strip())
+        if needle and needle not in seen:
+            seen[needle] = name.strip()
+    return [(original, needle) for needle, original in seen.items()]
+
+
+def _is_ascii_name(needle: str) -> bool:
+    return all(character in _ASCII_NAME_CHARS for character in needle)
+
+
+def checked_names(names: list[str]) -> list[str]:
+    """Names the matcher checks (every name but ASCII ones under 2 chars)."""
+    return [
+        original
+        for original, needle in _normalised_names(names)
+        if not _is_ascii_name(needle) or len(needle) >= MIN_CHECKED_ASCII_NAME_CHARS
+    ]
+
+
+def unchecked_name_list(names: list[str]) -> list[str]:
+    """The names (as given, stripped) too short to match: ASCII under 2 chars."""
+    return [
+        original
+        for original, needle in _normalised_names(names)
+        if _is_ascii_name(needle) and len(needle) < MIN_CHECKED_ASCII_NAME_CHARS
+    ]
+
+
+def unchecked_names(names: list[str]) -> int:
+    """How many names are too short to match (reported, never matched)."""
+    return len(unchecked_name_list(names))
+
+
+def _name_occurs(haystack: str, needle: str) -> bool:
+    if not _is_ascii_name(needle):
+        return needle in haystack
+    if len(needle) < MIN_CHECKED_ASCII_NAME_CHARS:
+        return False
+    start = 0
+    while (index := haystack.find(needle, start)) != -1:
+        end = index + len(needle)
+        before = index == 0 or haystack[index - 1] not in _ASCII_LETTERS
+        after = end == len(haystack) or haystack[end] not in _ASCII_LETTERS
+        if before and after:
+            return True
+        start = index + 1
+    return False
+
+
+def name_hits(text: str, names: list[str]) -> list[str]:
+    """The names (as given) that occur in ``text`` under the privacy:v1 matcher."""
+    haystack = normalise_for_match(text)
+    return [
+        original
+        for original, needle in _normalised_names(names)
+        if _name_occurs(haystack, needle)
+    ]
+
+
+def mentions_target(text: str, user_id: str, names: list[str]) -> bool:
+    """The user id anywhere, or a name under the privacy:v1 matcher."""
+    return user_id in text or bool(name_hits(text, names))
+
+
+# -- Rewrite checks (privacy:v1, identical in the bot) ------------------------
+#
+# The agent rewrites its memory without the user and its answer is stored.
+# The only checks: (1) a non-empty input must come back non-empty, else the
+# step fails; (2) the output must not hold the user id, else it is asked
+# again, then the step fails; (3) a listed name left after one re-ask is
+# stored and reported as a name hit; (4) a model timeout or error fails the
+# step. A failing step leaves every stored byte untouched.
+
+PRIVACY_MODEL_TIMEOUT_SECONDS = 120
+
+# The prefix render_transcript_line writes for a member's message:
+# `[id=<msg>] [BOT] <TAG>·<display> (uid=<author>)( (reply to id=<msg>))?: `
+# The display may not contain ": ", so a pre-uid line whose text happens to
+# hold " (uid=N): " never matches.
+MEMBER_LINE_PREFIX = re.compile(
+    r"^\[id=[0-9]+\] (\[BOT\] )?[A-Z]+·((?:(?!: )[^\n])*?) \(uid=([0-9]{1,22})\)"
+    r"(?: \(reply to id=[0-9]+\))?: "
+)
+
+
+def string_leaves(value) -> list[str]:
+    """Every string inside a JSON-like value, decoded (never re-escaped)."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in string_leaves(item)]
+    if isinstance(value, list | tuple):
+        return [leaf for item in value for leaf in string_leaves(item)]
+    return []
+
+
+async def _run_with_timeout(agent: Agent, prompt: str, history):
+    try:
+        return await asyncio.wait_for(
+            agent.run(prompt, message_history=history or None),
+            timeout=PRIVACY_MODEL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as error:
+        raise PrivacyCompactionError("timeout") from error
+
+
+async def privacy_compaction_summary(
+    model: Model | str,
+    messages: list[ModelMessage],
+    *,
+    user_id: str,
+    names: list[str],
+    max_id_retries: int = PRIVACY_MAX_ID_RETRIES,
+    max_name_retries: int = PRIVACY_MAX_NAME_RETRIES,
+) -> PrivacyNote:
+    """The agent's own memory note, rewritten by its own model without one user.
+
+    Rewrite checks privacy:v1. An empty note (the input is never empty here)
+    fails the step at once ("empty_output"). A note holding the user id is
+    asked for again up to ``max_id_retries`` times, then fails
+    ("target_id"). A name match is asked about ``max_name_retries`` time(s),
+    then the note is stored and the hits reported. A model call over
+    PRIVACY_MODEL_TIMEOUT_SECONDS fails ("timeout"); other model errors
+    propagate. On any failure the caller leaves the stored history untouched.
+    """
+    compaction_agent = Agent(model, output_type=str)
+    prompt = build_privacy_purge_prompt(user_id, names)
+    history: list[ModelMessage] = list(messages)
+    usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
+    id_retries = name_retries = attempts = 0
+    while True:
+        attempts += 1
+        result = await _run_with_timeout(compaction_agent, prompt, history)
+        for key, value in usage_dict(result.usage).items():
+            usage[key] += value
+        note = str(result.output)
+        if not note.strip():
+            raise PrivacyCompactionError("empty_output")
+        if user_id in note:
+            if id_retries >= max_id_retries:
+                raise PrivacyCompactionError("target_id")
+            id_retries += 1
+            history = result.all_messages()
+            prompt = PRIVACY_ID_RETRY_PROMPT.format(user_id=user_id)
+            continue
+        hits = name_hits(note, names)
+        if hits and name_retries < max_name_retries:
+            name_retries += 1
+            history = result.all_messages()
+            prompt = PRIVACY_NAME_RETRY_PROMPT
+            continue
+        return PrivacyNote(
+            text=note, name_hits=len(hits), attempts=attempts, usage=usage
+        )
+
+
+async def purge_agent_history(
+    history: list[ModelMessage],
+    *,
+    summarize: Callable[[list[ModelMessage]], Awaitable[str]],
+) -> list[ModelMessage]:
+    """Fold the WHOLE history, no kept tail, into the memory-note pair.
+
+    Unlike compact_agent_history nothing is kept verbatim: every raw message
+    may hold the purged user's words, so all of it goes through the model.
+    An empty history has nothing to fold and is returned as is.
+    """
+    if not history:
+        return history
+    return memory_note_pair(await summarize(list(history)))
+
+
+PRIVACY_WATCH_PROMPT = """\
+PRIVACY PURGE. A member of this community has asked to be forgotten. Their
+Discord user id is {user_id}{names_clause}.
+
+Below are the watch instructions you set for the watcher in one channel. Decide
+for each one:
+- keep: it has nothing to do with this person;
+- rewrite: it still serves other people, but must no longer refer to this
+person (give the new text, without their id, names, mentions or anything that
+identifies them);
+- drop: it exists only because of this person.
+Return one decision per instruction id.
+
+WATCH INSTRUCTIONS:
+{entries}"""
+
+PRIVACY_WATCH_RETRY_PROMPT = """\
+At least one instruction you kept or rewrote still contains the user id
+{user_id} or one of their names. Decide again for every instruction."""
+
+
+class WatchDecision(BaseModel):
+    instruction_id: str
+    action: Literal["keep", "rewrite", "drop"]
+    text: str | None = None
+
+
+class WatchDecisions(BaseModel):
+    decisions: list[WatchDecision]
+
+
+async def privacy_watch_decisions(
+    model: Model | str,
+    entries: dict[str, str],
+    *,
+    user_id: str,
+    names: list[str],
+) -> tuple[dict[str, str | None], int]:
+    """The agent decides keep/rewrite/drop for each watch instruction.
+
+    Returns the new text per instruction id (None = drop) and the number of
+    kept entries still matching a name. An entry without a decision is kept.
+    Rewrite checks privacy:v1: a rewrite with no text fails ("empty_output");
+    kept or rewritten text holding the user id is asked again up to
+    PRIVACY_MAX_ID_RETRIES times, then fails ("target_id"); a name match is
+    asked about once, then accepted and reported; a timeout fails.
+    """
+    if not entries:
+        return {}, 0
+    names_clause = (
+        "; they have appeared under these names: "
+        + ", ".join(f'"{name}"' for name in names)
+        if names
+        else ""
+    )
+    prompt = PRIVACY_WATCH_PROMPT.format(
+        user_id=user_id,
+        names_clause=names_clause,
+        entries="\n".join(f"- {key}: {text}" for key, text in entries.items()),
+    )
+    decision_agent = Agent(model, output_type=WatchDecisions)
+    history: list[ModelMessage] | None = None
+    id_retries = name_retries = 0
+    while True:
+        result = await _run_with_timeout(decision_agent, prompt, history)
+        by_id = {item.instruction_id: item for item in result.output.decisions}
+        outcome: dict[str, str | None] = {}
+        for key, text in entries.items():
+            decision = by_id.get(key)
+            if decision is None or decision.action == "keep":
+                outcome[key] = text
+            elif decision.action == "drop":
+                outcome[key] = None
+            elif not (decision.text or "").strip():
+                raise PrivacyCompactionError("empty_output")
+            else:
+                outcome[key] = decision.text.strip()
+        kept = [text for text in outcome.values() if text is not None]
+        leaks_name = sum(1 for text in kept if name_hits(text, names))
+        if any(user_id in text for text in kept):
+            if id_retries >= PRIVACY_MAX_ID_RETRIES:
+                raise PrivacyCompactionError("target_id")
+            id_retries += 1
+        elif leaks_name and name_retries < PRIVACY_MAX_NAME_RETRIES:
+            name_retries += 1
+        else:
+            return outcome, leaks_name
+        history = result.all_messages()
+        prompt = PRIVACY_WATCH_RETRY_PROMPT.format(user_id=user_id)
 
 
 @dataclass

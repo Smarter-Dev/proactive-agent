@@ -8,6 +8,7 @@ import time
 
 from pydantic_ai.exceptions import ModelHTTPError
 
+from proactive_agent.history import HistoryUnavailableError
 from proactive_agent.queue import ReadyRecord
 
 logger = logging.getLogger(__name__)
@@ -25,8 +26,24 @@ class UnavailableRetriesExhausted(RuntimeError):
 
 
 class ProactiveWorker:
-    def __init__(self, queue, runtimes, *, concurrency: int = 8, max_attempts: int = 5):
+    def __init__(
+        self,
+        queue,
+        runtimes,
+        *,
+        concurrency: int = 8,
+        max_attempts: int = 5,
+        services: tuple = (),
+        blocked_users=None,
+    ):
         self._queue = queue
+        # Long-running side loops (privacy purges, ...) with run(stop).
+        self._services = tuple(services)
+        # No wake runs until this process has loaded the blocked-users list
+        # once; after that it keeps going on the last list it loaded.
+        self._blocked_users = blocked_users
+        self._enforcing_poll_seconds = 1.0
+        self._service_restart_seconds = 1.0
         self._runtimes = runtimes
         self._semaphore = asyncio.Semaphore(concurrency)
         self._max_attempts = max_attempts
@@ -34,8 +51,62 @@ class ProactiveWorker:
         self._sleep_retry = asyncio.sleep
 
     async def run(self, stop: asyncio.Event) -> None:
+        services = [
+            asyncio.create_task(self._supervise(service, stop))
+            for service in self._services
+        ]
+        try:
+            await self._run_wakes(stop)
+        finally:
+            stop.set()
+            await asyncio.gather(*services, return_exceptions=True)
+
+    async def _supervise(self, service, stop: asyncio.Event) -> None:
+        """Run a side service until stop, restarting it whenever it dies."""
+        restarts = 0
+        while not stop.is_set():
+            try:
+                await service.run(stop)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                restarts += 1
+                logger.error(
+                    "proactive service died, restarting service=%s type=%s restarts=%d",
+                    type(service).__name__,
+                    type(error).__name__,
+                    restarts,
+                )
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(),
+                        timeout=min(30, self._service_restart_seconds * restarts),
+                    )
+                except TimeoutError:
+                    pass
+            else:
+                if not stop.is_set():
+                    logger.error(
+                        "proactive service returned early, restarting service=%s",
+                        type(service).__name__,
+                    )
+                    await asyncio.sleep(self._service_restart_seconds)
+
+    async def _wait_enforcing(self, stop: asyncio.Event) -> bool:
+        if self._blocked_users is None or self._blocked_users.enforcing:
+            return True
+        logger.warning("proactive worker waiting for the first blocked users list")
+        return await self._blocked_users.wait_enforcing(
+            stop, poll_seconds=self._enforcing_poll_seconds
+        )
+
+    async def _run_wakes(self, stop: asyncio.Event) -> None:
+        if not await self._wait_enforcing(stop):
+            return
         await self._queue.initialize()
         while not stop.is_set():
+            if not await self._wait_enforcing(stop):
+                return
             reclaimed = await self._queue.reclaim_ready()
             ready = reclaimed or await self._queue.read_ready(block_ms=5_000)
             by_guild: dict[str, list[ReadyRecord]] = {}
@@ -53,8 +124,20 @@ class ProactiveWorker:
             if not await self._queue.externally_owned(guild_id):
                 await self._queue.discard_embedded_ready(guild_id, ready)
                 return
+            if self._blocked_users is not None and not self._blocked_users.enforcing:
+                # No blocked-users list loaded yet: take no wake lease.
+                await asyncio.sleep(self._enforcing_poll_seconds)
+                continue
             async with self._semaphore:
-                lease = await self._queue.acquire_lease(guild_id)
+                # Checked again after the semaphore wait, right before the
+                # lease: the list must have been loaded once.
+                if (
+                    self._blocked_users is not None
+                    and not self._blocked_users.enforcing
+                ):
+                    lease = None
+                else:
+                    lease = await self._queue.acquire_lease(guild_id)
                 if lease is not None:
                     await self._run_guild_with_lease(guild_id, ready, lease)
                     return
@@ -99,6 +182,16 @@ class ProactiveWorker:
                     len(batch.notifications),
                     batch.dropped,
                     time.monotonic() - started,
+                )
+            except HistoryUnavailableError:
+                # A purge left the guild's v1 history tombstoned and will be
+                # retried. Defer like a cold start: no attempt counted, no
+                # dead letter; the records stay pending and are reclaimed.
+                logger.warning(
+                    "proactive guild wake deferred, history unavailable "
+                    "guild=%s wake=%s",
+                    guild_id,
+                    batch.wake_id,
                 )
             except Exception as error:
                 logger.exception(

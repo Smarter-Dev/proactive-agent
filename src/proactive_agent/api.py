@@ -7,7 +7,11 @@ from typing import Any
 
 import httpx
 
-from proactive_agent.contracts import EnabledChannel, HistorySnapshot
+from proactive_agent.contracts import (
+    BlockedUsersList,
+    EnabledChannel,
+    HistorySnapshot,
+)
 
 
 class ApplicationAPIError(Exception):
@@ -115,6 +119,43 @@ class ApplicationAPI:
                 "entries": entries,
             },
         )
+
+    async def get_blocked_users(self) -> BlockedUsersList:
+        response = await self._request("GET", "/privacy/blocked-users")
+        return BlockedUsersList.model_validate(response.json())
+
+    async def post_privacy_ack(
+        self,
+        run_id: str,
+        *,
+        component: str,
+        guild_id: str,
+        outcome: str,
+        stores: list[str],
+        detail: str,
+        name_hits: dict[str, int] | None = None,
+        tombstoned: bool = False,
+        unchecked_names: int = 0,
+        done_record: str = "not_written",
+    ) -> bool:
+        """Report one guild's purge outcome; False when the run is unknown."""
+        response = await self._request(
+            "POST",
+            f"/privacy/purges/{run_id}/acks",
+            allow_not_found=True,
+            json={
+                "component": component,
+                "guild_id": guild_id,
+                "outcome": outcome,
+                "stores": stores,
+                "detail": detail[:500],
+                "name_hits": dict(name_hits or {}),
+                "tombstoned": tombstoned,
+                "unchecked_names": unchecked_names,
+                "done_record": done_record,
+            },
+        )
+        return response is not None
 
     async def get_memory(self, guild_id: str) -> dict[str, Any] | None:
         response = await self._request(

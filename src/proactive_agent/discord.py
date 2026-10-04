@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from proactive_agent.types import ChannelMessage
+from proactive_agent.types import BlockedMessage, ChannelMessage
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+_MENTION_PATTERN = re.compile(r"<@!?([0-9]{15,22})>")
+_SNOWFLAKE_PATTERN = re.compile(r"(?<![0-9])([0-9]{15,22})(?![0-9])")
 
 
 class DiscordRESTError(Exception):
@@ -28,7 +31,10 @@ class DiscordREST:
         timeout: float = 15,
         transport: httpx.AsyncBaseTransport | None = None,
         api_base: str = DISCORD_API_BASE,
+        blocked_users=None,
     ):
+        # Anything with is_blocked(user_id); None blocks nobody (tests/evals).
+        self._blocked_users = blocked_users
         self._client = httpx.AsyncClient(
             base_url=api_base,
             headers={
@@ -54,7 +60,7 @@ class DiscordREST:
 
     async def fetch_message(
         self, channel_id: str, message_id: str, *, guild_id: str | None = None
-    ) -> ChannelMessage:
+    ) -> ChannelMessage | BlockedMessage:
         record = (
             await self._request("GET", f"/channels/{channel_id}/messages/{message_id}")
         ).json()
@@ -68,7 +74,7 @@ class DiscordREST:
         guild_id: str,
         limit: int = 60,
         before_id: str | None = None,
-    ) -> list[ChannelMessage]:
+    ) -> list[ChannelMessage | BlockedMessage]:
         remaining = max(1, min(limit, 100))
         params: dict[str, Any] = {"limit": remaining}
         if before_id:
@@ -150,10 +156,49 @@ class DiscordREST:
         self._role_names[guild_id] = cached
         return cached
 
+    def _blocked(self, user_id) -> bool:
+        return self._blocked_users is not None and self._blocked_users.is_blocked(
+            str(user_id)
+        )
+
+    def _replies_to_blocked(self, record: dict[str, Any]) -> bool:
+        # Discord embeds the replied-to message; a reply to a blocked author
+        # must not carry that message's id into the transcript.
+        referenced = record.get("referenced_message") or {}
+        author = referenced.get("author") or {}
+        return author.get("id") is not None and self._blocked(author["id"])
+
+    def _without_blocked_ids(self, content: str) -> str:
+        """Scrub blocked users' ids from the text itself.
+
+        Discord's ``mentions`` list misses mentions inside code blocks and
+        anything a bot or webhook wrote, so the content is scanned directly:
+        `<@id>`/`<@!id>` become `@[blocked user]`, a bare id `[blocked user]`.
+        """
+        if self._blocked_users is None:
+            return content
+
+        def mention(match: re.Match) -> str:
+            return "@[blocked user]" if self._blocked(match.group(1)) else match[0]
+
+        def bare(match: re.Match) -> str:
+            return "[blocked user]" if self._blocked(match.group(1)) else match[0]
+
+        content = _MENTION_PATTERN.sub(mention, content)
+        return _SNOWFLAKE_PATTERN.sub(bare, content)
+
     def _message(
         self, record: dict[str, Any], role_names: dict[str, str]
-    ) -> ChannelMessage:
+    ) -> ChannelMessage | BlockedMessage:
+        """The common boundary where a Discord message becomes model input.
+
+        A blocked author's message becomes a BlockedMessage carrying nothing
+        but its position; other messages lose mentions of blocked users.
+        """
         author = record["author"]
+        if self._blocked(author["id"]):
+            return BlockedMessage()
+        mentions = record.get("mentions", ())
         member = record.get("member") or {}
         display = (
             member.get("nick")
@@ -177,14 +222,15 @@ class DiscordREST:
             author_name=author.get("username") or str(author["id"]),
             author_display=display,
             is_bot=bool(author.get("bot", False)),
-            content=record.get("content") or "",
+            content=self._without_blocked_ids(record.get("content") or ""),
             reply_to_id=(
                 str(reference["message_id"])
                 if reference.get("message_id") is not None
+                and not self._replies_to_blocked(record)
                 else None
             ),
             mention_user_ids=tuple(
-                str(user["id"]) for user in record.get("mentions", ())
+                str(user["id"]) for user in mentions if not self._blocked(user["id"])
             ),
             mention_everyone=bool(record.get("mention_everyone", False)),
             attachment_count=len(record.get("attachments", ())),

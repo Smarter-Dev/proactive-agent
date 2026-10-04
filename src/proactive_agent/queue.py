@@ -21,6 +21,7 @@ from proactive_agent.keys import (
     ownership_key,
     pending_dropped_key,
     pending_key,
+    privacy_lock_key,
     wake_stream_key,
 )
 
@@ -62,6 +63,9 @@ return 0
 
 _ACQUIRE_LEASE_LUA = """
 if redis.call('GET', KEYS[2]) ~= 'external' then
+  return 0
+end
+if redis.call('EXISTS', KEYS[3]) == 1 then
   return 0
 end
 return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) and 1 or 0
@@ -226,9 +230,12 @@ class RedisWakeQueue:
         token = uuid4().hex
         acquired = await self._redis.eval(
             _ACQUIRE_LEASE_LUA,
-            2,
+            3,
             lease_key(guild_id),
             ownership_key(guild_id),
+            # A purge fencing a bot-owned guild must not be overtaken by a
+            # wake if ownership flips to the worker mid-purge.
+            privacy_lock_key(guild_id),
             token,
             self.lease_seconds,
         )
