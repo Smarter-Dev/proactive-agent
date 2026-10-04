@@ -87,8 +87,28 @@ class FakeAPI:
         return None
 
     async def post_privacy_ack(
-        self, run_id, *, component, guild_id, outcome, stores, detail
+        self,
+        run_id,
+        *,
+        component,
+        guild_id,
+        outcome,
+        stores,
+        detail,
+        name_hits,
+        tombstoned,
+        unchecked_names,
+        done_record,
     ):
+        # Ack v1 structured fields, checked on every ack the suite posts.
+        assert isinstance(name_hits, dict) and len(name_hits) <= 10
+        assert all(
+            isinstance(k, str) and isinstance(v, int) and v >= 0
+            for k, v in name_hits.items()
+        )
+        assert isinstance(tombstoned, bool)
+        assert isinstance(unchecked_names, int) and unchecked_names >= 0
+        assert done_record in {"written", "replayed", "not_written"}
         if self.ack_status == 404:
             return False
         if self.ack_status >= 400:
@@ -101,6 +121,10 @@ class FakeAPI:
                 "outcome": outcome,
                 "stores": list(stores),
                 "detail": detail,
+                "name_hits": dict(name_hits),
+                "tombstoned": tombstoned,
+                "unchecked_names": unchecked_names,
+                "done_record": done_record,
             }
         )
         return True

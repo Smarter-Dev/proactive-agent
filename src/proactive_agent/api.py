@@ -133,6 +133,10 @@ class ApplicationAPI:
         outcome: str,
         stores: list[str],
         detail: str,
+        name_hits: dict[str, int] | None = None,
+        tombstoned: bool = False,
+        unchecked_names: int = 0,
+        done_record: str = "not_written",
     ) -> bool:
         """Report one guild's purge outcome; False when the run is unknown."""
         response = await self._request(
@@ -145,6 +149,10 @@ class ApplicationAPI:
                 "outcome": outcome,
                 "stores": stores,
                 "detail": detail[:500],
+                "name_hits": dict(name_hits or {}),
+                "tombstoned": tombstoned,
+                "unchecked_names": unchecked_names,
+                "done_record": done_record,
             },
         )
         return response is not None

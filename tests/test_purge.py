@@ -281,6 +281,7 @@ async def test_a_purge_of_another_user_skips_an_already_folded_history(
     assert calls == ["note", "watch", "watch"]  # no second fold
     assert [ack["outcome"] for ack in api.acks] == ["purged", "unchanged"]
     assert api.acks[1]["detail"] == "history already attributed and clean"
+    assert api.acks[1]["name_hits"] == {"history": 0, "watch": 0}
     assert await redis_client.get(purge_epoch_key(GUILD)) == b"1"
     await replica.writer.close(timeout=1)
 

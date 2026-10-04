@@ -118,4 +118,8 @@ async def test_privacy_ack_posts_to_the_run_and_reports_unknown_runs():
         "outcome": "purged",
         "stores": ["proactive:v1:history"],
         "detail": "d" * 500,
+        "name_hits": {},
+        "tombstoned": False,
+        "unchecked_names": 0,
+        "done_record": "not_written",
     }

@@ -360,3 +360,77 @@ def test_structured_parts_feed_the_fold_rule_as_decoded_leaves():
     content = {"messages": [f"{QUOTED} asked about lifetimes", {"note": "tab\there"}]}
     texts = fold_input_texts([ModelRequest(parts=[ToolReturnPart("t", content, "c")])])
     assert texts == [f"{QUOTED} asked about lifetimes", "tab\there"]
+
+
+# Ack v1 structured fields on every path.
+
+
+async def test_structured_fields_on_fresh_replayed_and_failed_acks(redis_client, world):
+    api = world
+    api.ack_status = 500
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    replica.consumer._reclaim_idle_ms = 0
+    await replica.consumer.initialize()
+    await submit(redis_client, dict(command(), names=["k", "kai"]))
+    await replica.consumer.poll_once()  # purged, ack lost
+    api.ack_status = 200
+    await replica.consumer.poll_once()  # redelivery: replayed
+
+    [ack] = api.acks
+    assert ack["done_record"] == "replayed"
+    assert ack["name_hits"] == {"history": 0, "watch": 0}
+    assert ack["tombstoned"] is False
+    assert ack["unchecked_names"] == 1
+    await replica.writer.close(timeout=1)
+
+
+async def test_structured_fields_on_a_fresh_purge_and_a_failure(redis_client, world):
+    api = world
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    await replica.consumer.initialize()
+    await submit(redis_client, command())
+    await replica.consumer.poll_once()
+    assert api.acks[0]["done_record"] == "written"
+    assert api.acks[0]["name_hits"] == {"history": 0, "watch": 0}
+
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("model down")
+
+    replica.consumer._compact = broken
+    await redis_client.set(
+        history_key(GUILD),
+        build_snapshot(
+            GUILD, dump(raw_history_with_target()), revision=9000
+        ).model_dump_json(),
+    )
+    await submit(redis_client, command())
+    await replica.consumer.poll_once()
+    failed = api.acks[-1]
+    assert failed["outcome"] == "failed"
+    assert failed["done_record"] == "not_written"
+    assert failed["tombstoned"] is False
+    await replica.writer.close(timeout=1)
+
+
+async def test_structured_fields_when_a_tombstone_cannot_be_recovered(redis_client):
+    api = ListAPI()
+    api.addenda[GUILD] = {CHANNEL: ""}
+    api.blocked = {"revision": 1, "user_ids": []}
+    await tombstoned_world(redis_client, api, revision=5000)
+    blocked = BlockedUsers(api, redis_client)
+    await blocked.refresh()
+    replica = Replica(redis_client, api, honest_model([]), name="a")
+    replica.consumer._blocked_users = blocked
+    replica.consumer._list_wait_seconds = 0.01
+    replica.consumer._list_poll_seconds = 0.005
+    await replica.consumer.initialize()
+    await submit(redis_client, command())
+
+    await replica.consumer.poll_once()
+
+    [ack] = api.acks
+    assert ack["outcome"] == "failed"
+    assert ack["tombstoned"] is True
+    assert ack["done_record"] == "not_written"
+    assert ack["name_hits"] == {}
+    await replica.writer.close(timeout=1)

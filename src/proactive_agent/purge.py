@@ -171,6 +171,11 @@ class GuildOutcome:
     outcome: str
     stores: list[str] = field(default_factory=list)
     detail: str = ""
+    # Structured ack fields (Ack v1); the detail string is display only.
+    name_hits: dict[str, int] = field(default_factory=dict)
+    tombstoned: bool = False
+    unchecked_names: int = 0
+    done_record: str = "not_written"
     # Set when Postgres was purged but v1 could not be replaced: the entry
     # is kept pending so the purge is retried, and no done record is kept.
     retry: bool = False
@@ -486,6 +491,8 @@ class PrivacyPurgeConsumer:
                         "failed",
                         [],
                         _join("tombstoned=1", "postgres copy not the purged revision"),
+                        tombstoned=True,
+                        unchecked_names=unchecked_names(list(command.names)),
                     ),
                 )
                 if accepted is False:
@@ -500,15 +507,18 @@ class PrivacyPurgeConsumer:
                 # Finished on an earlier delivery of this run: never fold
                 # again, just re-post the ack.
                 result = done[guild_id]
+                result.done_record = "replayed"
             else:
                 result = await self.purge_guild(command, guild_id)
                 if result.retry:
                     # Forced retry: keep the entry pending, no done record.
                     all_acked = False
-                elif result.outcome != "failed" and not await self._record_done(
-                    run_id, guild_id, result
-                ):
-                    result.detail = _join("done_record=unsaved", result.detail)
+                elif result.outcome != "failed":
+                    if await self._record_done(run_id, guild_id, result):
+                        result.done_record = "written"
+                    else:
+                        result.done_record = "not_written"
+                        result.detail = _join("done_record=unsaved", result.detail)
             logger.info(
                 "privacy purge guild finished run=%s guild=%s outcome=%s",
                 run_id,
@@ -542,6 +552,10 @@ class PrivacyPurgeConsumer:
                 outcome=result.outcome,
                 stores=result.stores,
                 detail=result.detail,
+                name_hits=dict(result.name_hits),
+                tombstoned=result.tombstoned,
+                unchecked_names=result.unchecked_names,
+                done_record=result.done_record,
             )
         except Exception as error:
             logger.error(
@@ -634,8 +648,17 @@ class PrivacyPurgeConsumer:
             result = done.get(guild_id)
             saved = True
             if result is None:
-                result = GuildOutcome("failed", [], "delivery limit reached")
+                result = GuildOutcome(
+                    "failed",
+                    [],
+                    "delivery limit reached",
+                    tombstoned=guild_id in await self._tombstoned([guild_id]),
+                    unchecked_names=unchecked_names(list(command.names)),
+                )
                 saved = await self._record_done(run_id, guild_id, result)
+                result.done_record = "written" if saved else "not_written"
+            else:
+                result.done_record = "replayed"
             accepted = await self._post_ack(run_id, guild_id, result)
             if accepted is False:
                 unknown_run = True
@@ -656,7 +679,14 @@ class PrivacyPurgeConsumer:
             try:
                 data = json.loads(value)
                 done[_decode(guild_id)] = GuildOutcome(
-                    data["outcome"], list(data["stores"]), data["detail"]
+                    data["outcome"],
+                    list(data["stores"]),
+                    data["detail"],
+                    name_hits={
+                        str(k): int(v) for k, v in data.get("name_hits", {}).items()
+                    },
+                    tombstoned=bool(data.get("tombstoned", False)),
+                    unchecked_names=int(data.get("unchecked_names", 0)),
                 )
             except (ValueError, KeyError, TypeError):
                 continue
@@ -672,6 +702,9 @@ class PrivacyPurgeConsumer:
                 "outcome": result.outcome,
                 "stores": result.stores,
                 "detail": result.detail,
+                "name_hits": result.name_hits,
+                "tombstoned": result.tombstoned,
+                "unchecked_names": result.unchecked_names,
             }
         )
         for _attempt in range(2):
@@ -781,6 +814,7 @@ class PrivacyPurgeConsumer:
                 )
                 result.detail = _join(label, result.detail)
         unchecked = unchecked_names(list(command.names))
+        result.unchecked_names = unchecked
         if unchecked:
             # Names too short to match deterministically: the model saw
             # them, the checks could not; the web shows the count.
@@ -789,13 +823,14 @@ class PrivacyPurgeConsumer:
 
     async def _purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         stores: list[str] = []
+        hits: dict[str, int] = {}
         try:
             fence = await self._acquire_fence(guild_id)
         except Exception as error:
             return GuildOutcome("failed", stores, _error_detail("fence", error))
         renew_task = asyncio.create_task(self._renew(fence))
         try:
-            detail = await self._purge_fenced(command, guild_id, fence, stores)
+            detail = await self._purge_fenced(command, guild_id, fence, stores, hits)
         except Exception as error:
             logger.warning(
                 "privacy purge guild failed run=%s guild=%s type=%s",
@@ -812,7 +847,14 @@ class PrivacyPurgeConsumer:
             if tombstoned:
                 retry = True
                 detail = _join("tombstoned=1", detail)
-            return GuildOutcome("failed", stores, detail, retry=retry)
+            return GuildOutcome(
+                "failed",
+                stores,
+                detail,
+                name_hits=hits,
+                tombstoned=tombstoned,
+                retry=retry,
+            )
         finally:
             renew_task.cancel()
             await asyncio.gather(renew_task, return_exceptions=True)
@@ -824,7 +866,9 @@ class PrivacyPurgeConsumer:
                     guild_id,
                     type(error).__name__,
                 )
-        return GuildOutcome("purged" if stores else "unchanged", stores, detail)
+        return GuildOutcome(
+            "purged" if stores else "unchanged", stores, detail, name_hits=hits
+        )
 
     async def _purge_fenced(
         self,
@@ -832,6 +876,7 @@ class PrivacyPurgeConsumer:
         guild_id: str,
         fence: Fence,
         stores: list[str],
+        hits: dict[str, int],
     ) -> str:
         details: list[str] = []
         dropped = await self._discard_notifications(guild_id)
@@ -845,7 +890,7 @@ class PrivacyPurgeConsumer:
         taken = self._writer.discard(guild_id)
         try:
             history_detail, wrote = await self._purge_history(
-                command, guild_id, fence, stores
+                command, guild_id, fence, stores, hits
             )
         except (PartialPurgeError, PurgeRetry) as error:
             # Postgres already holds the purged copy: the discarded dirty
@@ -866,7 +911,9 @@ class PrivacyPurgeConsumer:
             # never be restored for the guild again.
             await self._bump_epoch(guild_id)
         if fence.external:
-            details.append(await self._purge_watch(command, guild_id, fence, stores))
+            details.append(
+                await self._purge_watch(command, guild_id, fence, stores, hits)
+            )
         return _join(*details)
 
     async def _bump_epoch(self, guild_id: str, *, best_effort: bool = False) -> None:
@@ -945,6 +992,7 @@ class PrivacyPurgeConsumer:
         guild_id: str,
         fence: Fence,
         stores: list[str],
+        hits: dict[str, int],
     ) -> tuple[str, bool]:
         """Returns (detail, whether the stored history was rewritten)."""
         names = list(command.names)
@@ -983,6 +1031,7 @@ class PrivacyPurgeConsumer:
                 return "history empty; legacy history deleted", False
             return "history empty", False
         clean = history_needs_no_fold(snapshot.history, command.user_id, names)
+        hits["history"] = 0
         # A clean history is still written when the write itself is needed:
         # to migrate legacy, to clear a tombstone, or before deleting legacy.
         if clean and not (migrated or tombstoned or drop_legacy):
@@ -1029,6 +1078,7 @@ class PrivacyPurgeConsumer:
         else:
             details.append(f"history folded attempts={note.attempts}")
             details.append(f"history_name_hits={note.name_hits}")
+            hits["history"] = note.name_hits
         if drop_legacy:
             # Postgres holds the purged copy and v1 holds it too or was
             # deleted: the raw legacy key must not outlive a reported purge.
@@ -1048,6 +1098,7 @@ class PrivacyPurgeConsumer:
         guild_id: str,
         fence: Fence,
         stores: list[str],
+        hits: dict[str, int],
     ) -> str:
         rows = await self._api.list_enabled_channels(guild_id)
         changed = 0
@@ -1059,10 +1110,11 @@ class PrivacyPurgeConsumer:
             entries = {entry.instruction_id: entry.text for entry in store.entries}
             if not entries:
                 continue
-            decided, hits = await self._decide_watch(
+            decided, watch_hits = await self._decide_watch(
                 entries, user_id=command.user_id, names=list(command.names)
             )
-            name_hits_kept += hits
+            name_hits_kept += watch_hits
+            hits["watch"] = name_hits_kept
             # An entry without a decision is kept as it is.
             kept = [
                 dataclass_replace(entry, text=text)

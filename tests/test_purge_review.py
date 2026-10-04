@@ -502,6 +502,9 @@ async def test_delivery_limit_reports_failed_for_unfinished_guilds(redis_client,
         "outcome": "failed",
         "stores": [],
         "detail": "delivery limit reached",
+        "name_hits": {},
+        "tombstoned": False,
+        "unchecked_names": 0,
     }
     await replica.writer.close(timeout=1)
 
