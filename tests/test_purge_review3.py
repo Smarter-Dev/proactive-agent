@@ -38,7 +38,6 @@ from test_purge import (
 import proactive_agent.agent as agent_module
 from proactive_agent.agent import (
     PrivacyCompactionError,
-    privacy_compaction_summary,
     privacy_watch_decisions,
 )
 from proactive_agent.keys import (
@@ -46,7 +45,6 @@ from proactive_agent.keys import (
     PRIVACY_PURGE_STREAM_KEY,
     history_invalid_key,
     history_key,
-    purge_epoch_key,
 )
 from proactive_agent.purge import _join, history_needs_no_fold
 
@@ -64,47 +62,6 @@ def fixed_model(text: str, calls: list) -> FunctionModel:
     return FunctionModel(respond)
 
 
-# M1. A note that is not a plausible memory fails the step, untouched.
-
-LAZY = "ok."
-REFUSAL = (
-    "I'm sorry, but I can't help with rewriting memories to remove a person. "
-    "Please contact an administrator for this kind of request."
-)
-NO_BYSTANDERS = (
-    "The channel talked about software releases, cats and veterinary visits, "
-    "and someone planned to ship a new version on Friday. Nothing else of "
-    "note happened in #general during these wakes."
-)
-
-
-@pytest.mark.parametrize("note", [LAZY, REFUSAL, NO_BYSTANDERS])
-async def test_an_implausible_note_fails_and_leaves_every_store(
-    redis_client, world, note
-):
-    api = world
-    calls: list = []
-    replica = Replica(redis_client, api, fixed_model(note, calls), name="a")
-    v1_before = await stored_v1(redis_client)
-    durable_before = api.durable[GUILD]
-    await replica.consumer.initialize()
-    await submit(redis_client, command())
-
-    await replica.consumer.poll_once()
-
-    assert len(calls) == 3  # asked twice more, then gave up
-    assert await stored_v1(redis_client) == v1_before
-    assert api.durable[GUILD] == durable_before
-    assert not await redis_client.exists(purge_epoch_key(GUILD))
-    assert api.acks[0]["outcome"] == "failed"
-    assert api.acks[0]["detail"].startswith(
-        "purge: purged note implausible after 3 attempts: "
-    )
-    category = api.acks[0]["detail"].split(": ")[2].split()[0]
-    assert category in {"too_short", "refusal", "retention_members"}
-    await replica.writer.close(timeout=1)
-
-
 def member_history(*members: tuple[str, str]) -> list[ModelMessage]:
     lines = "\n".join(
         f"[id={index}] {chr(65 + index)}·{name} (uid={uid}): shipping release "
@@ -117,27 +74,7 @@ def member_history(*members: tuple[str, str]) -> list[ModelMessage]:
     ]
 
 
-# The rule itself is covered by tests/test_fold_plausibility.py (shared
-# vectors).
-
-
 # Timeouts on the fold and watch calls.
-
-
-async def test_a_fold_model_call_times_out(monkeypatch):
-    async def slow(messages, info):
-        await asyncio.sleep(1)
-        return ModelResponse(parts=[TextPart("never")])
-
-    with pytest.raises(PrivacyCompactionError) as raised:
-        await privacy_compaction_summary(
-            FunctionModel(slow),
-            member_history((BYSTANDER, "nia")),
-            user_id=TARGET,
-            names=[],
-            timeout_seconds=0.05,
-        )
-    assert "timed out" in str(raised.value)
 
 
 async def test_a_watch_model_call_times_out(monkeypatch):

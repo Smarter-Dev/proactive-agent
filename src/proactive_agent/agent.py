@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-import math
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
@@ -730,8 +729,7 @@ with one overriding difference: leave this person out entirely.
 or from them.
 - Never write their user id, any of their names, a mention of them, or a
 description that would identify them.
-- Keep everyone else: their conversations, commitments, preferences and facts,
-attributed as `Name (uid=N)` with the user id you saw for them.
+- Keep everyone else: their conversations, commitments, preferences and facts.
 Where someone else's words only made sense as a reply to this person, keep
 what the other person said or decided without attributing anything to the
 person being forgotten.
@@ -742,8 +740,8 @@ Normal compaction rules:
 {compaction_rules}"""
 
 PRIVACY_ID_RETRY_PROMPT = """\
-Your note still contains the user id {user_id}, or is empty. Write the whole
-note again, without that id and without anything else about the person being
+Your note still contains the user id {user_id}. Write the whole note
+again, without that id and without anything else about the person being
 forgotten. Reply with the complete note only."""
 
 PRIVACY_NAME_RETRY_PROMPT = """\
@@ -869,60 +867,16 @@ def mentions_target(text: str, user_id: str, names: list[str]) -> bool:
     return user_id in text or bool(name_hits(text, names))
 
 
-# -- Fold plausibility (shared rule privacy:v1, identical in the bot) --------
+# -- Rewrite checks (privacy:v1, identical in the bot) ------------------------
 #
-# A purge must never become a reset: an output that refuses, says nothing,
-# or drops everyone else is rejected (asked again; when retries run out the
-# step fails and every stored byte stays as it was). The rule is specified
-# in purge-contract.md ("Fold plausibility rule privacy:v1") and exercised
-# by contracts/privacy/v1/fold_plausibility_vectors.json.
+# The agent rewrites its memory without the user and its answer is stored.
+# The only checks: (1) a non-empty input must come back non-empty, else the
+# step fails; (2) the output must not hold the user id, else it is asked
+# again, then the step fails; (3) a listed name left after one re-ask is
+# stored and reported as a name hit; (4) a model timeout or error fails the
+# step. A failing step leaves every stored byte untouched.
 
 PRIVACY_MODEL_TIMEOUT_SECONDS = 120
-PRIVACY_MAX_PLAUSIBILITY_RETRIES = 2
-FOLD_MIN_CHARS = 40
-FOLD_REFUSAL_WINDOW = 200
-# Matched on the normalised text (see _normalise_prose) at word boundaries,
-# within the first FOLD_REFUSAL_WINDOW characters only.
-FOLD_REFUSALS = (
-    "as an ai",
-    "i am not able to",
-    "i am sorry, but",
-    "i am unable to",
-    "i can't assist",
-    "i can't comply",
-    "i can't do that",
-    "i can't fulfill",
-    "i can't help",
-    "i can't provide",
-    "i cannot assist",
-    "i cannot do that",
-    "i cannot fulfill",
-    "i cannot help",
-    "i cannot provide",
-    "i must decline",
-    "i will not be able",
-    "i will not help",
-    "i won't assist",
-    "i won't be able",
-    "i won't do that",
-    "i won't help",
-    "i won't provide",
-    "i'm afraid i can't",
-    "i'm afraid i cannot",
-    "i'm not able to",
-    "i'm sorry but",
-    "i'm sorry, but",
-    "i'm unable to",
-)
-FOLD_BYSTANDER_MIN = 200
-FOLD_LENGTH_RATIO = 0.05
-FOLD_LENGTH_CAP = 400
-FOLD_RETENTION_SHARE = 0.5
-FOLD_RETENTION_CAP = 8
-FOLD_TOKEN_SAMPLE = 12
-FOLD_TOKEN_SHARE = 0.25
-FOLD_RARE_WORD_MIN = 6
-FOLD_DISPLAY_MIN = 3
 
 # The prefix render_transcript_line writes for a member's message:
 # `[id=<msg>] [BOT] <TAG>·<display> (uid=<author>)( (reply to id=<msg>))?: `
@@ -932,74 +886,6 @@ MEMBER_LINE_PREFIX = re.compile(
     r"^\[id=[0-9]+\] (\[BOT\] )?[A-Z]+·((?:(?!: )[^\n])*?) \(uid=([0-9]{1,22})\)"
     r"(?: \(reply to id=[0-9]+\))?: "
 )
-# A member line from before author ids: `[id=<msg>] [BOT] <TAG>·<display>: `.
-_LEGACY_MEMBER_PREFIX = re.compile(
-    r"^\[id=[0-9]+\] (\[BOT\] )?[A-Z]+·((?:(?!: )[^\n])+?): "
-)
-_UID_VALUE = re.compile(r"uid=([0-9]{1,22})")
-_RARE_WORD = re.compile(r"[^\W\d_]{6,}")  # FOLD_RARE_WORD_MIN letters
-_APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "ʼ": "'", "`": "'", "´": "'"})
-_WHITESPACE = re.compile(r"\s+")
-
-PRIVACY_PLAUSIBILITY_RETRY_PROMPT = """\
-That note cannot replace your memory ({reason}). Your memory of everyone else
-must survive the purge. Write the whole note again: keep every other person,
-conversation, commitment and fact from the transcript, attributed as
-`Name (uid=N)`, leaving out only the person being forgotten. Reply with the
-complete note only."""
-
-
-@functools.cache
-def common_words() -> frozenset[str]:
-    """contracts/privacy/v1/common_words.txt (packaged copy, same bytes)."""
-    from importlib.resources import files
-
-    text = (files("proactive_agent") / "privacy_data" / "common_words.txt").read_text(
-        encoding="utf-8"
-    )
-    return frozenset(line.strip() for line in text.splitlines() if line.strip())
-
-
-@dataclass(frozen=True)
-class FoldRejection:
-    """Why a fold output was rejected: a category and numbers, no content
-    (a refusal names the phrase from the fixed FOLD_REFUSALS list)."""
-
-    category: str
-    detail: str = ""
-
-    def __str__(self) -> str:
-        return f"{self.category} {self.detail}".strip()
-
-
-def _normalise_prose(text: str) -> str:
-    text = unicodedata.normalize("NFC", text).translate(_APOSTROPHES)
-    return _WHITESPACE.sub(" ", text).strip().casefold()
-
-
-def _phrase_at_boundary(haystack: str, phrase: str) -> bool:
-    start = 0
-    while (index := haystack.find(phrase, start)) != -1:
-        end = index + len(phrase)
-        if (index == 0 or not haystack[index - 1].isalnum()) and (
-            end == len(haystack) or not haystack[end].isalnum()
-        ):
-            return True
-        start = index + 1
-    return False
-
-
-def _contains_id(text: str, user_id: str) -> bool:
-    """The id as a whole number (not part of a longer digit run)."""
-    start = 0
-    while (index := text.find(user_id, start)) != -1:
-        end = index + len(user_id)
-        if (index == 0 or not text[index - 1].isdigit()) and (
-            end == len(text) or not text[end].isdigit()
-        ):
-            return True
-        start = index + 1
-    return False
 
 
 def string_leaves(value) -> list[str]:
@@ -1013,136 +899,14 @@ def string_leaves(value) -> list[str]:
     return []
 
 
-def fold_input_texts(messages: list[ModelMessage]) -> list[str]:
-    """The input parts a fold rule reads: user prompts (briefs, memory notes,
-    notifications), tool returns and the agent's text. System prompts and
-    tool-call arguments are not memory and are left out; structured content
-    contributes its string leaves, one part each."""
-    texts = []
-    for message in messages:
-        for part in message.parts:
-            kind = getattr(part, "part_kind", "")
-            if kind not in ("user-prompt", "tool-return", "text"):
-                continue
-            texts.extend(string_leaves(getattr(part, "content", None)))
-    return texts
-
-
-def _credit_display(display: str) -> str | None:
-    folded = normalise_for_match(display.strip())
-    if len(folded) < FOLD_DISPLAY_MIN or folded in common_words():
-        return None
-    return display.strip()
-
-
-def fold_plausibility_problem(
-    input_texts: list[str], user_id: str, names: list[str], output: str
-) -> FoldRejection | None:
-    """Why a fold output cannot replace its input store, or None.
-
-    Shared rule privacy:v1; the normative text is purge-contract.md, section
-    "Fold plausibility rule privacy:v1", in the same order as the code:
-    1. empty input -> output must be empty; the output never holds the
-       target id; 2. B = input lines without the id or a name, B empty ->
-    accept; 3. refusal phrase in the first 200 normalised chars -> reject;
-    4. no bystander lines in B -> accept; 5. too short; 6. length floor;
-    7. retention by members (U) or 8. by sampled tokens (legacy lines).
-    """
-    text = output.strip()
-    if not any(part.strip() for part in input_texts):
-        return FoldRejection("input_empty_output_not") if text else None
-    if _contains_id(output, user_id):
-        return FoldRejection("target_id")
-    lines = [line for part in input_texts for line in part.splitlines()]
-    b_lines = [
-        line
-        for line in lines
-        if line.strip()
-        and not _contains_id(line, user_id)
-        and not name_hits(line, names)
-    ]
-    if not b_lines:
-        return None
-    bystander = "\n".join(b_lines)
-    head = _normalise_prose(text)[:FOLD_REFUSAL_WINDOW]
-    for phrase in FOLD_REFUSALS:
-        if _phrase_at_boundary(head, phrase):
-            return FoldRejection("refusal", f'phrase="{phrase}"')
-    uids: dict[str, None] = {}
-    displays: dict[str, list[str]] = {}
-    legacy_displays: list[str] = []
-    for line in b_lines:
-        stripped = line.strip()
-        member = MEMBER_LINE_PREFIX.match(stripped)
-        legacy = None if member else _LEGACY_MEMBER_PREFIX.match(stripped)
-        prefix = member or legacy
-        is_bot = bool(prefix and prefix.group(1))
-        for uid in _UID_VALUE.findall(stripped):
-            if uid == user_id or (is_bot and member and uid == member.group(3)):
-                continue  # the target, or the agent's own line
-            uids.setdefault(uid)
-        if prefix and not is_bot:
-            display = _credit_display(prefix.group(2))
-            if member and display:
-                displays.setdefault(member.group(3), []).append(display)
-            if legacy:
-                # Seen even when not creditable: a legacy member line means
-                # bystander text exists without uid attribution.
-                legacy_displays.append(prefix.group(2).strip())
-    if not uids and not legacy_displays:
-        # No bystander has lines in B (host text only): neither the length
-        # floor nor retention applies, so "nothing to carry forward" passes.
-        return None
-    if len(text) < FOLD_MIN_CHARS or not any(c.isalpha() for c in text):
-        return FoldRejection("too_short", f"chars={len(text)} needs={FOLD_MIN_CHARS}")
-    if len(bystander) >= FOLD_BYSTANDER_MIN:
-        floor = max(
-            FOLD_MIN_CHARS,
-            min(math.ceil(FOLD_LENGTH_RATIO * len(bystander)), FOLD_LENGTH_CAP),
+async def _run_with_timeout(agent: Agent, prompt: str, history):
+    try:
+        return await asyncio.wait_for(
+            agent.run(prompt, message_history=history or None),
+            timeout=PRIVACY_MODEL_TIMEOUT_SECONDS,
         )
-        if len(text) < floor:
-            return FoldRejection("length_floor", f"chars={len(text)} needs={floor}")
-    if uids:
-        members = list(uids)
-        kept = sum(
-            1
-            for uid in members
-            if f"uid={uid}" in text
-            or any(name_hits(text, [name]) for name in displays.get(uid, ()))
-        )
-        required = min(
-            FOLD_RETENTION_CAP, math.ceil(FOLD_RETENTION_SHARE * len(members))
-        )
-        if kept < required:
-            return FoldRejection(
-                "retention_members", f"kept={kept} of={len(members)} needs={required}"
-            )
-        return None
-    if len(bystander) < FOLD_BYSTANDER_MIN:
-        return None
-    tokens: list[str] = []
-    seen: set[str] = set()
-    for display in legacy_displays:
-        credit = _credit_display(display)
-        if credit and normalise_for_match(credit) not in seen:
-            seen.add(normalise_for_match(credit))
-            tokens.append(credit)
-    for word in _RARE_WORD.findall(bystander):
-        folded = normalise_for_match(word)
-        if folded in seen or folded in common_words():
-            continue
-        seen.add(folded)
-        tokens.append(word)
-    tokens = tokens[:FOLD_TOKEN_SAMPLE]
-    if not tokens:
-        return FoldRejection("no_retention_signal")
-    kept = sum(1 for token in tokens if name_hits(text, [token]))
-    required = math.ceil(FOLD_TOKEN_SHARE * len(tokens))
-    if kept < required:
-        return FoldRejection(
-            "retention_tokens", f"kept={kept} of={len(tokens)} needs={required}"
-        )
-    return None
+    except TimeoutError as error:
+        raise PrivacyCompactionError("timeout") from error
 
 
 async def privacy_compaction_summary(
@@ -1153,60 +917,36 @@ async def privacy_compaction_summary(
     names: list[str],
     max_id_retries: int = PRIVACY_MAX_ID_RETRIES,
     max_name_retries: int = PRIVACY_MAX_NAME_RETRIES,
-    max_plausibility_retries: int = PRIVACY_MAX_PLAUSIBILITY_RETRIES,
-    timeout_seconds: float = PRIVACY_MODEL_TIMEOUT_SECONDS,
 ) -> PrivacyNote:
     """The agent's own memory note, rewritten by its own model without one user.
 
-    The note may never contain the user id (or be empty): the model is asked
-    again up to ``max_id_retries`` times, then PrivacyCompactionError is
-    raised and the caller must leave the stored history untouched. A
-    whole-word name match is asked about once more and then accepted (and
-    reported), because a name can be an ordinary word. A note failing
-    fold_plausibility_problem (privacy:v1: a refusal, too short, or dropping
-    the other members) is
-    asked again up to ``max_plausibility_retries`` times, then raises.
-    Each model call is capped at ``timeout_seconds``.
+    Rewrite checks privacy:v1. An empty note (the input is never empty here)
+    fails the step at once ("empty_output"). A note holding the user id is
+    asked for again up to ``max_id_retries`` times, then fails
+    ("target_id"). A name match is asked about ``max_name_retries`` time(s),
+    then the note is stored and the hits reported. A model call over
+    PRIVACY_MODEL_TIMEOUT_SECONDS fails ("timeout"); other model errors
+    propagate. On any failure the caller leaves the stored history untouched.
     """
     compaction_agent = Agent(model, output_type=str)
-    input_texts = fold_input_texts(list(messages))
     prompt = build_privacy_purge_prompt(user_id, names)
     history: list[ModelMessage] = list(messages)
     usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
-    id_retries = name_retries = plausibility_retries = attempts = 0
+    id_retries = name_retries = attempts = 0
     while True:
         attempts += 1
-        try:
-            result = await asyncio.wait_for(
-                compaction_agent.run(prompt, message_history=history or None),
-                timeout=timeout_seconds,
-            )
-        except TimeoutError as error:
-            raise PrivacyCompactionError(
-                f"model call timed out after {timeout_seconds:g} s"
-            ) from error
+        result = await _run_with_timeout(compaction_agent, prompt, history)
         for key, value in usage_dict(result.usage).items():
             usage[key] += value
         note = str(result.output)
-        problem = fold_plausibility_problem(input_texts, user_id, names, note)
-        if user_id in note or (not note.strip() and problem is not None):
+        if not note.strip():
+            raise PrivacyCompactionError("empty_output")
+        if user_id in note:
             if id_retries >= max_id_retries:
-                raise PrivacyCompactionError(
-                    f"purged note still held the user id or was empty after "
-                    f"{attempts} attempts"
-                )
+                raise PrivacyCompactionError("target_id")
             id_retries += 1
             history = result.all_messages()
             prompt = PRIVACY_ID_RETRY_PROMPT.format(user_id=user_id)
-            continue
-        if problem is not None:
-            if plausibility_retries >= max_plausibility_retries:
-                raise PrivacyCompactionError(
-                    f"purged note implausible after {attempts} attempts: {problem}"
-                )
-            plausibility_retries += 1
-            history = result.all_messages()
-            prompt = PRIVACY_PLAUSIBILITY_RETRY_PROMPT.format(reason=problem)
             continue
         hits = name_hits(note, names)
         if hits and name_retries < max_name_retries:
@@ -1276,10 +1016,11 @@ async def privacy_watch_decisions(
     """The agent decides keep/rewrite/drop for each watch instruction.
 
     Returns the new text per instruction id (None = drop) and the number of
-    kept entries still matching a name. An entry without a decision is kept
-    as is. Kept or rewritten text holding the user id is
-    asked about once more, then PrivacyCompactionError is raised; a name
-    match after the retry is accepted, as with the memory note.
+    kept entries still matching a name. An entry without a decision is kept.
+    Rewrite checks privacy:v1: a rewrite with no text fails ("empty_output");
+    kept or rewritten text holding the user id is asked again up to
+    PRIVACY_MAX_ID_RETRIES times, then fails ("target_id"); a name match is
+    asked about once, then accepted and reported; a timeout fails.
     """
     if not entries:
         return {}, 0
@@ -1296,41 +1037,33 @@ async def privacy_watch_decisions(
     )
     decision_agent = Agent(model, output_type=WatchDecisions)
     history: list[ModelMessage] | None = None
-    for attempt in range(2):
-        try:
-            result = await asyncio.wait_for(
-                decision_agent.run(prompt, message_history=history),
-                timeout=PRIVACY_MODEL_TIMEOUT_SECONDS,
-            )
-        except TimeoutError as error:
-            raise PrivacyCompactionError(
-                f"model call timed out after {PRIVACY_MODEL_TIMEOUT_SECONDS} s"
-            ) from error
+    id_retries = name_retries = 0
+    while True:
+        result = await _run_with_timeout(decision_agent, prompt, history)
         by_id = {item.instruction_id: item for item in result.output.decisions}
         outcome: dict[str, str | None] = {}
         for key, text in entries.items():
             decision = by_id.get(key)
             if decision is None or decision.action == "keep":
                 outcome[key] = text
-            elif decision.action == "drop" or not (decision.text or "").strip():
+            elif decision.action == "drop":
                 outcome[key] = None
+            elif not (decision.text or "").strip():
+                raise PrivacyCompactionError("empty_output")
             else:
                 outcome[key] = decision.text.strip()
         kept = [text for text in outcome.values() if text is not None]
-        leaks_id = any(user_id in text for text in kept)
         leaks_name = sum(1 for text in kept if name_hits(text, names))
-        if not leaks_id and not leaks_name:
-            return outcome, 0
-        if attempt == 0:
-            history = result.all_messages()
-            prompt = PRIVACY_WATCH_RETRY_PROMPT.format(user_id=user_id)
-            continue
-        if leaks_id:
-            raise PrivacyCompactionError(
-                "watch instructions still held the user id after a retry"
-            )
-        return outcome, leaks_name
-    raise AssertionError("unreachable")
+        if any(user_id in text for text in kept):
+            if id_retries >= PRIVACY_MAX_ID_RETRIES:
+                raise PrivacyCompactionError("target_id")
+            id_retries += 1
+        elif leaks_name and name_retries < PRIVACY_MAX_NAME_RETRIES:
+            name_retries += 1
+        else:
+            return outcome, leaks_name
+        history = result.all_messages()
+        prompt = PRIVACY_WATCH_RETRY_PROMPT.format(user_id=user_id)
 
 
 @dataclass

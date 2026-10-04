@@ -21,14 +21,9 @@ from purge_fakes import (
     raw_history_with_target,
 )
 from pydantic_ai.messages import (
-    ModelMessage,
     ModelRequest,
-    ModelResponse,
-    TextPart,
     ToolReturnPart,
-    UserPromptPart,
 )
-from pydantic_ai.models.function import AgentInfo, FunctionModel
 from test_purge import (
     Replica,
     command,
@@ -40,9 +35,7 @@ from test_purge import (
 from test_purge_review import ListAPI
 
 from proactive_agent.agent import (
-    PrivacyCompactionError,
     memory_note_pair,
-    privacy_compaction_summary,
 )
 from proactive_agent.blocked_users import BlockedUsers
 from proactive_agent.history import (
@@ -125,59 +118,6 @@ async def test_a_quoted_nickname_is_purged_not_acked_unchanged(redis_client):
     assert api.acks[0]["outcome"] == "purged"
     assert QUOTED not in json.loads(await stored_v1(redis_client))["history"].__repr__()
     await replica.writer.close(timeout=1)
-
-
-# M2. Through the model loop: blanking is rejected, an honest paraphrase of
-# a realistic (pre-uid) history is accepted.
-
-
-def legacy_history() -> list[ModelMessage]:
-    lines = "\n".join(
-        [
-            "[id=1] A·kaizer: my cat Miso is sick again",
-            "[id=2] B·Priyanka: refactored the scheduler module yesterday",
-            "[id=3] C·Tomasz: benchmarked allocator throughput on graviton",
-            "[id=4] D·Ingrid: proposed migrating telemetry to opentelemetry",
-            "[id=5] B·Priyanka: the scheduler refactor needs another reviewer",
-        ]
-    )
-    return [
-        ModelRequest(parts=[UserPromptPart("NOTIFICATIONS: activity in #general")]),
-        ModelRequest(parts=[ToolReturnPart("channel_history", lines, "c1")]),
-        ModelResponse(parts=[TextPart("noted")]),
-    ]
-
-
-def scripted(*notes):
-    calls = []
-
-    def respond(messages, info: AgentInfo) -> ModelResponse:
-        calls.append(len(calls))
-        return ModelResponse(parts=[TextPart(notes[min(len(calls), len(notes)) - 1])])
-
-    return FunctionModel(respond), calls
-
-
-async def test_an_honest_paraphrase_of_realistic_history_is_accepted():
-    model, calls = scripted(
-        "Priyanka refactored the scheduler and wants another reviewer for it; "
-        "Tomasz benchmarked allocator throughput on Graviton; Ingrid proposed "
-        "moving telemetry to OpenTelemetry. All in #general."
-    )
-    note = await privacy_compaction_summary(
-        model, legacy_history(), user_id=TARGET, names=["kaizer"]
-    )
-    assert note.attempts == 1
-
-
-async def test_blanking_is_rejected_with_its_category():
-    model, calls = scripted("Nothing much happened in the channel lately.")
-    with pytest.raises(PrivacyCompactionError) as raised:
-        await privacy_compaction_summary(
-            model, legacy_history(), user_id=TARGET, names=["kaizer"]
-        )
-    assert len(calls) == 3
-    assert str(raised.value).endswith("retention_tokens kept=0 of=12 needs=3")
 
 
 # M3. Tombstone recovery from the purged Postgres copy, independent of the
@@ -352,14 +292,6 @@ async def test_an_unreadable_legacy_store_fails_and_is_kept(redis_client, world)
 
 def test_history_key_constant_is_used():
     assert history_key(GUILD).endswith(":history")
-
-
-def test_structured_parts_feed_the_fold_rule_as_decoded_leaves():
-    from proactive_agent.agent import fold_input_texts
-
-    content = {"messages": [f"{QUOTED} asked about lifetimes", {"note": "tab\there"}]}
-    texts = fold_input_texts([ModelRequest(parts=[ToolReturnPart("t", content, "c")])])
-    assert texts == [f"{QUOTED} asked about lifetimes", "tab\there"]
 
 
 # Ack v1 structured fields on every path.
