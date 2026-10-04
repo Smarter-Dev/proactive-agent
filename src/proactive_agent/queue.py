@@ -500,10 +500,22 @@ class RedisWakeQueue:
             maxlen=10_000,
             approximate=True,
         )
-        await self._redis.xtrim(
-            DEAD_LETTER_STREAM_KEY,
-            minid=f"{int(time.time() * 1000) - CONTENT_RETENTION_MILLISECONDS}-0",
-            approximate=False,
+        await self.trim_dead_letters()
+
+    async def trim_dead_letters(self) -> int:
+        """Drop dead letters written more than the retention window ago.
+
+        Run on every write and on the worker's timer, so a stream nothing
+        writes to any more still ages out. Exact, not approximate: approximate
+        trimming spares a quiet stream whose entries sit in one macro node.
+        Returns the number dropped.
+        """
+        return int(
+            await self._redis.xtrim(
+                DEAD_LETTER_STREAM_KEY,
+                minid=f"{int(time.time() * 1000) - CONTENT_RETENTION_MILLISECONDS}-0",
+                approximate=False,
+            )
         )
 
     async def _ensure_guild_group(self, guild_id: str) -> None:

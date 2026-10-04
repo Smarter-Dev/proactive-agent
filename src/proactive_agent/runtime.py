@@ -60,9 +60,13 @@ FAILURE_NOTICE_INTERVAL_SECONDS = 6 * 60 * 60
 FAILURE_NOTICE_ERROR_LIMIT = 1500
 
 
-def failure_notice_text(error: str) -> str:
-    """The single message a guild sees when a wake is given up on."""
-    detail = error.replace("```", "'''")[:FAILURE_NOTICE_ERROR_LIMIT]
+def failure_notice_text(error_type: str) -> str:
+    """The single message a guild sees when a wake is given up on.
+
+    It names the exception type only: a provider error's message can quote
+    the prompt, and so other channels' messages.
+    """
+    detail = error_type.replace("```", "'''")[:FAILURE_NOTICE_ERROR_LIMIT]
     return (
         "\u26a0\ufe0f I hit an error while waking up and gave up on that wake "
         "after several retries, so I may have missed something here. This one "
@@ -275,7 +279,7 @@ class GuildRuntime:
         await self._record_usage(batch, result, responses)
         return result
 
-    async def report_failure(self, batch: WakeBatch, error: str) -> str | None:
+    async def report_failure(self, batch: WakeBatch, error_type: str) -> str | None:
         """Say in Discord that a wake was dropped, at most once per window.
 
         Returns the channel posted in, or None when there was nowhere to
@@ -290,7 +294,7 @@ class GuildRuntime:
             self.guild_id, ttl_seconds=FAILURE_NOTICE_INTERVAL_SECONDS
         ):
             return None
-        await self.discord.send_message(channel_id, failure_notice_text(error))
+        await self.discord.send_message(channel_id, failure_notice_text(error_type))
         return channel_id
 
     async def _failure_notice_channel(self, batch: WakeBatch) -> str | None:

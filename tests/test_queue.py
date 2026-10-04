@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -307,3 +308,16 @@ async def test_dead_letters_older_than_the_window_are_trimmed(redis_client):
     assert len(entries) == 1
     assert entries[0][0] != f"{expired_ms}-0".encode()
 
+
+
+@pytest.mark.asyncio
+async def test_the_dead_letter_trim_runs_without_a_new_dead_letter(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    now_ms = int(time.time() * 1000)
+    await redis_client.xadd(DEAD_LETTER_STREAM_KEY, {"payload": "{}"}, id="1000-0")
+    await redis_client.xadd(DEAD_LETTER_STREAM_KEY, {"payload": "{}"}, id=f"{now_ms}-0")
+
+    assert await queue.trim_dead_letters() == 1
+
+    [(entry_id, _)] = await redis_client.xrange(DEAD_LETTER_STREAM_KEY)
+    assert entry_id == f"{now_ms}-0".encode()
