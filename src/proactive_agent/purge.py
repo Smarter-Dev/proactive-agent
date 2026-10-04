@@ -196,6 +196,11 @@ class Fence:
     lost: bool = False
 
 
+def _stream_id_key(stream_id: str) -> tuple[int, int]:
+    milliseconds, _, sequence = stream_id.partition("-")
+    return int(milliseconds), int(sequence or 0)
+
+
 def _join(detail: str, extra: str) -> str:
     return ("; ".join(item for item in (detail, extra) if item))[:500]
 
@@ -428,7 +433,7 @@ class PrivacyPurgeConsumer:
                 continue
             if not accepted:
                 logger.warning("privacy purge run unknown, dropped run=%s", run_id)
-                await self._drop(stream_id)
+                await self._drop(stream_id, unknown_run=True)
                 return
         if all_acked:
             await self._ack(stream_id)
@@ -476,14 +481,16 @@ class PrivacyPurgeConsumer:
             run_id,
             self._max_deliveries,
         )
+        unknown_run = False
         for guild_id in guild_ids:
             result = done.get(guild_id)
             if result is None:
                 result = GuildOutcome("failed", [], "delivery limit reached")
                 await self._record_done(run_id, guild_id, result)
             if await self._post_ack(run_id, guild_id, result) is False:
+                unknown_run = True
                 break
-        await self._drop(stream_id)
+        await self._drop(stream_id, unknown_run=unknown_run)
 
     async def _done(self, run_id: str) -> dict[str, GuildOutcome]:
         raw = await self._redis.hgetall(purge_done_key(PURGE_COMPONENT, run_id))
@@ -551,15 +558,36 @@ class PrivacyPurgeConsumer:
         # once every component acked every guild.
         await self._redis.xack(PRIVACY_PURGE_STREAM_KEY, PURGE_GROUP, stream_id)
 
-    async def _drop(self, stream_id: str) -> None:
-        """XDEL, then XACK, an entry no producer will clean up (malformed,
-        unknown run, delivery limit): it may still carry the id and names.
+    async def _drop(self, stream_id: str, *, unknown_run: bool = False) -> None:
+        """Finish with an entry that will not be retried (malformed, unknown
+        run, delivery limit); it may still carry the id and names.
 
-        XDEL goes first: if it fails the entry stays pending and is
-        reclaimed and dropped again, never acknowledged but left behind.
+        The entry is XDELed only for a run the server answered 404 for, or
+        once every other consumer group (the bot's) has read and acked it;
+        otherwise only this group acks it and the web deletes it when the
+        run ends or closes. When it is deleted, XDEL goes first: if that
+        fails the entry stays pending and is retried, never left acked but
+        undeleted by mistake.
         """
-        await self._redis.xdel(PRIVACY_PURGE_STREAM_KEY, stream_id)
+        if unknown_run or await self._others_done_with(stream_id):
+            await self._redis.xdel(PRIVACY_PURGE_STREAM_KEY, stream_id)
         await self._ack(stream_id)
+
+    async def _others_done_with(self, stream_id: str) -> bool:
+        """Every other group on the stream has delivered and acked the entry."""
+        entry = _stream_id_key(stream_id)
+        for group in await self._redis.xinfo_groups(PRIVACY_PURGE_STREAM_KEY):
+            name = _decode(group["name"])
+            if name == PURGE_GROUP:
+                continue
+            if _stream_id_key(_decode(group["last-delivered-id"])) < entry:
+                return False
+            pending = await self._redis.xpending_range(
+                PRIVACY_PURGE_STREAM_KEY, name, min=stream_id, max=stream_id, count=1
+            )
+            if pending:
+                return False
+        return True
 
     async def purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         """Purge one guild. Never raises; failures come back as an outcome."""

@@ -8,6 +8,7 @@ import time
 
 from pydantic_ai.exceptions import ModelHTTPError
 
+from proactive_agent.history import HistoryUnavailableError
 from proactive_agent.queue import ReadyRecord
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,16 @@ class ProactiveWorker:
                     len(batch.notifications),
                     batch.dropped,
                     time.monotonic() - started,
+                )
+            except HistoryUnavailableError:
+                # A purge left the guild's v1 history tombstoned and will be
+                # retried. Defer like a cold start: no attempt counted, no
+                # dead letter; the records stay pending and are reclaimed.
+                logger.warning(
+                    "proactive guild wake deferred, history unavailable "
+                    "guild=%s wake=%s",
+                    guild_id,
+                    batch.wake_id,
                 )
             except Exception as error:
                 logger.exception(
