@@ -825,9 +825,18 @@ def checked_names(names: list[str]) -> list[str]:
     ]
 
 
+def unchecked_name_list(names: list[str]) -> list[str]:
+    """The names (as given, stripped) too short to match: ASCII under 2 chars."""
+    return [
+        original
+        for original, needle in _normalised_names(names)
+        if _is_ascii_name(needle) and len(needle) < MIN_CHECKED_ASCII_NAME_CHARS
+    ]
+
+
 def unchecked_names(names: list[str]) -> int:
     """How many names are too short to match (reported, never matched)."""
-    return len(_normalised_names(names)) - len(checked_names(names))
+    return len(unchecked_name_list(names))
 
 
 def _name_occurs(haystack: str, needle: str) -> bool:

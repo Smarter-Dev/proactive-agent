@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import unicodedata
+from pathlib import Path
 
 import pytest
 
-from proactive_agent.agent import checked_names, name_hits, unchecked_names
+from proactive_agent.agent import (
+    checked_names,
+    name_hits,
+    unchecked_name_list,
+    unchecked_names,
+)
 
 
 @pytest.mark.parametrize(
@@ -36,3 +43,23 @@ def test_short_ascii_names_are_unchecked_but_others_are_not():
     assert checked_names(names) == ["王", "kai", "é"]
     assert unchecked_names(names) == 1
     assert name_hits("k is here", ["k"]) == []
+
+
+VECTORS = json.loads(
+    (
+        Path(__file__).parents[1]
+        / "contracts"
+        / "privacy"
+        / "v1"
+        / "name_matcher_vectors.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize(
+    "case", VECTORS, ids=[f"{i}:{c['text'][:24]}" for i, c in enumerate(VECTORS)]
+)
+def test_shared_privacy_v1_vectors(case):
+    """The vectors smarter-dev publishes (byte-identical copy) all agree."""
+    assert bool(name_hits(case["text"], case["names"])) is case["hit"]
+    assert unchecked_name_list(case["names"]) == case["unchecked"]
