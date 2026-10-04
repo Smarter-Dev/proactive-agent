@@ -123,3 +123,53 @@ async def test_privacy_ack_posts_to_the_run_and_reports_unknown_runs():
         "unchecked_names": 0,
         "done_record": "not_written",
     }
+
+
+async def test_an_api_error_carries_its_status_but_not_the_body():
+    from proactive_agent.api import ApplicationAPIError
+    from proactive_agent.history import build_snapshot
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "bad value: what someone said"})
+
+    api = ApplicationAPI(
+        base_url="https://app.test/api",
+        api_key="sk_test",
+        transport=httpx.MockTransport(handler),
+    )
+    snapshot = build_snapshot("11", [{"content": "what someone said"}], revision=1)
+    try:
+        await api.put_history(snapshot)
+    except ApplicationAPIError as error:
+        assert error.status_code == 422
+        assert "422" in str(error)
+        assert "what someone said" not in str(error)
+    else:
+        raise AssertionError("expected ApplicationAPIError")
+    finally:
+        await api.close()
+
+
+async def test_a_discord_error_carries_its_status_and_code_but_not_the_body():
+    from proactive_agent.discord import DiscordRESTError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"code": 50035, "message": "Invalid: what someone said"}
+        )
+
+    discord = DiscordREST(
+        bot_token="token",
+        api_base="https://discord.test/api/v10",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await discord.send_message("22", "what someone said")
+    except DiscordRESTError as error:
+        assert "400" in str(error)
+        assert "code 50035" in str(error)
+        assert "what someone said" not in str(error)
+    else:
+        raise AssertionError("expected DiscordRESTError")
+    finally:
+        await discord.close()

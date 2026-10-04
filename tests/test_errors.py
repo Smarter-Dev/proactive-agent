@@ -13,7 +13,9 @@ def test_the_trace_keeps_types_and_frames_and_no_message():
         trace = exception_trace(error)
 
     assert "what someone said" not in trace
-    assert trace.index("ValueError") < trace.index("direct cause") < trace.index(
-        "RuntimeError"
+    assert (
+        trace.index("ValueError")
+        < trace.index("direct cause")
+        < trace.index("RuntimeError")
     )
     assert ", in test_the_trace_keeps_types_and_frames_and_no_message" in trace

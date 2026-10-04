@@ -11,6 +11,7 @@ import re
 from pydantic import ValidationError
 
 from proactive_agent.contracts import HistorySnapshot
+from proactive_agent.errors import exception_trace
 from proactive_agent.keys import (
     history_invalid_key,
     history_key,
@@ -492,10 +493,13 @@ class DebouncedHistoryWriter:
                         self._dirty.pop(guild_id, None)
                     continue
                 attempt += 1
-                logger.exception(
-                    "proactive history flush failed guild=%s revision=%d",
+                # The snapshot is the agent's history, members' messages
+                # included, and an API error can echo the body it was sent.
+                logger.error(
+                    "proactive history flush failed guild=%s revision=%d\n%s",
                     guild_id,
                     snapshot.revision,
+                    exception_trace(error),
                 )
                 await asyncio.sleep(
                     min(60, self._retry_base_seconds * (2 ** (attempt - 1)))

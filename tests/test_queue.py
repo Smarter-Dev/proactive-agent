@@ -298,7 +298,9 @@ async def test_a_dead_letter_keeps_ids_and_the_error_type_only(redis_client):
 async def test_dead_letters_older_than_the_window_are_trimmed(redis_client):
     queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
     expired_ms = 1_000
-    await redis_client.xadd(DEAD_LETTER_STREAM_KEY, {"payload": "{}"}, id=f"{expired_ms}-0")
+    await redis_client.xadd(
+        DEAD_LETTER_STREAM_KEY, {"payload": "{}"}, id=f"{expired_ms}-0"
+    )
 
     await queue.dead_letter(
         guild_id="111", stream_id="1-0", payload="{}", error="RuntimeError", attempts=1
@@ -307,7 +309,6 @@ async def test_dead_letters_older_than_the_window_are_trimmed(redis_client):
     entries = await redis_client.xrange(DEAD_LETTER_STREAM_KEY)
     assert len(entries) == 1
     assert entries[0][0] != f"{expired_ms}-0".encode()
-
 
 
 @pytest.mark.asyncio

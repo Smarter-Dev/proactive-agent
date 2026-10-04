@@ -23,6 +23,15 @@ class DiscordRESTError(Exception):
         self.status_code = status_code
 
 
+def _discord_error_code(response: httpx.Response) -> int | None:
+    """The numeric ``code`` of a Discord error body, if it has one."""
+    try:
+        code = response.json().get("code")
+    except (AttributeError, ValueError):
+        return None
+    return code if isinstance(code, int) else None
+
+
 class DiscordREST:
     def __init__(
         self,
@@ -249,7 +258,9 @@ class DiscordREST:
             try:
                 response = await self._client.request(method, path, **kwargs)
             except httpx.HTTPError as error:
-                raise DiscordRESTError(None, f"{method} {path}: {error}") from error
+                raise DiscordRESTError(
+                    None, f"{method} {path}: {type(error).__name__}"
+                ) from error
             if response.status_code != 429:
                 break
             if attempt == 3:
@@ -260,8 +271,11 @@ class DiscordREST:
                 delay = 1
             await asyncio.sleep(min(60, max(0, delay)))
         if response.status_code >= 400:
+            # Status and Discord's numeric error code only: an error body can
+            # echo the message text it rejected.
             raise DiscordRESTError(
                 response.status_code,
-                f"{method} {path} -> {response.status_code}: {response.text[:500]}",
+                f"{method} {path} -> {response.status_code}"
+                f" (code {_discord_error_code(response)})",
             )
         return response

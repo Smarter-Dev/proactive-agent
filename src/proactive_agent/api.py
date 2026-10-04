@@ -245,12 +245,15 @@ class ApplicationAPI:
         try:
             response = await self._client.request(method, path, **kwargs)
         except httpx.HTTPError as error:
-            raise ApplicationAPIError(None, f"{method} {path}: {error}") from error
+            raise ApplicationAPIError(
+                None, f"{method} {path}: {type(error).__name__}"
+            ) from error
         if allow_not_found and response.status_code == 404:
             return None
         if response.status_code >= 400:
+            # Status only: a rejected history PUT's body can echo the
+            # messages it was sent.
             raise ApplicationAPIError(
-                response.status_code,
-                f"{method} {path} -> {response.status_code}: {response.text[:500]}",
+                response.status_code, f"{method} {path} -> {response.status_code}"
             )
         return response
