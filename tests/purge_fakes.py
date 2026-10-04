@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from jsonschema import Draft202012Validator
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
@@ -23,6 +25,11 @@ from proactive_agent.contracts import EnabledChannel, NotificationEnvelope
 from proactive_agent.queue import StreamNotification, WakeBatch
 from proactive_agent.runtime import ActionJournal, GuildRuntime
 from proactive_agent.types import ActivationResult
+
+ACK_SCHEMA_PATH = (
+    Path(__file__).parents[1] / "contracts" / "privacy" / "v1" / "purge_ack.schema.json"
+)
+ACK_VALIDATOR = Draft202012Validator(json.loads(ACK_SCHEMA_PATH.read_text("utf-8")))
 
 TARGET = "111111111111111111"
 TARGET_NAME = "kai"
@@ -47,6 +54,7 @@ class FakeAPI:
         self.memory_reads = 0
         self.blocked = {"revision": 0, "user_ids": []}
         self.blocked_failures = 0
+        self.validated_acks = []
 
     async def get_history(self, guild_id):
         return self.durable.get(guild_id)
@@ -100,15 +108,22 @@ class FakeAPI:
         unchecked_names,
         done_record,
     ):
-        # Ack v1 structured fields, checked on every ack the suite posts.
-        assert isinstance(name_hits, dict) and len(name_hits) <= 10
-        assert all(
-            isinstance(k, str) and isinstance(v, int) and v >= 0
-            for k, v in name_hits.items()
-        )
-        assert isinstance(tombstoned, bool)
-        assert isinstance(unchecked_names, int) and unchecked_names >= 0
-        assert done_record in {"written", "replayed", "not_written"}
+        # Every ack the suite posts must validate against the shared schema
+        # (contracts/privacy/v1/purge_ack.schema.json), with all Ack v1
+        # structured fields present.
+        payload = {
+            "component": component,
+            "guild_id": guild_id,
+            "outcome": outcome,
+            "stores": list(stores),
+            "detail": detail[:500],
+            "name_hits": dict(name_hits),
+            "tombstoned": tombstoned,
+            "unchecked_names": unchecked_names,
+            "done_record": done_record,
+        }
+        ACK_VALIDATOR.validate(payload)
+        self.validated_acks.append(payload)
         if self.ack_status == 404:
             return False
         if self.ack_status >= 400:
