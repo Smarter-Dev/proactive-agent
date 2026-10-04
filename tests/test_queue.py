@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -11,12 +12,15 @@ from proactive_agent.contracts import NotificationEnvelope
 from proactive_agent.keys import (
     DEAD_LETTER_STREAM_KEY,
     READY_STREAM_KEY,
+    batch_dropped_key,
+    batch_key,
     failure_notice_key,
     ownership_key,
+    pending_dropped_key,
     pending_key,
     wake_stream_key,
 )
-from proactive_agent.queue import RedisWakeQueue
+from proactive_agent.queue import CONTENT_RETENTION_MILLISECONDS, RedisWakeQueue
 
 
 @pytest.fixture
@@ -156,7 +160,7 @@ async def test_failed_batch_dead_letters_at_retry_ceiling(redis_client):
     dead = await redis_client.xrange(DEAD_LETTER_STREAM_KEY)
     assert len(dead) == 1
     assert dead[0][1][b"attempts"] == b"2"
-    assert b"wake" in dead[0][1][b"payload"]
+    assert batch.wake_id.encode() in dead[0][1][b"payload"]
     assert (await redis_client.xpending(wake_stream_key("111"), "proactive-agent-v1"))[
         "pending"
     ] == 0
@@ -216,3 +220,105 @@ async def test_lease_is_refused_while_a_privacy_purge_fences_the_guild(redis_cli
     assert await queue.acquire_lease("111") is None
     await redis_client.delete(privacy_lock_key("111"))
     assert await queue.acquire_lease("111") is not None
+
+
+def _inside_the_retention_window(ttl_milliseconds: int) -> bool:
+    return 0 < ttl_milliseconds <= CONTENT_RETENTION_MILLISECONDS
+
+
+async def _pending(redis_client, guild_id: str, *bodies: str) -> None:
+    for body in bodies:
+        await redis_client.rpush(
+            pending_key(guild_id),
+            envelope(guild_id, body=body, wakes=False).model_dump_json(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_claimed_batch_and_its_dropped_count_expire(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    await queue.initialize()
+    await _pending(redis_client, "111", "queued")
+    await redis_client.set(pending_dropped_key("111"), 2)
+    await publish_wake(redis_client, envelope("111", body="wake", wakes=True))
+
+    batch = await queue.build_batch("111", await queue.read_ready(block_ms=1))
+
+    assert _inside_the_retention_window(
+        await redis_client.pttl(batch_key("111", batch.wake_id))
+    )
+    assert _inside_the_retention_window(
+        await redis_client.pttl(batch_dropped_key("111", batch.wake_id))
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_midrun_drain_into_a_batch_leaves_it_expiring(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    await queue.initialize()
+    await publish_wake(redis_client, envelope("111", body="wake", wakes=True))
+    batch = await queue.build_batch("111", await queue.read_ready(block_ms=1))
+    await _pending(redis_client, "111", "arrived mid-run")
+    await redis_client.set(pending_dropped_key("111"), 1)
+
+    await queue.drain_midrun(batch)
+
+    assert _inside_the_retention_window(
+        await redis_client.pttl(batch_key("111", batch.wake_id))
+    )
+    assert _inside_the_retention_window(
+        await redis_client.pttl(batch_dropped_key("111", batch.wake_id))
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_dead_letter_keeps_ids_and_the_error_type_only(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    await queue.initialize()
+    await _pending(redis_client, "111", "what someone said quietly")
+    await publish_wake(
+        redis_client, envelope("111", body="what someone said", wakes=True)
+    )
+    batch = await queue.build_batch("111", await queue.read_ready(block_ms=1))
+
+    assert await queue.record_failure(
+        batch,
+        error="ModelHTTPError: status_code: 400, body: what someone said",
+        max_attempts=1,
+    )
+
+    [(_, fields)] = await redis_client.xrange(DEAD_LETTER_STREAM_KEY)
+    assert b"what someone said" not in b"".join(fields.values())
+    assert fields[b"error"] == b"ModelHTTPError"
+    for item in batch.notifications:
+        assert str(item.notification_id).encode() in fields[b"payload"]
+
+
+@pytest.mark.asyncio
+async def test_dead_letters_older_than_the_window_are_trimmed(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    expired_ms = 1_000
+    await redis_client.xadd(
+        DEAD_LETTER_STREAM_KEY, {"payload": "{}"}, id=f"{expired_ms}-0"
+    )
+
+    await queue.dead_letter(
+        guild_id="111", stream_id="1-0", payload="{}", error="RuntimeError", attempts=1
+    )
+
+    entries = await redis_client.xrange(DEAD_LETTER_STREAM_KEY)
+    assert len(entries) == 1
+    assert entries[0][0] != f"{expired_ms}-0".encode()
+
+
+@pytest.mark.asyncio
+async def test_the_dead_letter_trim_runs_without_a_new_dead_letter(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    now_ms = int(time.time() * 1000)
+    await redis_client.xadd(DEAD_LETTER_STREAM_KEY, {"payload": "{}"}, id="1000-0")
+    await redis_client.xadd(DEAD_LETTER_STREAM_KEY, {"payload": "{}"}, id=f"{now_ms}-0")
+
+    assert await queue.trim_dead_letters() == 1
+
+    [(entry_id, _)] = await redis_client.xrange(DEAD_LETTER_STREAM_KEY)
+    assert entry_id == f"{now_ms}-0".encode()

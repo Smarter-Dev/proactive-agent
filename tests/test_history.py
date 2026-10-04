@@ -254,3 +254,29 @@ async def test_superseded_flush_is_dropped_not_retried_forever(redis_client):
     assert api.puts == []
     assert api.durable.history == [{"note": "clean"}]
     await writer.close(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_flush_logs_no_history_text(redis_client, caplog):
+    class FailingAPI(FakeAPI):
+        async def put_history(self, snapshot):
+            if not self.puts:
+                self.puts.append(None)
+                raise RuntimeError("rejected: what someone said")
+            self.puts.append(snapshot)
+
+    api = FailingAPI()
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(
+        repository, api, debounce_seconds=60, retry_base_seconds=0.001
+    )
+    await writer.save(
+        guild_id="111", history=[{"content": "what someone said"}], previous_revision=0
+    )
+
+    with caplog.at_level("ERROR"):
+        await writer.close(timeout=1)
+
+    assert "proactive history flush failed guild=111" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "what someone said" not in caplog.text

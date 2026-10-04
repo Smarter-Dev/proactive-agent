@@ -8,11 +8,15 @@ import time
 
 from pydantic_ai.exceptions import ModelHTTPError
 
+from proactive_agent.errors import exception_trace, exception_type_name
 from proactive_agent.history import HistoryUnavailableError
 from proactive_agent.queue import ReadyRecord
 
 logger = logging.getLogger(__name__)
 UNAVAILABLE_RETRY_DELAYS = (30, 60, 120)
+# How often the dead-letter stream is trimmed to the retention window when no
+# new dead letter trims it.
+DEAD_LETTER_TRIM_SECONDS = 15 * 60
 
 
 class GuildLeaseLostError(RuntimeError):
@@ -104,9 +108,13 @@ class ProactiveWorker:
         if not await self._wait_enforcing(stop):
             return
         await self._queue.initialize()
+        next_dead_letter_trim = time.monotonic()
         while not stop.is_set():
             if not await self._wait_enforcing(stop):
                 return
+            if time.monotonic() >= next_dead_letter_trim:
+                await self._trim_dead_letters()
+                next_dead_letter_trim = time.monotonic() + DEAD_LETTER_TRIM_SECONDS
             reclaimed = await self._queue.reclaim_ready()
             ready = reclaimed or await self._queue.read_ready(block_ms=5_000)
             by_guild: dict[str, list[ReadyRecord]] = {}
@@ -118,6 +126,17 @@ class ProactiveWorker:
                 task.add_done_callback(self._tasks.discard)
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def _trim_dead_letters(self) -> None:
+        try:
+            dropped = await self._queue.trim_dead_letters()
+        except Exception as error:  # noqa: BLE001 — retried on the next timer
+            logger.error(
+                "proactive dead-letter trim failed\n%s", exception_trace(error)
+            )
+            return
+        if dropped:
+            logger.info("proactive dead-letter trim dropped=%d", dropped)
 
     async def _run_guild(self, guild_id: str, ready: tuple[ReadyRecord, ...]) -> None:
         while True:
@@ -194,12 +213,15 @@ class ProactiveWorker:
                     batch.wake_id,
                 )
             except Exception as error:
-                logger.exception(
-                    "proactive guild wake failed guild=%s wake=%s",
+                # Types and frames only: a provider error can quote the
+                # prompt, and so members' messages from other channels.
+                logger.error(
+                    "proactive guild wake failed guild=%s wake=%s\n%s",
                     guild_id,
                     batch.wake_id,
+                    exception_trace(error),
                 )
-                detail = f"{type(error).__name__}: {error}"
+                detail = exception_type_name(error)
                 unavailable = isinstance(error, UnavailableRetriesExhausted)
                 dead_lettered = await self._queue.record_failure(
                     batch,
@@ -258,11 +280,12 @@ class ProactiveWorker:
             await runtime.record_unavailable_retries(
                 batch, retries=retries, recovered=recovered
             )
-        except Exception:
-            logger.exception(
-                "proactive unavailable history note failed guild=%s wake=%s",
+        except Exception as error:
+            logger.error(
+                "proactive unavailable history note failed guild=%s wake=%s\n%s",
                 batch.guild_id,
                 batch.wake_id,
+                exception_trace(error),
             )
 
     async def _announce_failure(self, runtime, batch, detail: str) -> None:
@@ -275,11 +298,12 @@ class ProactiveWorker:
             return
         try:
             channel_id = await runtime.report_failure(batch, detail)
-        except Exception:
-            logger.exception(
-                "proactive failure notice failed guild=%s wake=%s",
+        except Exception as error:
+            logger.error(
+                "proactive failure notice failed guild=%s wake=%s\n%s",
                 batch.guild_id,
                 batch.wake_id,
+                exception_trace(error),
             )
             return
         if channel_id is not None:

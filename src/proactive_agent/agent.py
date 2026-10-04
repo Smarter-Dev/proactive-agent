@@ -36,6 +36,7 @@ from proactive_agent.environment import (
     InstructionStore,
     WakeActions,
 )
+from proactive_agent.errors import exception_trace
 from proactive_agent.types import ProposedReaction, ProposedResponse
 
 SUMMARIZE_THRESHOLD = 3000
@@ -266,7 +267,11 @@ def tool_errors_returned(tool_function):
         try:
             return await tool_function(ctx, *args, **kwargs)
         except Exception as error:  # noqa: BLE001 — surfaced to the agent
-            logger.exception("proactive tool %s failed", tool_function.__name__)
+            logger.error(
+                "proactive tool %s failed\n%s",
+                tool_function.__name__,
+                exception_trace(error),
+            )
             return (
                 f"Tool {tool_function.__name__} failed: "
                 f"{type(error).__name__}: {error}. Adjust your approach or "

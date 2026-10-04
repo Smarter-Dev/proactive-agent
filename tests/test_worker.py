@@ -122,7 +122,7 @@ async def test_unavailable_exhausts_three_retries_then_dead_letters():
     queue.acknowledge.assert_not_awaited()
     queue.record_failure.assert_awaited_once_with(
         batch,
-        error="UnavailableRetriesExhausted: model returned HTTP 503 after 3 retries",
+        error="proactive_agent.worker.UnavailableRetriesExhausted",
         max_attempts=1,
     )
     runtime.report_failure.assert_awaited_once()
@@ -189,7 +189,7 @@ async def test_lost_lease_cancels_processing_and_leaves_batch_for_retry():
     assert cancelled.is_set()
     queue.acknowledge.assert_not_awaited()
     queue.record_failure.assert_awaited_once_with(
-        batch, error="GuildLeaseLostError: lost", max_attempts=5
+        batch, error="proactive_agent.worker.GuildLeaseLostError", max_attempts=5
     )
 
 
@@ -205,7 +205,7 @@ async def test_dead_lettered_wake_announces_itself():
 
     await worker._run_guild("111", ())
 
-    runtime.report_failure.assert_awaited_once_with(batch, "RuntimeError: boom")
+    runtime.report_failure.assert_awaited_once_with(batch, "RuntimeError")
 
 
 async def test_failure_below_the_ceiling_stays_silent():
@@ -247,7 +247,7 @@ async def test_a_runtime_that_never_loaded_cannot_be_asked_to_announce():
     await worker._run_guild("111", ())
 
     queue.record_failure.assert_awaited_once_with(
-        batch, error="RuntimeError: no runtime", max_attempts=5
+        batch, error="RuntimeError", max_attempts=5
     )
 
 
@@ -377,3 +377,42 @@ async def test_a_dead_service_is_restarted():
     await asyncio.wait_for(task, timeout=1)
 
     assert len(runs) == 3
+
+
+async def test_a_failure_is_logged_and_announced_without_its_message(caplog):
+    queue, batch = queue_and_batch()
+    queue.record_failure.return_value = True
+    runtime = SimpleNamespace(
+        process=AsyncMock(side_effect=RuntimeError("what someone said")),
+        report_failure=AsyncMock(return_value=None),
+    )
+    runtimes = SimpleNamespace(get=AsyncMock(return_value=runtime))
+    worker = ProactiveWorker(queue, runtimes)
+
+    with caplog.at_level(logging.INFO, logger="proactive_agent.worker"):
+        await worker._run_guild("111", ())
+
+    assert "what someone said" not in caplog.text
+    assert "RuntimeError" in caplog.text
+    runtime.report_failure.assert_awaited_once_with(batch, "RuntimeError")
+    assert queue.record_failure.await_args.kwargs["error"] == "RuntimeError"
+
+
+async def test_the_run_loop_trims_dead_letters_on_its_timer():
+    stop = asyncio.Event()
+    queue = SimpleNamespace(
+        initialize=AsyncMock(),
+        trim_dead_letters=AsyncMock(return_value=2),
+        reclaim_ready=AsyncMock(return_value=()),
+    )
+
+    async def read_ready(block_ms):
+        stop.set()
+        return ()
+
+    queue.read_ready = read_ready
+    worker = ProactiveWorker(queue, SimpleNamespace())
+
+    await worker.run(stop)
+
+    queue.trim_dead_letters.assert_awaited_once()
