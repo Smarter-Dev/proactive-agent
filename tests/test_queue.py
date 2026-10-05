@@ -134,11 +134,14 @@ async def test_a_finished_wake_leaves_no_envelope_in_redis(redis_client):
 
     assert await redis_client.xlen(wake_stream_key("111")) == 0
     assert await redis_client.xlen(READY_STREAM_KEY) == 0
-    assert await redis_client.exists(
-        pending_key("111"),
-        batch_key("111", batch.wake_id),
-        batch_dropped_key("111", batch.wake_id),
-    ) == 0
+    assert (
+        await redis_client.exists(
+            pending_key("111"),
+            batch_key("111", batch.wake_id),
+            batch_dropped_key("111", batch.wake_id),
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -318,14 +321,17 @@ async def test_a_claimed_batch_expires_six_hours_after_its_oldest_envelope(
     batch = await queue.build_batch("111", await queue.read_ready(block_ms=1))
     oldest = min(item.created_at for item in batch.pending)
 
-    assert await redis_client.pexpiretime(
-        batch_key("111", batch.wake_id)
-    ) == _ms(oldest) + IN_FLIGHT_MAX_MILLISECONDS
+    assert (
+        await redis_client.pexpiretime(batch_key("111", batch.wake_id))
+        == _ms(oldest) + IN_FLIGHT_MAX_MILLISECONDS
+    )
 
 
 @pytest.mark.asyncio
 async def test_a_retried_claim_does_not_move_the_batch_expiry_out(redis_client):
-    queue = RedisWakeQueue(redis_client, consumer_name="worker-1", reclaim_idle_seconds=0)
+    queue = RedisWakeQueue(
+        redis_client, consumer_name="worker-1", reclaim_idle_seconds=0
+    )
     await queue.initialize()
     await _pending_aged(redis_client, "111", "old", timedelta(hours=5))
     await publish_wake(redis_client, envelope("111", body="wake", wakes=True))
@@ -351,9 +357,10 @@ async def test_a_midrun_drain_brings_the_expiry_in_to_an_older_arrival(redis_cli
     await queue.drain_midrun(batch)
 
     oldest = min(item.created_at for item in batch.pending)
-    assert await redis_client.pexpiretime(
-        batch_key("111", batch.wake_id)
-    ) == _ms(oldest) + IN_FLIGHT_MAX_MILLISECONDS
+    assert (
+        await redis_client.pexpiretime(batch_key("111", batch.wake_id))
+        == _ms(oldest) + IN_FLIGHT_MAX_MILLISECONDS
+    )
 
 
 @pytest.mark.asyncio
