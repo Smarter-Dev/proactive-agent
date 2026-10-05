@@ -1,9 +1,12 @@
 """Redis Stream consumer with guild isolation and crash-safe pending batches.
 
-Envelopes carry verbatim Discord message text, so nothing here keeps one past
-:data:`CONTENT_RETENTION_MILLISECONDS`: a claimed batch and its dropped
-counter expire that long after the claim, and the dead-letter stream keeps
-ids and an error type rather than envelopes, trimmed to the same window.
+Envelopes carry verbatim Discord message text. A wake that finishes, or is
+dead-lettered after its last attempt, acknowledges and deletes its stream
+entries and deletes its claimed batch at once; a failed attempt with attempts
+left keeps both for the retry. :data:`QUEUE_RETENTION_MILLISECONDS` after the
+claim, a batch and its dropped counter expire anyway, the backstop for a wake
+that never finishes. The dead-letter stream keeps ids and an error type
+rather than envelopes, trimmed to :data:`DEAD_LETTER_RETENTION_MILLISECONDS`.
 """
 
 from __future__ import annotations
@@ -36,9 +39,11 @@ READY_GROUP = "proactive-agent-workers-v1"
 WAKE_GROUP = "proactive-agent-v1"
 WAKE_PAYLOAD_FIELD = "payload"
 
-# The same 48-hour window smarter-dev bounds the wake stream and its own
-# claimed batches by.
-CONTENT_RETENTION_MILLISECONDS = 48 * 60 * 60 * 1000
+# The same 6-hour window smarter-dev trims the wake stream and pending list to
+# (QUEUE_RETENTION_WINDOW in smarter_dev/shared/message_content.py).
+QUEUE_RETENTION_MILLISECONDS = 6 * 60 * 60 * 1000
+# Dead letters hold no message text, only ids and an error type.
+DEAD_LETTER_RETENTION_MILLISECONDS = 48 * 60 * 60 * 1000
 
 _CLAIM_PENDING_LUA = """
 if redis.call('EXISTS', KEYS[2]) == 0 then
@@ -333,7 +338,7 @@ class RedisWakeQueue:
             batch_key(guild_id, wake_id),
             pending_dropped_key(guild_id),
             batch_dropped_key(guild_id, wake_id),
-            CONTENT_RETENTION_MILLISECONDS,
+            QUEUE_RETENTION_MILLISECONDS,
         )
         dropped = int(_decode(raw_pending[0]))
         pending = tuple(
@@ -378,7 +383,7 @@ class RedisWakeQueue:
             batch_key(batch.guild_id, batch.wake_id),
             pending_dropped_key(batch.guild_id),
             batch_dropped_key(batch.guild_id, batch.wake_id),
-            CONTENT_RETENTION_MILLISECONDS,
+            QUEUE_RETENTION_MILLISECONDS,
         )
         dropped = int(_decode(raw_pending[0]))
         newly_pending = [
@@ -503,7 +508,7 @@ class RedisWakeQueue:
         await self.trim_dead_letters()
 
     async def trim_dead_letters(self) -> int:
-        """Drop dead letters written more than the retention window ago.
+        """Drop dead letters written more than their retention window ago.
 
         Run on every write and on the worker's timer, so a stream nothing
         writes to any more still ages out. Exact, not approximate: approximate
@@ -513,7 +518,7 @@ class RedisWakeQueue:
         return int(
             await self._redis.xtrim(
                 DEAD_LETTER_STREAM_KEY,
-                minid=f"{int(time.time() * 1000) - CONTENT_RETENTION_MILLISECONDS}-0",
+                minid=f"{int(time.time() * 1000) - DEAD_LETTER_RETENTION_MILLISECONDS}-0",
                 approximate=False,
             )
         )

@@ -73,11 +73,13 @@ marked that guild `external` in Redis.
   60, then 120 seconds. If it still fails, the wake is dead-lettered. The
   worker adds one history-only note with the retry count and outcome, so the
   agent sees it on its next real wake without generating another wake.
-- Notification envelopes carry Discord message text, so the queue keeps none
-  past 48 hours: a claimed batch and its dropped counter expire 48 hours after
-  the claim, and the dead-letter stream (`proactive:v1:dead-letter`) keeps
-  only the notifications' ids and the error's type, trimmed to 48 hours on
-  every write.
+- Notification envelopes carry Discord message text, so a wake that finishes
+  (or is dead-lettered after its last attempt) acknowledges and deletes its
+  wake-stream entries and deletes its claimed batch at once. A failed attempt
+  with attempts left keeps both for the retry. A batch and its dropped counter
+  still expire 6 hours after the claim, the backstop for a wake that never
+  finishes. The dead-letter stream (`proactive:v1:dead-letter`) keeps only the
+  notifications' ids and the error's type, trimmed to 48 hours on every write.
 
 ## Rollout from the bot repository
 

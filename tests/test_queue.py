@@ -20,7 +20,7 @@ from proactive_agent.keys import (
     pending_key,
     wake_stream_key,
 )
-from proactive_agent.queue import CONTENT_RETENTION_MILLISECONDS, RedisWakeQueue
+from proactive_agent.queue import QUEUE_RETENTION_MILLISECONDS, RedisWakeQueue
 
 
 @pytest.fixture
@@ -111,6 +111,44 @@ async def test_pending_is_claimed_once_and_survives_retry(redis_client):
         await redis_client.exists(f"proactive:v1:{{guild:111}}:batch:{first.wake_id}")
         == 0
     )
+
+
+def test_the_queue_window_is_six_hours():
+    assert QUEUE_RETENTION_MILLISECONDS == 6 * 60 * 60 * 1000
+
+
+@pytest.mark.asyncio
+async def test_a_finished_wake_leaves_no_envelope_in_redis(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    await queue.initialize()
+    await _pending(redis_client, "111", "queued")
+    await redis_client.set(pending_dropped_key("111"), 1)
+    await publish_wake(redis_client, envelope("111", body="wake", wakes=True))
+    batch = await queue.build_batch("111", await queue.read_ready(block_ms=1))
+
+    await queue.acknowledge(batch)
+
+    assert await redis_client.xlen(wake_stream_key("111")) == 0
+    assert await redis_client.xlen(READY_STREAM_KEY) == 0
+    assert await redis_client.exists(
+        pending_key("111"),
+        batch_key("111", batch.wake_id),
+        batch_dropped_key("111", batch.wake_id),
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_attempt_keeps_the_wake_for_its_retry(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    await queue.initialize()
+    await _pending(redis_client, "111", "queued")
+    await publish_wake(redis_client, envelope("111", body="wake", wakes=True))
+    batch = await queue.build_batch("111", await queue.read_ready(block_ms=1))
+
+    assert not await queue.record_failure(batch, error="first", max_attempts=2)
+
+    assert await redis_client.xlen(wake_stream_key("111")) == 1
+    assert await redis_client.exists(batch_key("111", batch.wake_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -223,7 +261,7 @@ async def test_lease_is_refused_while_a_privacy_purge_fences_the_guild(redis_cli
 
 
 def _inside_the_retention_window(ttl_milliseconds: int) -> bool:
-    return 0 < ttl_milliseconds <= CONTENT_RETENTION_MILLISECONDS
+    return 0 < ttl_milliseconds <= QUEUE_RETENTION_MILLISECONDS
 
 
 async def _pending(redis_client, guild_id: str, *bodies: str) -> None:
