@@ -3,9 +3,9 @@
 Envelopes carry verbatim Discord message text. A wake that finishes, or is
 dead-lettered after its last attempt, acknowledges and deletes its stream
 entries and deletes its claimed batch at once; a failed attempt with attempts
-left keeps both for the retry. :data:`QUEUE_RETENTION_MILLISECONDS` after the
-claim, a batch and its dropped counter expire anyway, the backstop for a wake
-that never finishes. The dead-letter stream keeps ids and an error type
+left keeps both for the retry. A batch expires anyway, the backstop for a wake
+that never finishes, :data:`IN_FLIGHT_MAX_MILLISECONDS` after its oldest
+envelope was written. The dead-letter stream keeps ids and an error type
 rather than envelopes, trimmed to :data:`DEAD_LETTER_RETENTION_MILLISECONDS`.
 """
 
@@ -39,9 +39,10 @@ READY_GROUP = "proactive-agent-workers-v1"
 WAKE_GROUP = "proactive-agent-v1"
 WAKE_PAYLOAD_FIELD = "payload"
 
-# The same 6-hour window smarter-dev trims the wake stream and pending list to
-# (QUEUE_RETENTION_WINDOW in smarter_dev/shared/message_content.py).
-QUEUE_RETENTION_MILLISECONDS = 6 * 60 * 60 * 1000
+# The privacy notice's bound on message text in flight (IN_FLIGHT_MAX in
+# smarter-dev's smarter_dev/shared/retention_policy.py): nothing claimed here
+# outlives it, counted from when the envelope was written.
+IN_FLIGHT_MAX_MILLISECONDS = 6 * 60 * 60 * 1000
 # Dead letters hold no message text, only ids and an error type.
 DEAD_LETTER_RETENTION_MILLISECONDS = 48 * 60 * 60 * 1000
 
@@ -338,13 +339,14 @@ class RedisWakeQueue:
             batch_key(guild_id, wake_id),
             pending_dropped_key(guild_id),
             batch_dropped_key(guild_id, wake_id),
-            QUEUE_RETENTION_MILLISECONDS,
+            IN_FLIGHT_MAX_MILLISECONDS,
         )
         dropped = int(_decode(raw_pending[0]))
         pending = tuple(
             NotificationEnvelope.model_validate_json(_decode(item))
             for item in raw_pending[1:]
         )
+        await self._expire_with_oldest(batch_key(guild_id, wake_id), pending)
         return WakeBatch(
             guild_id=guild_id,
             wake_id=wake_id,
@@ -383,19 +385,34 @@ class RedisWakeQueue:
             batch_key(batch.guild_id, batch.wake_id),
             pending_dropped_key(batch.guild_id),
             batch_dropped_key(batch.guild_id, batch.wake_id),
-            QUEUE_RETENTION_MILLISECONDS,
+            IN_FLIGHT_MAX_MILLISECONDS,
         )
         dropped = int(_decode(raw_pending[0]))
         newly_pending = [
             NotificationEnvelope.model_validate_json(_decode(item))
             for item in raw_pending[1:]
         ]
+        await self._expire_with_oldest(
+            batch_key(batch.guild_id, batch.wake_id), newly_pending
+        )
         batch.waking.extend(newly_waking)
         batch.pending.extend(newly_pending)
         batch.dropped += dropped
         return (
             (*newly_pending, *(item.envelope for item in newly_waking)),
             dropped,
+        )
+
+    async def _expire_with_oldest(self, key: str, envelopes) -> None:
+        """Bring the batch's expiry in to its oldest envelope's write plus the
+        in-flight bound. Only ever earlier, so a retry cannot extend it."""
+        if not envelopes:
+            return
+        oldest = min(envelope.created_at for envelope in envelopes)
+        await self._redis.pexpireat(
+            key,
+            int(oldest.timestamp() * 1000) + IN_FLIGHT_MAX_MILLISECONDS,
+            lt=True,
         )
 
     async def acknowledge(self, batch: WakeBatch) -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import fakeredis.aioredis
@@ -20,7 +20,7 @@ from proactive_agent.keys import (
     pending_key,
     wake_stream_key,
 )
-from proactive_agent.queue import QUEUE_RETENTION_MILLISECONDS, RedisWakeQueue
+from proactive_agent.queue import IN_FLIGHT_MAX_MILLISECONDS, RedisWakeQueue
 
 
 @pytest.fixture
@@ -28,7 +28,9 @@ def redis_client():
     return fakeredis.aioredis.FakeRedis(decode_responses=False)
 
 
-def envelope(guild_id: str, *, body: str, wakes: bool) -> NotificationEnvelope:
+def envelope(
+    guild_id: str, *, body: str, wakes: bool, age: timedelta = timedelta(0)
+) -> NotificationEnvelope:
     return NotificationEnvelope(
         schema_version=1,
         notification_id=uuid4(),
@@ -36,7 +38,9 @@ def envelope(guild_id: str, *, body: str, wakes: bool) -> NotificationEnvelope:
         channel_id="222",
         channel_name="general",
         kind="mention" if wakes else "reaction",
-        created_at=datetime(2026, 9, 1, 16, 0, tzinfo=UTC),
+        # Written now (less ``age``): a batch expires a fixed time after its
+        # oldest envelope was written, so a fixed past date would expire it.
+        created_at=datetime.now(UTC) - age,
         body=body,
         message_ids=("333",),
         wakes=wakes,
@@ -113,8 +117,8 @@ async def test_pending_is_claimed_once_and_survives_retry(redis_client):
     )
 
 
-def test_the_queue_window_is_six_hours():
-    assert QUEUE_RETENTION_MILLISECONDS == 6 * 60 * 60 * 1000
+def test_the_in_flight_bound_is_six_hours():
+    assert IN_FLIGHT_MAX_MILLISECONDS == 6 * 60 * 60 * 1000
 
 
 @pytest.mark.asyncio
@@ -261,7 +265,7 @@ async def test_lease_is_refused_while_a_privacy_purge_fences_the_guild(redis_cli
 
 
 def _inside_the_retention_window(ttl_milliseconds: int) -> bool:
-    return 0 < ttl_milliseconds <= QUEUE_RETENTION_MILLISECONDS
+    return 0 < ttl_milliseconds <= IN_FLIGHT_MAX_MILLISECONDS
 
 
 async def _pending(redis_client, guild_id: str, *bodies: str) -> None:
@@ -288,6 +292,68 @@ async def test_a_claimed_batch_and_its_dropped_count_expire(redis_client):
     assert _inside_the_retention_window(
         await redis_client.pttl(batch_dropped_key("111", batch.wake_id))
     )
+
+
+async def _pending_aged(redis_client, guild_id: str, body: str, age: timedelta) -> None:
+    await redis_client.rpush(
+        pending_key(guild_id),
+        envelope(guild_id, body=body, wakes=False, age=age).model_dump_json(),
+    )
+
+
+def _ms(moment: datetime) -> int:
+    return int(moment.timestamp() * 1000)
+
+
+@pytest.mark.asyncio
+async def test_a_claimed_batch_expires_six_hours_after_its_oldest_envelope(
+    redis_client,
+):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    await queue.initialize()
+    await _pending_aged(redis_client, "111", "old", timedelta(hours=5))
+    await _pending_aged(redis_client, "111", "new", timedelta(minutes=1))
+    await publish_wake(redis_client, envelope("111", body="wake", wakes=True))
+
+    batch = await queue.build_batch("111", await queue.read_ready(block_ms=1))
+    oldest = min(item.created_at for item in batch.pending)
+
+    assert await redis_client.pexpiretime(
+        batch_key("111", batch.wake_id)
+    ) == _ms(oldest) + IN_FLIGHT_MAX_MILLISECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_retried_claim_does_not_move_the_batch_expiry_out(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1", reclaim_idle_seconds=0)
+    await queue.initialize()
+    await _pending_aged(redis_client, "111", "old", timedelta(hours=5))
+    await publish_wake(redis_client, envelope("111", body="wake", wakes=True))
+    ready = await queue.read_ready(block_ms=1)
+    first = await queue.build_batch("111", ready)
+    expiry = await redis_client.pexpiretime(batch_key("111", first.wake_id))
+
+    retried = await queue.build_batch("111", ready)
+
+    assert retried.wake_id == first.wake_id
+    assert await redis_client.pexpiretime(batch_key("111", first.wake_id)) == expiry
+
+
+@pytest.mark.asyncio
+async def test_a_midrun_drain_brings_the_expiry_in_to_an_older_arrival(redis_client):
+    queue = RedisWakeQueue(redis_client, consumer_name="worker-1")
+    await queue.initialize()
+    await _pending_aged(redis_client, "111", "recent", timedelta(minutes=1))
+    await publish_wake(redis_client, envelope("111", body="wake", wakes=True))
+    batch = await queue.build_batch("111", await queue.read_ready(block_ms=1))
+    await _pending_aged(redis_client, "111", "older", timedelta(hours=4))
+
+    await queue.drain_midrun(batch)
+
+    oldest = min(item.created_at for item in batch.pending)
+    assert await redis_client.pexpiretime(
+        batch_key("111", batch.wake_id)
+    ) == _ms(oldest) + IN_FLIGHT_MAX_MILLISECONDS
 
 
 @pytest.mark.asyncio
