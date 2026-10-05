@@ -1,9 +1,12 @@
 """Redis Stream consumer with guild isolation and crash-safe pending batches.
 
-Envelopes carry verbatim Discord message text, so nothing here keeps one past
-:data:`CONTENT_RETENTION_MILLISECONDS`: a claimed batch and its dropped
-counter expire that long after the claim, and the dead-letter stream keeps
-ids and an error type rather than envelopes, trimmed to the same window.
+Envelopes carry verbatim Discord message text. A wake that finishes, or is
+dead-lettered after its last attempt, acknowledges and deletes its stream
+entries and deletes its claimed batch at once; a failed attempt with attempts
+left keeps both for the retry. A batch expires anyway, the backstop for a wake
+that never finishes, :data:`IN_FLIGHT_MAX_MILLISECONDS` after its oldest
+envelope was written. The dead-letter stream keeps ids and an error type
+rather than envelopes, trimmed to :data:`DEAD_LETTER_RETENTION_MILLISECONDS`.
 """
 
 from __future__ import annotations
@@ -36,9 +39,12 @@ READY_GROUP = "proactive-agent-workers-v1"
 WAKE_GROUP = "proactive-agent-v1"
 WAKE_PAYLOAD_FIELD = "payload"
 
-# The same 48-hour window smarter-dev bounds the wake stream and its own
-# claimed batches by.
-CONTENT_RETENTION_MILLISECONDS = 48 * 60 * 60 * 1000
+# The privacy notice's bound on message text in flight (IN_FLIGHT_MAX in
+# smarter-dev's smarter_dev/shared/retention_policy.py): nothing claimed here
+# outlives it, counted from when the envelope was written.
+IN_FLIGHT_MAX_MILLISECONDS = 6 * 60 * 60 * 1000
+# Dead letters hold no message text, only ids and an error type.
+DEAD_LETTER_RETENTION_MILLISECONDS = 48 * 60 * 60 * 1000
 
 _CLAIM_PENDING_LUA = """
 if redis.call('EXISTS', KEYS[2]) == 0 then
@@ -333,13 +339,14 @@ class RedisWakeQueue:
             batch_key(guild_id, wake_id),
             pending_dropped_key(guild_id),
             batch_dropped_key(guild_id, wake_id),
-            CONTENT_RETENTION_MILLISECONDS,
+            IN_FLIGHT_MAX_MILLISECONDS,
         )
         dropped = int(_decode(raw_pending[0]))
         pending = tuple(
             NotificationEnvelope.model_validate_json(_decode(item))
             for item in raw_pending[1:]
         )
+        await self._expire_with_oldest(batch_key(guild_id, wake_id), pending)
         return WakeBatch(
             guild_id=guild_id,
             wake_id=wake_id,
@@ -378,19 +385,34 @@ class RedisWakeQueue:
             batch_key(batch.guild_id, batch.wake_id),
             pending_dropped_key(batch.guild_id),
             batch_dropped_key(batch.guild_id, batch.wake_id),
-            CONTENT_RETENTION_MILLISECONDS,
+            IN_FLIGHT_MAX_MILLISECONDS,
         )
         dropped = int(_decode(raw_pending[0]))
         newly_pending = [
             NotificationEnvelope.model_validate_json(_decode(item))
             for item in raw_pending[1:]
         ]
+        await self._expire_with_oldest(
+            batch_key(batch.guild_id, batch.wake_id), newly_pending
+        )
         batch.waking.extend(newly_waking)
         batch.pending.extend(newly_pending)
         batch.dropped += dropped
         return (
             (*newly_pending, *(item.envelope for item in newly_waking)),
             dropped,
+        )
+
+    async def _expire_with_oldest(self, key: str, envelopes) -> None:
+        """Bring the batch's expiry in to its oldest envelope's write plus the
+        in-flight bound. Only ever earlier, so a retry cannot extend it."""
+        if not envelopes:
+            return
+        oldest = min(envelope.created_at for envelope in envelopes)
+        await self._redis.pexpireat(
+            key,
+            int(oldest.timestamp() * 1000) + IN_FLIGHT_MAX_MILLISECONDS,
+            lt=True,
         )
 
     async def acknowledge(self, batch: WakeBatch) -> None:
@@ -503,7 +525,7 @@ class RedisWakeQueue:
         await self.trim_dead_letters()
 
     async def trim_dead_letters(self) -> int:
-        """Drop dead letters written more than the retention window ago.
+        """Drop dead letters written more than their retention window ago.
 
         Run on every write and on the worker's timer, so a stream nothing
         writes to any more still ages out. Exact, not approximate: approximate
@@ -513,7 +535,7 @@ class RedisWakeQueue:
         return int(
             await self._redis.xtrim(
                 DEAD_LETTER_STREAM_KEY,
-                minid=f"{int(time.time() * 1000) - CONTENT_RETENTION_MILLISECONDS}-0",
+                minid=f"{int(time.time() * 1000) - DEAD_LETTER_RETENTION_MILLISECONDS}-0",
                 approximate=False,
             )
         )
