@@ -52,7 +52,8 @@ return 1
 """
 
 # A privacy purge's own v1 write: unconditional, and the only write that
-# clears the tombstone. It is a new write: the idle clock restarts.
+# clears the tombstone. It is not activity: the idle clock keeps the time of
+# the last real write (ARGV[2], read before the write).
 _WRITE_PURGED_LUA = """
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('DEL', KEYS[2])
@@ -138,6 +139,10 @@ def snapshot_is_valid(snapshot: HistorySnapshot) -> bool:
     return snapshot.checksum == history_checksum(snapshot.history)
 
 
+class HistoryChecksumError(ValueError):
+    """The Postgres copy's history does not match its checksum."""
+
+
 class GuildHistoryRepository:
     """Load Redis first and use the application API as durable fallback."""
 
@@ -175,7 +180,7 @@ class GuildHistoryRepository:
         durable = await self._api.get_history(guild_id)
         if durable is not None:
             if not snapshot_is_valid(durable):
-                raise ValueError(
+                raise HistoryChecksumError(
                     f"durable proactive history checksum failed for guild {guild_id}"
                 )
             await self.cache(durable)
@@ -249,6 +254,21 @@ class GuildHistoryRepository:
             written_at = await self._redis.zscore(HISTORY_IDLE_INDEX_KEY, guild_id)
         return written_at, meta.get("fresh") == "1"
 
+    async def stored_revision(self, guild_id: str) -> int:
+        """The highest revision either store holds, read without parsing the
+        history (it may be unreadable)."""
+        revision = 0
+        raw = await self._redis.get(history_key(guild_id))
+        if raw:
+            text = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
+            match = re.search(r'"revision":(\d+)', text)
+            if match:
+                revision = int(match.group(1))
+        durable = await self._api.get_history(guild_id)
+        if durable is not None:
+            revision = max(revision, durable.revision)
+        return revision
+
     async def reindex(self, guild_id: str, written_at: float) -> None:
         await self._redis.zadd(HISTORY_IDLE_INDEX_KEY, {guild_id: written_at})
 
@@ -291,7 +311,11 @@ class GuildHistoryRepository:
         """The purge's own v1 write: replaces v1 and clears the tombstone."""
         if not snapshot_is_valid(snapshot):
             raise ValueError("refusing to cache history with an invalid checksum")
-        written_at = time.time()
+        # The purge must not extend how long the rest stays verbatim: keep
+        # the clock where the last real write left it.
+        written_at, _fresh = await self.idle_state(snapshot.guild_id)
+        if written_at is None:
+            written_at = time.time()
         await self._redis.zadd(HISTORY_IDLE_INDEX_KEY, {snapshot.guild_id: written_at})
         await self._redis.eval(
             _WRITE_PURGED_LUA,

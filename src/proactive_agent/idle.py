@@ -14,7 +14,9 @@ It runs as a worker service, whether or not any wake comes, every
 beside the v1 key (``keys.history_meta_key``), indexed in
 ``keys.HISTORY_IDLE_INDEX_KEY``; both live in Redis, so a restart resumes it.
 v1 histories written before the index existed start their clock at the
-service's first pass.
+service's first pass. A privacy purge's rewrite keeps the clock where it was.
+A history that no longer parses is replaced at the idle point by a note that
+it was dropped.
 
 The fold is written like a wake's: v1 at once (a new revision, so every
 replica's in-RAM copy is reloaded before its next wake) and Postgres through
@@ -33,6 +35,7 @@ from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from uuid import uuid4
 
+from pydantic import ValidationError
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
 from proactive_agent.agent import (
@@ -42,6 +45,7 @@ from proactive_agent.agent import (
     purge_agent_history,
 )
 from proactive_agent.errors import exception_trace
+from proactive_agent.history import HistoryChecksumError
 from proactive_agent.keys import lease_key, privacy_lock_key
 from proactive_agent.purge import PrivacyLock
 
@@ -53,6 +57,9 @@ SUMMARY_TIMEOUT_SECONDS = 120
 FENCE_SECONDS = 600
 UNSUMMARIZED_NOTE = (
     "[Earlier history could not be summarized when it went idle and was dropped.]"
+)
+UNREADABLE_NOTE = (
+    "[Earlier history could not be read when it went idle and was dropped.]"
 )
 
 
@@ -156,13 +163,16 @@ class IdleHistoryCompactor:
         if self._clock() - written_at < IDLE_WINDOW.total_seconds():
             await self._repository.reindex(guild_id, written_at)
             return "written since"
-        snapshot = await self._repository.load_canonical(guild_id)
-        if snapshot is None or not snapshot.history:
-            await self._repository.forget_idle(guild_id)
-            return "empty"
-        history: list[ModelMessage] = list(
-            ModelMessagesTypeAdapter.validate_json(json.dumps(snapshot.history))
-        )
+        try:
+            snapshot = await self._repository.load_canonical(guild_id)
+            if snapshot is None or not snapshot.history:
+                await self._repository.forget_idle(guild_id)
+                return "empty"
+            history: list[ModelMessage] = list(
+                ModelMessagesTypeAdapter.validate_json(json.dumps(snapshot.history))
+            )
+        except (HistoryChecksumError, ValidationError):
+            return await self._replace_unreadable(guild_id)
         if is_summary_only(history):
             await self._repository.forget_idle(guild_id)
             return "already summary only"
@@ -179,6 +189,21 @@ class IdleHistoryCompactor:
         # Summary only: nothing for the sweep until the next real write.
         await self._repository.forget_idle(guild_id)
         return outcome
+
+    async def _replace_unreadable(self, guild_id: str) -> str:
+        """Verbatim bytes nobody can use, and no purge can rewrite what it
+        cannot parse. The worker cannot delete its Postgres row, so both
+        copies become a note that the history was dropped."""
+        revision = await self._repository.stored_revision(guild_id)
+        await self._writer.save(
+            guild_id=guild_id,
+            history=json.loads(
+                ModelMessagesTypeAdapter.dump_json(memory_note_pair(UNREADABLE_NOTE))
+            ),
+            previous_revision=revision,
+        )
+        await self._repository.forget_idle(guild_id)
+        return "unreadable replaced"
 
     async def _fold(self, history: list[ModelMessage]) -> list[ModelMessage]:
         try:

@@ -30,13 +30,19 @@ from proactive_agent.agent import (
     is_summary_only,
     memory_note_pair,
 )
+from proactive_agent.contracts import HistorySnapshot
 from proactive_agent.history import (
     DebouncedHistoryWriter,
     GuildHistoryRepository,
     build_snapshot,
 )
 from proactive_agent.idle import IDLE_WINDOW, IdleHistoryCompactor
-from proactive_agent.keys import HISTORY_IDLE_INDEX_KEY, history_key, ownership_key
+from proactive_agent.keys import (
+    HISTORY_IDLE_INDEX_KEY,
+    history_key,
+    history_meta_key,
+    ownership_key,
+)
 from proactive_agent.queue import RedisWakeQueue
 
 IDLE = IDLE_WINDOW.total_seconds()
@@ -358,3 +364,66 @@ async def test_a_wake_that_fails_after_compacting_leaves_it_flagged(setup):
     setup.clock.offset = IDLE + 1
     assert await setup.compactor().sweep_once() == {GUILD: "tail dropped"}
     assert setup.summaries == []
+
+
+async def test_a_purge_rewrite_keeps_the_idle_clock(setup):
+    # Last written a minute short of the window, then purged: the rest must
+    # still fold on time, not 2 hours after the purge.
+    snapshot = await setup.save(raw_history_with_target())
+    written_at = time.time() - IDLE + 60
+    await setup.redis.hset(history_meta_key(GUILD), "written_at", repr(written_at))
+    await setup.redis.zadd(HISTORY_IDLE_INDEX_KEY, {GUILD: written_at})
+
+    purged = build_snapshot(
+        GUILD,
+        dump(memory_note_pair("nia asked about Rust")),
+        revision=snapshot.revision + 10,
+    )
+    await setup.repository.write_purged(purged)
+
+    assert (await setup.repository.idle_state(GUILD))[0] == written_at
+    assert await setup.redis.zscore(HISTORY_IDLE_INDEX_KEY, GUILD) == written_at
+    setup.clock.offset = 61
+    assert await setup.compactor().sweep_once() == {GUILD: "already summary only"}
+
+
+async def test_an_unreadable_durable_copy_is_replaced_at_the_idle_point(setup):
+    # Postgres holds bytes that fail their checksum, and v1 has nothing.
+    setup.api.durable[GUILD] = HistorySnapshot(
+        guild_id=GUILD,
+        revision=3,
+        checksum="0" * 64,
+        history=dump(raw_history_with_target()),
+    )
+    await setup.redis.zadd(HISTORY_IDLE_INDEX_KEY, {GUILD: time.time()})
+    setup.clock.offset = IDLE + 1
+
+    assert await setup.compactor().sweep_once() == {GUILD: "unreadable replaced"}
+    assert setup.summaries == []
+    v1, durable = await setup.stored()
+    for copy in (v1, durable):
+        assert is_summary_only(ModelMessagesTypeAdapter.validate_json(json.dumps(copy)))
+        assert VERBATIM not in as_text(copy)
+    assert setup.api.durable[GUILD].revision == 4
+    assert await setup.redis.zscore(HISTORY_IDLE_INDEX_KEY, GUILD) is None
+
+
+async def test_a_history_that_does_not_parse_is_replaced_at_the_idle_point(setup):
+    # A valid snapshot whose messages are not model messages.
+    await setup.save([{"kind": "unknown", "text": VERBATIM}])
+    setup.clock.offset = IDLE + 1
+
+    assert await setup.compactor().sweep_once() == {GUILD: "unreadable replaced"}
+    v1, durable = await setup.stored()
+    for copy in (v1, durable):
+        assert VERBATIM not in as_text(copy)
+
+
+async def test_an_unreadable_history_inside_the_window_is_kept(setup):
+    # Negative control for the replace: only the idle point removes it.
+    await setup.save([{"kind": "unknown", "text": VERBATIM}])
+    before = await setup.redis.get(history_key(GUILD))
+    setup.clock.offset = IDLE - 60
+
+    assert await setup.compactor().sweep_once() == {}
+    assert await setup.redis.get(history_key(GUILD)) == before
