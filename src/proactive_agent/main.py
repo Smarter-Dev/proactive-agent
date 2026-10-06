@@ -28,6 +28,7 @@ from proactive_agent.discord import DiscordREST
 from proactive_agent.engine import AgentEngine, SkimRunner
 from proactive_agent.health import HealthServer
 from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
+from proactive_agent.idle import IdleHistoryCompactor
 from proactive_agent.models import build_model
 from proactive_agent.parity import build_proactive_agent
 from proactive_agent.purge import PrivacyPurgeConsumer
@@ -141,12 +142,26 @@ async def run() -> None:
         blocked_users=blocked_users,
         replica_id=replica_id,
     )
+    idle_model = build_model(settings.proactive_agent_model)
+
+    async def idle_summarize(messages) -> str:
+        summary, _usage = await self_compaction_summary(idle_model, messages)
+        return summary
+
+    idle_compactor = IdleHistoryCompactor(
+        redis_client,
+        queue,
+        history_repository,
+        history_writer,
+        # The agent's own model writes its own memory, as in a wake.
+        summarize=idle_summarize,
+    )
     worker = ProactiveWorker(
         queue,
         runtimes,
         concurrency=settings.proactive_worker_concurrency,
         max_attempts=settings.proactive_max_attempts,
-        services=(blocked_users, privacy_purges),
+        services=(blocked_users, privacy_purges, idle_compactor),
         blocked_users=blocked_users,
     )
     health = HealthServer(redis_client, api, port=settings.proactive_health_port)

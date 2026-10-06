@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from pydantic_ai.messages import (
+    ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
@@ -259,6 +260,7 @@ class GuildRuntime:
             )
 
         self.engine.deps_factory = deps_factory
+        self.engine.agent_runner.on_compacted = self._save_compacted
         result = await self.engine.wake(
             notifications=tuple(notifications),
             dropped=batch.dropped,
@@ -312,12 +314,24 @@ class GuildRuntime:
             enabled[0],
         )
 
-    async def _save_history(self, history: list[dict]):
+    async def _save_compacted(self, history: list[ModelMessage]) -> None:
+        """Store the wake's compaction (note + kept tail) before its turn
+        runs, flagged fresh; the end-of-wake save clears the flag."""
+        snapshot = await self._save_history(
+            json.loads(ModelMessagesTypeAdapter.dump_json(history)),
+            freshly_compacted=True,
+        )
+        self.history_revision = snapshot.revision
+
+    async def _save_history(
+        self, history: list[dict], *, freshly_compacted: bool = False
+    ):
         try:
             return await self.history_writer.save(
                 guild_id=self.guild_id,
                 history=history,
                 previous_revision=self.history_revision,
+                freshly_compacted=freshly_compacted,
             )
         except StaleHistoryError:
             # Someone else (another replica, or a purge) stored a newer

@@ -7,14 +7,18 @@ import hashlib
 import json
 import logging
 import re
+import time
 
 from pydantic import ValidationError
 
 from proactive_agent.contracts import HistorySnapshot
 from proactive_agent.errors import exception_trace
 from proactive_agent.keys import (
+    HISTORY_IDLE_INDEX_KEY,
+    KEY_PREFIX,
     history_invalid_key,
     history_key,
+    history_meta_key,
     legacy_history_key,
     purge_epoch_key,
 )
@@ -26,6 +30,9 @@ logger = logging.getLogger(__name__)
 # replace v1 then). HistorySnapshot JSON puts "revision" before "history",
 # so the first match is the snapshot's own field, read without decoding a
 # potentially large history in Lua.
+# A new history write (ARGV[3] = its epoch seconds, ARGV[4] = the fresh flag)
+# restarts the guild's idle clock in KEYS[3] in the same step; a reload that
+# only re-caches a stored copy passes ARGV[3] = "" and leaves the clock alone.
 _CACHE_IF_NEWER_LUA = """
 if redis.call('EXISTS', KEYS[2]) == 1 then
   return 0
@@ -38,14 +45,19 @@ if current then
   end
 end
 redis.call('SET', KEYS[1], ARGV[1])
+if ARGV[3] ~= '' then
+  redis.call('HSET', KEYS[3], 'written_at', ARGV[3], 'fresh', ARGV[4])
+end
 return 1
 """
 
 # A privacy purge's own v1 write: unconditional, and the only write that
-# clears the tombstone.
+# clears the tombstone. It is not activity: the idle clock keeps the time of
+# the last real write (ARGV[2], read before the write).
 _WRITE_PURGED_LUA = """
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('DEL', KEYS[2])
+redis.call('HSET', KEYS[3], 'written_at', ARGV[2], 'fresh', '0')
 return 1
 """
 
@@ -127,6 +139,10 @@ def snapshot_is_valid(snapshot: HistorySnapshot) -> bool:
     return snapshot.checksum == history_checksum(snapshot.history)
 
 
+class HistoryChecksumError(ValueError):
+    """The Postgres copy's history does not match its checksum."""
+
+
 class GuildHistoryRepository:
     """Load Redis first and use the application API as durable fallback."""
 
@@ -164,31 +180,116 @@ class GuildHistoryRepository:
         durable = await self._api.get_history(guild_id)
         if durable is not None:
             if not snapshot_is_valid(durable):
-                raise ValueError(
+                raise HistoryChecksumError(
                     f"durable proactive history checksum failed for guild {guild_id}"
                 )
             await self.cache(durable)
             return durable
         return None
 
-    async def cache(self, snapshot: HistorySnapshot) -> bool:
+    async def cache(
+        self,
+        snapshot: HistorySnapshot,
+        *,
+        written_at: float | None = None,
+        freshly_compacted: bool = False,
+    ) -> bool:
         """Set the v1 key only if it holds an older revision (or nothing).
 
         Returns False, writing nothing, when the stored revision is equal or
-        newer.
+        newer. ``written_at`` marks a new history write: the guild's idle
+        clock restarts there (index first, so a failure between the two can
+        only make the sweep look sooner). Without it the snapshot is a
+        stored copy re-cached; the clock is only started if the guild has
+        none.
         """
         if not snapshot_is_valid(snapshot):
             raise ValueError("refusing to cache history with an invalid checksum")
+        if written_at is not None:
+            await self._redis.zadd(
+                HISTORY_IDLE_INDEX_KEY, {snapshot.guild_id: written_at}
+            )
+        else:
+            await self._redis.zadd(
+                HISTORY_IDLE_INDEX_KEY, {snapshot.guild_id: time.time()}, nx=True
+            )
         return bool(
             await self._redis.eval(
                 _CACHE_IF_NEWER_LUA,
-                2,
+                3,
                 history_key(snapshot.guild_id),
                 history_invalid_key(snapshot.guild_id),
+                history_meta_key(snapshot.guild_id),
                 snapshot.model_dump_json(),
                 snapshot.revision,
+                "" if written_at is None else repr(written_at),
+                "1" if freshly_compacted else "0",
             )
         )
+
+    # -- idle clock (see idle.py) --
+
+    async def idle_guild_ids(self, *, written_before: float) -> list[str]:
+        members = await self._redis.zrangebyscore(
+            HISTORY_IDLE_INDEX_KEY, "-inf", written_before
+        )
+        return [
+            member.decode() if isinstance(member, bytes) else member
+            for member in members
+        ]
+
+    async def idle_state(self, guild_id: str) -> tuple[float | None, bool]:
+        """(epoch of the last history write, fresh flag). The meta hash is
+        the authority; a guild without one falls back to its index score."""
+        meta = await self._redis.hgetall(history_meta_key(guild_id))
+        meta = {
+            (key.decode() if isinstance(key, bytes) else key): (
+                value.decode() if isinstance(value, bytes) else value
+            )
+            for key, value in meta.items()
+        }
+        try:
+            written_at = float(meta["written_at"])
+        except (KeyError, ValueError):
+            written_at = await self._redis.zscore(HISTORY_IDLE_INDEX_KEY, guild_id)
+        return written_at, meta.get("fresh") == "1"
+
+    async def stored_revision(self, guild_id: str) -> int:
+        """The highest revision either store holds, read without parsing the
+        history (it may be unreadable)."""
+        revision = 0
+        raw = await self._redis.get(history_key(guild_id))
+        if raw:
+            text = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
+            match = re.search(r'"revision":(\d+)', text)
+            if match:
+                revision = int(match.group(1))
+        durable = await self._api.get_history(guild_id)
+        if durable is not None:
+            revision = max(revision, durable.revision)
+        return revision
+
+    async def reindex(self, guild_id: str, written_at: float) -> None:
+        await self._redis.zadd(HISTORY_IDLE_INDEX_KEY, {guild_id: written_at})
+
+    async def forget_idle(self, guild_id: str) -> None:
+        """Leave the idle index until the next history write."""
+        await self._redis.zrem(HISTORY_IDLE_INDEX_KEY, guild_id)
+
+    async def index_unindexed(self, *, now: float) -> int:
+        """Start the idle clock at ``now`` for v1 histories the index does
+        not hold (written before it existed)."""
+        added = 0
+        async for key in self._redis.scan_iter(
+            match=f"{KEY_PREFIX}:{{guild:*}}:history"
+        ):
+            key = key.decode() if isinstance(key, bytes) else key
+            match = re.search(r"\{guild:([0-9]+)\}", key)
+            if match:
+                added += await self._redis.zadd(
+                    HISTORY_IDLE_INDEX_KEY, {match.group(1): now}, nx=True
+                )
+        return added
 
     async def _load_redis(self, guild_id: str) -> HistorySnapshot | None:
         raw = await self._redis.get(history_key(guild_id))
@@ -210,12 +311,20 @@ class GuildHistoryRepository:
         """The purge's own v1 write: replaces v1 and clears the tombstone."""
         if not snapshot_is_valid(snapshot):
             raise ValueError("refusing to cache history with an invalid checksum")
+        # The purge must not extend how long the rest stays verbatim: keep
+        # the clock where the last real write left it.
+        written_at, _fresh = await self.idle_state(snapshot.guild_id)
+        if written_at is None:
+            written_at = time.time()
+        await self._redis.zadd(HISTORY_IDLE_INDEX_KEY, {snapshot.guild_id: written_at})
         await self._redis.eval(
             _WRITE_PURGED_LUA,
-            2,
+            3,
             history_key(snapshot.guild_id),
             history_invalid_key(snapshot.guild_id),
+            history_meta_key(snapshot.guild_id),
             snapshot.model_dump_json(),
+            repr(written_at),
         )
 
     async def is_invalid(self, guild_id: str) -> bool:
@@ -355,11 +464,14 @@ class DebouncedHistoryWriter:
         guild_id: str,
         history: list[dict],
         previous_revision: int,
+        freshly_compacted: bool = False,
     ) -> HistorySnapshot:
         if self._closed:
             raise RuntimeError("history writer is closed")
         snapshot = build_snapshot(guild_id, history, revision=previous_revision + 1)
-        if not await self._repository.cache(snapshot):
+        if not await self._repository.cache(
+            snapshot, written_at=time.time(), freshly_compacted=freshly_compacted
+        ):
             raise StaleHistoryError(
                 f"proactive history revision {snapshot.revision} is stale "
                 f"for guild {guild_id}"

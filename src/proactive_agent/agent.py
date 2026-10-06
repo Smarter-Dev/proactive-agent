@@ -701,6 +701,33 @@ def memory_note_pair(summary: str) -> list[ModelMessage]:
     ]
 
 
+MEMORY_NOTE_PREFIX = "[COMPACTION MEMORY NOTE"
+
+
+def leading_note_pair(history: list[ModelMessage]) -> list[ModelMessage] | None:
+    """The memory-note pair a compaction put at the head of the history."""
+    if len(history) < 2:
+        return None
+    note, acknowledgement = history[0], history[1]
+    if not isinstance(note, ModelRequest) or not isinstance(
+        acknowledgement, ModelResponse
+    ):
+        return None
+    if not any(
+        isinstance(part, UserPromptPart)
+        and isinstance(part.content, str)
+        and part.content.startswith(MEMORY_NOTE_PREFIX)
+        for part in note.parts
+    ):
+        return None
+    return [note, acknowledgement]
+
+
+def is_summary_only(history: list[ModelMessage]) -> bool:
+    """Nothing verbatim left: the history is one memory-note pair."""
+    return len(history) == 2 and leading_note_pair(history) is not None
+
+
 async def compact_agent_history(
     history: list[ModelMessage],
     *,
@@ -1079,11 +1106,19 @@ class KimiAgentRunner:
     summarize: Callable[[list[ModelMessage]], Awaitable[str]]
     token_limit: int = HISTORY_TOKEN_LIMIT
     history: list[ModelMessage] = field(default_factory=list)
+    # Stores a freshly compacted history (note + kept tail) before the wake's
+    # own turn runs, flagged so the idle sweep can drop the tail without a
+    # model call if the wake never writes anything newer.
+    on_compacted: Callable[[list[ModelMessage]], Awaitable[None]] | None = None
 
     async def wake(self, brief: str, deps: AgentDeps) -> tuple[str, dict]:
-        self.history = await compact_agent_history(
+        compacted = await compact_agent_history(
             self.history, token_limit=self.token_limit, summarize=self.summarize
         )
+        if compacted is not self.history:
+            self.history = compacted
+            if self.on_compacted is not None:
+                await self.on_compacted(compacted)
         result = await self.agent.run(
             brief, deps=deps, message_history=self.history or None
         )
