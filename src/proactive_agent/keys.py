@@ -7,6 +7,10 @@ READY_GUILDS_KEY = f"{KEY_PREFIX}:guilds-with-wakes"
 READY_STREAM_KEY = f"{KEY_PREFIX}:ready"
 DEAD_LETTER_STREAM_KEY = f"{KEY_PREFIX}:dead-letter"
 LEGACY_HISTORY_PREFIX = "proactive:guild-history"
+# Sorted set guild_id -> epoch seconds of the guild's last history write; the
+# idle sweep's candidate index. Each guild's own history-meta hash is the
+# authority, written in the same script as the history.
+HISTORY_IDLE_INDEX_KEY = f"{KEY_PREFIX}:history-idle"
 
 
 def guild_tag(guild_id: str) -> str:
@@ -58,6 +62,13 @@ def failure_notice_key(guild_id: str) -> str:
 
 def history_key(guild_id: str) -> str:
     return f"{KEY_PREFIX}:{guild_tag(guild_id)}:history"
+
+
+def history_meta_key(guild_id: str) -> str:
+    """Hash beside the v1 history: ``written_at`` (epoch seconds of the last
+    history write) and ``fresh`` ("1" while the history is exactly a wake
+    compaction's output, note + kept tail)."""
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:history-meta"
 
 
 def legacy_history_key(guild_id: str) -> str:
