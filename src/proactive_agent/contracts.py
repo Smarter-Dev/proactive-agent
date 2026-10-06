@@ -111,3 +111,6 @@ class BlockedUsersList(BaseModel):
 
     revision: int = Field(ge=0)
     user_ids: list[Snowflake]
+    # People who opted back in to the AI assistant (smarter-dev #92): their
+    # messages written before the time stay hidden. Absent from older servers.
+    read_from: dict[Snowflake, AwareDatetime] = Field(default_factory=dict)

@@ -165,9 +165,9 @@ class DiscordREST:
         self._role_names[guild_id] = cached
         return cached
 
-    def _blocked(self, user_id) -> bool:
+    def _blocked(self, user_id, message_id=None) -> bool:
         return self._blocked_users is not None and self._blocked_users.is_blocked(
-            str(user_id)
+            str(user_id), message_id
         )
 
     def _replies_to_blocked(self, record: dict[str, Any]) -> bool:
@@ -175,7 +175,9 @@ class DiscordREST:
         # must not carry that message's id into the transcript.
         referenced = record.get("referenced_message") or {}
         author = referenced.get("author") or {}
-        return author.get("id") is not None and self._blocked(author["id"])
+        return author.get("id") is not None and self._blocked(
+            author["id"], referenced.get("id")
+        )
 
     def _without_blocked_ids(self, content: str) -> str:
         """Scrub blocked users' ids from the text itself.
@@ -205,7 +207,7 @@ class DiscordREST:
         but its position; other messages lose mentions of blocked users.
         """
         author = record["author"]
-        if self._blocked(author["id"]):
+        if self._blocked(author["id"], record.get("id")):
             return BlockedMessage()
         mentions = record.get("mentions", ())
         member = record.get("member") or {}
