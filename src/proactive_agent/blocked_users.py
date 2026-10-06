@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 from uuid import uuid4
 
 from proactive_agent.keys import (
@@ -24,6 +25,8 @@ from proactive_agent.keys import (
 
 logger = logging.getLogger(__name__)
 
+# Discord's epoch: a snowflake's top 42 bits are milliseconds since it.
+DISCORD_EPOCH_MS = 1_420_070_400_000
 REFRESH_SECONDS = 60
 ENFORCING_TTL_SECONDS = 180
 RETRY_BASE_SECONDS = 1
@@ -49,6 +52,12 @@ return lowest
 """
 
 
+def first_snowflake(moment: datetime) -> int:
+    """The smallest Discord id a message created at ``moment`` can have."""
+    milliseconds = int(moment.timestamp() * 1000) - DISCORD_EPOCH_MS
+    return max(milliseconds, 0) << 22
+
+
 class BlockedUsers:
     def __init__(
         self,
@@ -70,6 +79,8 @@ class BlockedUsers:
         self._retry_base_seconds = retry_base_seconds
         self._retry_max_seconds = retry_max_seconds
         self._user_ids: frozenset[str] = frozenset()
+        # Opted back in: the first message id each may be read from.
+        self._read_from: dict[str, int] = {}
         self.revision: int | None = None
         self.loaded = asyncio.Event()
         self._clock = clock
@@ -87,8 +98,26 @@ class BlockedUsers:
         """
         return self._last_success is not None
 
-    def is_blocked(self, user_id: str | int | None) -> bool:
-        return user_id is not None and str(user_id) in self._user_ids
+    def is_blocked(
+        self, user_id: str | int | None, message_id: str | int | None = None
+    ) -> bool:
+        """Whether this user's messages (or this one, given its id) are hidden.
+
+        Someone who opted back in is off the list, but a message they wrote
+        before that stays hidden; a message id that is not a number does too.
+        """
+        if user_id is None:
+            return False
+        user = str(user_id)
+        if user in self._user_ids:
+            return True
+        cutoff = self._read_from.get(user)
+        if cutoff is None or message_id is None:
+            return False
+        try:
+            return int(message_id) < cutoff
+        except (TypeError, ValueError):
+            return True
 
     async def refresh(self) -> bool:
         """Fetch the list once. False (and the old list kept) on failure."""
@@ -114,6 +143,10 @@ class BlockedUsers:
                 self.revision,
             )
         self._user_ids = frozenset(listing.user_ids)
+        self._read_from = {
+            user_id: first_snowflake(moment)
+            for user_id, moment in listing.read_from.items()
+        }
         self.revision = listing.revision
         # Taken before the report, so this replica's enforcing window never
         # outlives the key it wrote.
