@@ -22,6 +22,7 @@ from proactive_agent.keys import (
     legacy_history_key,
     purge_epoch_key,
 )
+from proactive_agent.optout_gate import scrub_history
 
 logger = logging.getLogger(__name__)
 
@@ -449,7 +450,11 @@ class DebouncedHistoryWriter:
         *,
         debounce_seconds: float = 5,
         retry_base_seconds: float = 1,
+        blocked_users=None,
     ):
+        # Anything with is_blocked(user_id); every save blanks those users'
+        # transcript lines and ids first. None blocks nobody (tests/evals).
+        self._blocked_users = blocked_users
         self._repository = repository
         self._api = api
         self._debounce_seconds = debounce_seconds
@@ -468,6 +473,7 @@ class DebouncedHistoryWriter:
     ) -> HistorySnapshot:
         if self._closed:
             raise RuntimeError("history writer is closed")
+        history = scrub_history(history, self._blocked_users)
         snapshot = build_snapshot(guild_id, history, revision=previous_revision + 1)
         if not await self._repository.cache(
             snapshot, written_at=time.time(), freshly_compacted=freshly_compacted

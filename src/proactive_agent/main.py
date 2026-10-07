@@ -62,6 +62,7 @@ async def run() -> None:
         history_repository,
         api,
         debounce_seconds=settings.proactive_history_debounce_seconds,
+        blocked_users=blocked_users,
     )
     queue = RedisWakeQueue(
         redis_client,

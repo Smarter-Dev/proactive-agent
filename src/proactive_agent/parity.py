@@ -20,6 +20,7 @@ from proactive_agent.agent import (
     build_kimi_agent,
     disabled_channel_error,
 )
+from proactive_agent.optout_gate import names_blocked_user
 
 COMMON_UNICODE_EMOJIS = [
     "👍",
@@ -43,6 +44,10 @@ COMMON_UNICODE_EMOJIS = [
 MAX_CODE_OUTPUT_CHARS = 10_000
 MAX_MEMORIES_PER_TURN = 3
 MAX_MEMORY_NOTE_CHARS = 500
+REMEMBER_OPTED_OUT = (
+    "that one's about someone who opted out of the assistant — "
+    "nothing about them gets kept."
+)
 _DISABLED_FLAG_VALUES = {"0", "false", "no", "off"}
 _EXT_MEDIA_TYPE = {
     ".png": "image/png",
@@ -85,6 +90,8 @@ class ProactiveDeps(AgentDeps):
     review_image_prompt: Callable[[str], Awaitable[Any]] | None = None
     generate_image_bytes: Callable[[str], Awaitable[tuple[bytes, str]]] | None = None
     author_handler: Callable[..., Awaitable[str]] | None = None
+    # Anything with is_blocked(user_id); None blocks nobody (tests/evals).
+    blocked_users: Any = None
 
 
 async def _post_status(ctx, text: str) -> None:
@@ -382,6 +389,8 @@ async def remember(ctx, text: str) -> str:
     note = (text or "").strip()
     if not note:
         return "there was nothing in that one to keep."
+    if names_blocked_user(note, ctx.deps.blocked_users):
+        return REMEMBER_OPTED_OUT
     if os.getenv("CHAT_MEMORY_ENABLED", "").strip().lower() in _DISABLED_FLAG_VALUES:
         return "couldn't save that note right now."
     if ctx.deps.memories_saved_this_turn >= MAX_MEMORIES_PER_TURN:
@@ -410,6 +419,7 @@ async def remember(ctx, text: str) -> str:
         return {
             "duplicate": "you already noted that one.",
             "daily_cap": "that's all i can hold from today — tomorrow's a fresh page.",
+            "opted_out": REMEMBER_OPTED_OUT,
         }.get(result.get("reason"), "couldn't save that note right now.")
     ctx.deps.memories_saved_this_turn += 1
     ctx.deps.saved_memory_texts.append(note)
