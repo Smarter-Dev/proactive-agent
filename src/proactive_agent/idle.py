@@ -47,6 +47,7 @@ from proactive_agent.agent import (
 from proactive_agent.errors import exception_trace
 from proactive_agent.history import HistoryChecksumError
 from proactive_agent.keys import lease_key, privacy_lock_key
+from proactive_agent.optout_gate import scrub_history
 from proactive_agent.purge import PrivacyLock
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class IdleHistoryCompactor:
         summarize: Callable[[list[ModelMessage]], Awaitable[str]],
         clock: Callable[[], float] = time.time,
         tick_seconds: float = SWEEP_TICK.total_seconds(),
+        blocked_users=None,
     ):
         self._redis = redis_client
         self._queue = queue
@@ -84,6 +86,7 @@ class IdleHistoryCompactor:
         self._summarize = summarize
         self._clock = clock
         self._tick_seconds = tick_seconds
+        self._blocked_users = blocked_users
 
     async def run(self, stop: asyncio.Event) -> None:
         await self._repository.index_unindexed(now=self._clock())
@@ -95,6 +98,11 @@ class IdleHistoryCompactor:
                 pass
 
     async def sweep_once(self) -> dict[str, str]:
+        if self._blocked_users is not None and not self._blocked_users.enforcing:
+            # No list yet, so nobody would be scrubbed from the fold (#100).
+            # The next tick tries again.
+            logger.info("proactive idle compaction deferred: blocked users not loaded")
+            return {}
         cutoff = self._clock() - IDLE_WINDOW.total_seconds()
         outcomes: dict[str, str] = {}
         for guild_id in await self._repository.idle_guild_ids(written_before=cutoff):
@@ -168,8 +176,11 @@ class IdleHistoryCompactor:
             if snapshot is None or not snapshot.history:
                 await self._repository.forget_idle(guild_id)
                 return "empty"
+            # The summariser never reads someone who opted out (#100).
             history: list[ModelMessage] = list(
-                ModelMessagesTypeAdapter.validate_json(json.dumps(snapshot.history))
+                ModelMessagesTypeAdapter.validate_json(
+                    json.dumps(scrub_history(snapshot.history, self._blocked_users))
+                )
             )
         except (HistoryChecksumError, ValidationError):
             return await self._replace_unreadable(guild_id)

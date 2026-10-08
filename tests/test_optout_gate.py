@@ -7,6 +7,7 @@ An opted-out member is on the blocked-users list; nothing the worker writes
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 import fakeredis.aioredis
@@ -24,7 +25,7 @@ from purge_fakes import (
     make_runtime,
     raw_history_with_target,
 )
-from pydantic_ai.messages import ModelRequest, ToolReturnPart
+from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ToolReturnPart
 
 from proactive_agent.agent import ToolBudget
 from proactive_agent.blocked_users import BlockedUsers
@@ -406,3 +407,82 @@ async def test_memory_block_keeps_an_unblocked_id(redis_client):
 
     assert f"<@{TARGET}> has a cat\n{BLOB_KEPT}" in block
     assert note_lines(*memory_bundle()["notes"]) in block
+
+
+async def test_idle_fold_never_shows_the_summariser_a_blocked_author(redis_client):
+    from purge_fakes import raw_history_with_target
+
+    from proactive_agent.idle import IDLE_WINDOW, IdleHistoryCompactor
+    from proactive_agent.keys import ownership_key
+    from proactive_agent.queue import RedisWakeQueue
+
+    for user_ids, seen in (([], True), ([TARGET], False)):
+        await redis_client.flushall()
+        api = GateAPI()
+        blocked = await blocked_list(redis_client, api, user_ids)
+        repository = GuildHistoryRepository(redis_client, api)
+        # Stored while nobody had opted out.
+        writer = DebouncedHistoryWriter(repository, api, debounce_seconds=0)
+        await redis_client.set(ownership_key(GUILD), "external")
+        await writer.save(
+            guild_id=GUILD,
+            history=json.loads(
+                ModelMessagesTypeAdapter.dump_json(raw_history_with_target())
+            ),
+            previous_revision=0,
+        )
+        await writer.flush(GUILD)
+        summaries: list = []
+
+        async def summarize(messages, summaries=summaries) -> str:
+            summaries.append(list(messages))
+            return "they talked about pets"
+
+        compactor = IdleHistoryCompactor(
+            redis_client,
+            RedisWakeQueue(redis_client, consumer_name="test"),
+            repository,
+            writer,
+            summarize=summarize,
+            clock=lambda: time.time() + IDLE_WINDOW.total_seconds() + 1,
+            blocked_users=blocked,
+        )
+
+        assert await compactor.sweep_once() == {GUILD: "folded"}
+        assert (TARGET_TEXT in str(summaries[0])) is seen
+        await writer.close(timeout=1)
+
+
+async def test_idle_sweep_waits_for_the_blocked_list(redis_client):
+    from proactive_agent.idle import IDLE_WINDOW, IdleHistoryCompactor
+    from proactive_agent.queue import RedisWakeQueue
+
+    api = GateAPI()
+    api.blocked = {"revision": 1, "user_ids": [TARGET]}
+    blocked = BlockedUsers(api, redis_client)  # not refreshed yet
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(repository, api, debounce_seconds=0)
+    idle_guild_ids = repository.idle_guild_ids
+    asked: list = []
+
+    async def spy(**kwargs):
+        asked.append(kwargs)
+        return await idle_guild_ids(**kwargs)
+
+    repository.idle_guild_ids = spy
+    compactor = IdleHistoryCompactor(
+        redis_client,
+        RedisWakeQueue(redis_client, consumer_name="test"),
+        repository,
+        writer,
+        summarize=no_skim,
+        clock=lambda: time.time() + IDLE_WINDOW.total_seconds() + 1,
+        blocked_users=blocked,
+    )
+
+    assert await compactor.sweep_once() == {}
+    assert asked == []
+    assert await blocked.refresh()
+    await compactor.sweep_once()
+    assert len(asked) == 1
+    await writer.close(timeout=1)
