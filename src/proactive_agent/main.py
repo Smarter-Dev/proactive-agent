@@ -98,9 +98,8 @@ async def run() -> None:
             discord=discord,
         )
 
-        async def summarize(messages) -> str:
-            summary, _usage = await self_compaction_summary(agent_model, messages)
-            return summary
+        async def summarize(messages):
+            return await self_compaction_summary(agent_model, messages)
 
         runner = KimiAgentRunner(agent=agent, summarize=summarize)
         engine = AgentEngine(
@@ -145,9 +144,8 @@ async def run() -> None:
     )
     idle_model = build_model(settings.proactive_agent_model)
 
-    async def idle_summarize(messages) -> str:
-        summary, _usage = await self_compaction_summary(idle_model, messages)
-        return summary
+    async def idle_summarize(messages):
+        return await self_compaction_summary(idle_model, messages)
 
     idle_compactor = IdleHistoryCompactor(
         redis_client,
@@ -156,6 +154,8 @@ async def run() -> None:
         history_writer,
         # The agent's own model writes its own memory, as in a wake.
         summarize=idle_summarize,
+        api=api,
+        model_id=settings.proactive_agent_model,
         blocked_users=blocked_users,
     )
     worker = ProactiveWorker(

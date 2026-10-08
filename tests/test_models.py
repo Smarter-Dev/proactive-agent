@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.usage import RunUsage
 
 from proactive_agent.agent import usage_dict
 from proactive_agent.models import build_model
@@ -19,19 +18,18 @@ def test_litellm_proxy_routes_both_model_families(monkeypatch) -> None:
         assert str(model.base_url) == "https://proxy.example.test/v1/"
 
 
-def test_usage_dict_accepts_method_and_property_result_apis() -> None:
-    usage = SimpleNamespace(
-        input_tokens=3,
-        output_tokens=2,
-        cache_read_tokens=1,
-    )
+def test_usage_dict_reads_the_run_usage_property() -> None:
+    usage = RunUsage(input_tokens=3, output_tokens=2, cache_read_tokens=1)
 
-    assert (
-        usage_dict(usage)
-        == usage_dict(lambda: usage)
-        == {
-            "input_tokens": 3,
-            "output_tokens": 2,
-            "cache_read_tokens": 1,
-        }
-    )
+    assert usage_dict(usage) == {
+        "input_tokens": 3,
+        "output_tokens": 2,
+        "cache_read_tokens": 1,
+    }
+
+
+def test_usage_dict_warns_when_only_details_arrived(caplog) -> None:
+    usage = RunUsage(requests=1, details={"thoughts_tokens": 69})
+
+    assert usage_dict(usage)["output_tokens"] == 0
+    assert "details but no token counts" in caplog.text

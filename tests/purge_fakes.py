@@ -55,6 +55,8 @@ class FakeAPI:
         self.blocked = {"revision": 0, "user_ids": []}
         self.blocked_failures = 0
         self.validated_acks = []
+        self.usage_reports = []
+        self.fail_usage = False
 
     async def get_history(self, guild_id):
         return self.durable.get(guild_id)
@@ -92,7 +94,9 @@ class FakeAPI:
         return {"content": f"memory read {self.memory_reads}"}
 
     async def record_usage(self, **kwargs):
-        return None
+        if self.fail_usage:
+            raise ApplicationAPIError(500, "boom")
+        self.usage_reports.append(kwargs)
 
     async def post_privacy_ack(
         self,
