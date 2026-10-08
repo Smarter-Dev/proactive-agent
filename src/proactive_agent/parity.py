@@ -385,7 +385,10 @@ def _format_remaining(status: dict) -> str:
 
 
 async def remember(ctx, text: str) -> str:
-    """Keep a short first-person memory attributed to this channel."""
+    """Keep a short first-person memory attributed to this channel. Name every
+    person as a tag, `<userid:username>` like `<123456789012345678:kai>`, with
+    the uid from the transcript (`<:username>` only for someone you have no id
+    for)."""
     note = (text or "").strip()
     if not note:
         return "there was nothing in that one to keep."
