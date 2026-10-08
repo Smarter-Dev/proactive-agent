@@ -42,20 +42,33 @@ from proactive_agent.types import ProposedReaction, ProposedResponse
 SUMMARIZE_THRESHOLD = 3000
 
 
+TOOL_CALL_LIMIT = 8
+MAX_SENDS_PER_WAKE = 2
+logger = logging.getLogger(__name__)
+
+ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
+
+
 def usage_dict(usage) -> dict[str, int]:
     """Stable token fields from a pydantic-ai RunUsage instance."""
-    if callable(usage):
-        usage = usage()
-    return {
+    tokens = {
         "input_tokens": usage.input_tokens or 0,
         "output_tokens": usage.output_tokens or 0,
         "cache_read_tokens": usage.cache_read_tokens or 0,
     }
+    if not (tokens["input_tokens"] or tokens["output_tokens"]) and usage.details:
+        # pydantic-ai 1.107 with genai-prices 0.1.5 filled only details for
+        # every wake (#102): counts the provider sent never reached billing.
+        logger.warning(
+            "model usage has details but no token counts: %s", sorted(usage.details)
+        )
+    return tokens
 
 
-TOOL_CALL_LIMIT = 8
-MAX_SENDS_PER_WAKE = 2
-logger = logging.getLogger(__name__)
+def add_usage(total: dict[str, int], usage: dict[str, int]) -> None:
+    for key, value in usage.items():
+        total[key] = total.get(key, 0) + value
+
 
 HISTORY_TOKEN_LIMIT = 100_000
 # After compaction, keep roughly this many trailing messages verbatim.
@@ -963,13 +976,12 @@ async def privacy_compaction_summary(
     compaction_agent = Agent(model, output_type=str)
     prompt = build_privacy_purge_prompt(user_id, names)
     history: list[ModelMessage] = list(messages)
-    usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
+    usage = dict(ZERO_USAGE)
     id_retries = name_retries = attempts = 0
     while True:
         attempts += 1
         result = await _run_with_timeout(compaction_agent, prompt, history)
-        for key, value in usage_dict(result.usage).items():
-            usage[key] += value
+        add_usage(usage, usage_dict(result.usage))
         note = str(result.output)
         if not note.strip():
             raise PrivacyCompactionError("empty_output")
@@ -1103,7 +1115,9 @@ class KimiAgentRunner:
     """Runs the agent, carrying history across wakes with compaction."""
 
     agent: Agent
-    summarize: Callable[[list[ModelMessage]], Awaitable[str]]
+    # Returns the memory note and the tokens writing it spent, which the
+    # wake bills under the agent model alongside its own turn.
+    summarize: Callable[[list[ModelMessage]], Awaitable[tuple[str, dict]]]
     token_limit: int = HISTORY_TOKEN_LIMIT
     history: list[ModelMessage] = field(default_factory=list)
     # Stores a freshly compacted history (note + kept tail) before the wake's
@@ -1112,8 +1126,15 @@ class KimiAgentRunner:
     on_compacted: Callable[[list[ModelMessage]], Awaitable[None]] | None = None
 
     async def wake(self, brief: str, deps: AgentDeps) -> tuple[str, dict]:
+        usage = dict(ZERO_USAGE)
+
+        async def summarize(messages: list[ModelMessage]) -> str:
+            summary, spent = await self.summarize(messages)
+            add_usage(usage, spent)
+            return summary
+
         compacted = await compact_agent_history(
-            self.history, token_limit=self.token_limit, summarize=self.summarize
+            self.history, token_limit=self.token_limit, summarize=summarize
         )
         if compacted is not self.history:
             self.history = compacted
@@ -1123,4 +1144,5 @@ class KimiAgentRunner:
             brief, deps=deps, message_history=self.history or None
         )
         self.history = result.all_messages()
-        return result.output, usage_dict(result.usage)
+        add_usage(usage, usage_dict(result.usage))
+        return result.output, usage

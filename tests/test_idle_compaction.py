@@ -24,6 +24,7 @@ from pydantic_ai.messages import (
     TextPart,
     UserPromptPart,
 )
+from pydantic_ai.usage import RunUsage
 
 from proactive_agent.agent import (
     KimiAgentRunner,
@@ -47,6 +48,7 @@ from proactive_agent.queue import RedisWakeQueue
 
 IDLE = IDLE_WINDOW.total_seconds()
 VERBATIM = "my cat Miso is sick"
+SPENT = {"input_tokens": 900, "output_tokens": 120, "cache_read_tokens": 30}
 
 
 @pytest.fixture
@@ -76,9 +78,9 @@ class Setup:
         self.clock = Clock()
         self.summaries: list[list] = []
 
-    async def summarize(self, messages) -> str:
+    async def summarize(self, messages) -> tuple[str, dict]:
         self.summaries.append(list(messages))
-        return "kai and nia talked about pets and Rust in #general"
+        return "kai and nia talked about pets and Rust in #general", dict(SPENT)
 
     def compactor(self, **kwargs) -> IdleHistoryCompactor:
         return IdleHistoryCompactor(
@@ -87,6 +89,8 @@ class Setup:
             self.repository,
             self.writer,
             summarize=kwargs.pop("summarize", self.summarize),
+            api=self.api,
+            model_id="agent-model",
             clock=self.clock,
             **kwargs,
         )
@@ -297,9 +301,7 @@ class _FakeAgent:
             def all_messages(self):
                 return messages
 
-            usage = type(
-                "U", (), {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
-            )()
+            usage = RunUsage(input_tokens=40, output_tokens=4, requests=1)
 
         return Result()
 
@@ -308,7 +310,7 @@ async def test_wake_stores_its_compaction_before_the_model_runs():
     stored = []
 
     async def summarize(_messages):
-        return "note"
+        return "note", dict(SPENT)
 
     async def on_compacted(history):
         stored.append(list(history))
@@ -427,3 +429,60 @@ async def test_an_unreadable_history_inside_the_window_is_kept(setup):
 
     assert await setup.compactor().sweep_once() == {}
     assert await setup.redis.get(history_key(GUILD)) == before
+
+
+async def test_wake_bills_its_compaction_with_its_own_turn():
+    runner = KimiAgentRunner(
+        agent=_FakeAgent(),
+        summarize=lambda _messages: asyncio.sleep(0, ("note", dict(SPENT))),
+        token_limit=10,
+        history=raw_history_with_target() * 3,
+    )
+    _note, usage = await runner.wake("brief", deps=None)
+
+    assert usage == {"input_tokens": 940, "output_tokens": 124, "cache_read_tokens": 30}
+
+
+async def test_wake_without_compaction_bills_only_its_turn():
+    runner = KimiAgentRunner(
+        agent=_FakeAgent(), summarize=None, history=raw_history_with_target()
+    )
+    _note, usage = await runner.wake("brief", deps=None)
+
+    assert usage == {"input_tokens": 40, "output_tokens": 4, "cache_read_tokens": 0}
+
+
+async def test_an_idle_fold_bills_the_agent_model(setup):
+    await setup.save(raw_history_with_target())
+    setup.clock.offset = IDLE + 1
+
+    assert await setup.compactor().sweep_once() == {GUILD: "folded"}
+
+    [report] = setup.api.usage_reports
+    assert report["guild_id"] == GUILD
+    assert report["wake_id"].startswith("idle-")
+    assert len(report["wake_id"]) <= 64
+    assert report["passive"] is True and report["responses"] == 0
+    assert report["entries"] == [
+        {"model_id": "agent-model", "operation": "agent", **SPENT}
+    ]
+
+
+async def test_dropping_a_fresh_tail_bills_nothing(setup):
+    # Negative control: no model call, no usage row.
+    await setup.save(compacted_with_tail(), fresh=True)
+    setup.clock.offset = IDLE + 1
+
+    assert await setup.compactor().sweep_once() == {GUILD: "tail dropped"}
+    assert setup.api.usage_reports == []
+
+
+async def test_a_failed_usage_report_still_writes_the_fold(setup):
+    await setup.save(raw_history_with_target())
+    setup.clock.offset = IDLE + 1
+    setup.api.fail_usage = True
+
+    assert await setup.compactor().sweep_once() == {GUILD: "folded"}
+    v1, durable = await setup.stored()
+    for copy in (v1, durable):
+        assert is_summary_only(ModelMessagesTypeAdapter.validate_json(json.dumps(copy)))

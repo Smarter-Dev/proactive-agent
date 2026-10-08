@@ -434,9 +434,9 @@ async def test_idle_fold_never_shows_the_summariser_a_blocked_author(redis_clien
         await writer.flush(GUILD)
         summaries: list = []
 
-        async def summarize(messages, summaries=summaries) -> str:
+        async def summarize(messages, summaries=summaries) -> tuple[str, dict]:
             summaries.append(list(messages))
-            return "they talked about pets"
+            return "they talked about pets", {}
 
         compactor = IdleHistoryCompactor(
             redis_client,
@@ -444,6 +444,8 @@ async def test_idle_fold_never_shows_the_summariser_a_blocked_author(redis_clien
             repository,
             writer,
             summarize=summarize,
+            api=api,
+            model_id="agent-model",
             clock=lambda: time.time() + IDLE_WINDOW.total_seconds() + 1,
             blocked_users=blocked,
         )
@@ -476,6 +478,8 @@ async def test_idle_sweep_waits_for_the_blocked_list(redis_client):
         repository,
         writer,
         summarize=no_skim,
+        api=api,
+        model_id="agent-model",
         clock=lambda: time.time() + IDLE_WINDOW.total_seconds() + 1,
         blocked_users=blocked,
     )

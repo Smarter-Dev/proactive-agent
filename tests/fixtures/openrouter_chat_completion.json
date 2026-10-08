@@ -1,0 +1,30 @@
+{
+  "id": "gen-fixture-glm-reply-ok",
+  "provider": "Z.AI",
+  "model": "z-ai/glm-5.3-flash",
+  "object": "chat.completion",
+  "created": 1791421200,
+  "choices": [
+    {
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "OK",
+        "refusal": null,
+        "reasoning": "The user wants one word."
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 38,
+    "total_tokens": 50,
+    "cost": 0.0000081,
+    "is_byok": false,
+    "prompt_tokens_details": {"cached_tokens": 0},
+    "completion_tokens_details": {"reasoning_tokens": 36}
+  }
+}

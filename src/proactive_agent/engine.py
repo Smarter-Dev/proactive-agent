@@ -9,7 +9,14 @@ from datetime import UTC
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
-from proactive_agent.agent import AgentDeps, KimiAgentRunner, ToolBudget
+from proactive_agent.agent import (
+    ZERO_USAGE,
+    AgentDeps,
+    KimiAgentRunner,
+    ToolBudget,
+    add_usage,
+    usage_dict,
+)
 from proactive_agent.contracts import NotificationEnvelope
 from proactive_agent.environment import (
     ChannelEnvironment,
@@ -25,22 +32,8 @@ in a short paragraph, then list the load-bearing messages VERBATIM as
 Keep it brief; the agent can look up anything by id."""
 
 
-def _usage_dict(usage) -> dict[str, int]:
-    if callable(usage):
-        usage = usage()
-    return {
-        "input_tokens": usage.input_tokens or 0,
-        "output_tokens": usage.output_tokens or 0,
-        "cache_read_tokens": usage.cache_read_tokens or 0,
-    }
-
-
 def _merge_usage(usage_by_model: dict, model_id: str, usage: dict) -> None:
-    entry = usage_by_model.setdefault(
-        model_id, {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
-    )
-    for key, value in usage.items():
-        entry[key] += value
+    add_usage(usage_by_model.setdefault(model_id, dict(ZERO_USAGE)), usage)
 
 
 @dataclass
@@ -55,7 +48,7 @@ class SkimRunner:
 
     async def skim(self, transcript: str) -> tuple[str, dict]:
         result = await self._agent.run(transcript)
-        return result.output, _usage_dict(result.usage)
+        return result.output, usage_dict(result.usage)
 
 
 def render_channel_instructions(

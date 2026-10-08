@@ -18,6 +18,9 @@ service's first pass. A privacy purge's rewrite keeps the clock where it was.
 A history that no longer parses is replaced at the idle point by a note that
 it was dropped.
 
+A fold's tokens are billed like a wake's: one usage report under the agent
+model (operation ``agent``), with its own ``idle-`` wake id.
+
 The fold is written like a wake's: v1 at once (a new revision, so every
 replica's in-RAM copy is reloaded before its next wake) and Postgres through
 the debounced writer. The guild is fenced like a purge fences it: the guild
@@ -32,13 +35,15 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from pydantic import ValidationError
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
 from proactive_agent.agent import (
+    ZERO_USAGE,
+    add_usage,
     is_summary_only,
     leading_note_pair,
     memory_note_pair,
@@ -74,7 +79,9 @@ class IdleHistoryCompactor:
         repository,
         writer,
         *,
-        summarize: Callable[[list[ModelMessage]], Awaitable[str]],
+        summarize: Callable[[list[ModelMessage]], Awaitable[tuple[str, dict]]],
+        api,
+        model_id: str,
         clock: Callable[[], float] = time.time,
         tick_seconds: float = SWEEP_TICK.total_seconds(),
         blocked_users=None,
@@ -84,6 +91,8 @@ class IdleHistoryCompactor:
         self._repository = repository
         self._writer = writer
         self._summarize = summarize
+        self._api = api
+        self._model_id = model_id
         self._clock = clock
         self._tick_seconds = tick_seconds
         self._blocked_users = blocked_users
@@ -191,7 +200,9 @@ class IdleHistoryCompactor:
         if note_pair is not None:
             compacted, outcome = note_pair, "tail dropped"
         else:
-            compacted, outcome = await self._fold(history), "folded"
+            compacted, usage = await self._fold(history)
+            outcome = "folded"
+            await self._record_usage(guild_id, usage)
         await self._writer.save(
             guild_id=guild_id,
             history=json.loads(ModelMessagesTypeAdapter.dump_json(compacted)),
@@ -216,10 +227,19 @@ class IdleHistoryCompactor:
         await self._repository.forget_idle(guild_id)
         return "unreadable replaced"
 
-    async def _fold(self, history: list[ModelMessage]) -> list[ModelMessage]:
+    async def _fold(
+        self, history: list[ModelMessage]
+    ) -> tuple[list[ModelMessage], dict[str, int]]:
+        usage = dict(ZERO_USAGE)
+
+        async def summarize(messages: list[ModelMessage]) -> str:
+            summary, spent = await self._summarize(messages)
+            add_usage(usage, spent)
+            return summary
+
         try:
-            return await asyncio.wait_for(
-                purge_agent_history(history, summarize=self._summarize),
+            folded = await asyncio.wait_for(
+                purge_agent_history(history, summarize=summarize),
                 timeout=SUMMARY_TIMEOUT_SECONDS,
             )
         except Exception as error:
@@ -229,4 +249,26 @@ class IdleHistoryCompactor:
                 "proactive idle summary failed, dropping verbatim history\n%s",
                 exception_trace(error),
             )
-            return leading_note_pair(history) or memory_note_pair(UNSUMMARIZED_NOTE)
+            folded = leading_note_pair(history) or memory_note_pair(UNSUMMARIZED_NOTE)
+        return folded, usage
+
+    async def _record_usage(self, guild_id: str, usage: dict[str, int]) -> None:
+        if not any(usage.values()):
+            return
+        try:
+            await self._api.record_usage(
+                guild_id=guild_id,
+                wake_id=f"idle-{uuid4().hex}",
+                metered_at=datetime.now(UTC),
+                passive=True,
+                responses=0,
+                entries=[{"model_id": self._model_id, "operation": "agent", **usage}],
+            )
+        except Exception as error:
+            # The fold is still written: losing a usage row beats keeping
+            # verbatim history past the idle window.
+            logger.error(
+                "proactive idle usage report failed guild=%s\n%s",
+                guild_id,
+                exception_trace(error),
+            )
