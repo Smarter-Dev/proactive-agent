@@ -39,6 +39,8 @@ from proactive_agent.history import (
 from proactive_agent.keys import history_key
 from proactive_agent.optout_gate import (
     blank_blocked_lines,
+    names_blocked_user,
+    scrub_blocked_ids,
     scrub_history,
     scrub_memory,
 )
@@ -397,6 +399,38 @@ async def test_memory_scrub_keeps_other_lines_and_empties_to_none(redis_client):
     assert scrubbed["personality"] is None
     assert scrubbed["notes"] == [NOTE_KEPT, NOTE_KEPT_PLAIN]
     assert scrub_memory(bundle, None) is bundle
+
+
+async def test_a_blocked_members_tag_goes_whole_and_its_line_is_dropped(
+    redis_client,
+):
+    # smarter-dev #104: memory names people as <id:username>.
+    api = GateAPI()
+    blocked = await blocked_list(redis_client, api, [TARGET])
+    kept = f"<{BYSTANDER}:{BYSTANDER_NAME}> ships Rust\n<:sam> runs the jam\n"
+    bundle = {
+        **memory_bundle(),
+        "content": f"<{TARGET}:{TARGET_NAME}> has a cat\n{kept}",
+    }
+
+    assert scrub_blocked_ids(
+        f"<{TARGET}:{TARGET_NAME}> and <:{TARGET_NAME}>", blocked
+    ) == (f"[blocked user] and <:{TARGET_NAME}>")
+    assert names_blocked_user(f"hi <{TARGET}:{TARGET_NAME}>", blocked)
+    assert not names_blocked_user(f"hi <{BYSTANDER}:{BYSTANDER_NAME}> <:sam>", blocked)
+    assert scrub_memory(bundle, blocked)["content"] == kept
+
+
+def test_remember_tells_the_model_to_tag_people():
+    assert "`<userid:username>`" in remember.__doc__
+    assert "`<:username>`" in remember.__doc__
+
+
+def test_compaction_prompt_names_people_as_tags():
+    from proactive_agent.agent import COMPACTION_PROMPT
+
+    assert "`<user-id:username>`" in COMPACTION_PROMPT
+    assert "user id when you have it" not in COMPACTION_PROMPT
 
 
 async def test_memory_block_keeps_an_unblocked_id(redis_client):

@@ -21,6 +21,9 @@ from proactive_agent.agent import MEMBER_LINE_PREFIX
 from proactive_agent.transcript import BLOCKED_LINE
 
 MENTION_PATTERN = re.compile(r"<@!?([0-9]{15,22})>")
+# A memory tag, ``<id:username>`` (smarter-dev #104); one with no id is
+# ``<:username>`` and has nothing to match.
+MEMBER_TAG_PATTERN = re.compile(r"<([0-9]{1,22}):([^<>\n]{1,64})>")
 SNOWFLAKE_PATTERN = re.compile(r"(?<![0-9])([0-9]{15,22})(?![0-9])")
 _LINE_MESSAGE_ID = re.compile(r"^\[id=([0-9]+)\]")
 # The memory fields the web returns as free text (blob and its sections).
@@ -36,10 +39,15 @@ def _blocked(blocked_users, user_id, message_id=None) -> bool:
 def scrub_blocked_ids(text: str, blocked_users) -> str:
     """Blocked users' ids out of the text.
 
-    `<@id>`/`<@!id>` become `@[blocked user]`, a bare id `[blocked user]`.
+    `<@id>`/`<@!id>` become `@[blocked user]`, a bare id `[blocked user]`,
+    and a memory tag `<id:username>` goes whole, name included, as
+    `[blocked user]`.
     """
     if blocked_users is None:
         return text
+
+    def tag(match: re.Match) -> str:
+        return "[blocked user]" if _blocked(blocked_users, match[1]) else match[0]
 
     def mention(match: re.Match) -> str:
         return "@[blocked user]" if _blocked(blocked_users, match[1]) else match[0]
@@ -47,6 +55,7 @@ def scrub_blocked_ids(text: str, blocked_users) -> str:
     def bare(match: re.Match) -> str:
         return "[blocked user]" if _blocked(blocked_users, match[1]) else match[0]
 
+    text = MEMBER_TAG_PATTERN.sub(tag, text)
     text = MENTION_PATTERN.sub(mention, text)
     return SNOWFLAKE_PATTERN.sub(bare, text)
 
