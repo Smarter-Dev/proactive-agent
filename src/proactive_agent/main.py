@@ -62,6 +62,7 @@ async def run() -> None:
         history_repository,
         api,
         debounce_seconds=settings.proactive_history_debounce_seconds,
+        blocked_users=blocked_users,
     )
     queue = RedisWakeQueue(
         redis_client,
@@ -155,6 +156,7 @@ async def run() -> None:
         history_writer,
         # The agent's own model writes its own memory, as in a wake.
         summarize=idle_summarize,
+        blocked_users=blocked_users,
     )
     worker = ProactiveWorker(
         queue,

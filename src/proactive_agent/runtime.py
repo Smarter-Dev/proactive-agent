@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,13 +34,17 @@ from proactive_agent.keys import (
     history_key,
     purge_epoch_key,
 )
+from proactive_agent.optout_gate import (
+    SNOWFLAKE_PATTERN,
+    scrub_history,
+    scrub_memory,
+)
 from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
 from proactive_agent.response_fitting import split_for_discord
 from proactive_agent.types import ActivationResult
 
 MEMORY_REFRESH_SECONDS = 3600
-_SNOWFLAKE_PATTERN = re.compile(r"(?<![0-9])([0-9]{15,22})(?![0-9])")
 # One round trip at wake start: the guild's purge epoch and the revision of
 # the v1 history snapshot (matched as text, never decoding the history).
 _STORE_STATE_LUA = """
@@ -83,7 +86,9 @@ def _decode_or_none(value) -> str | None:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-def render_memory_block(memory: dict | None) -> str:
+def render_memory_block(memory: dict | None, blocked_users=None) -> str:
+    """The memory prompt block; blocked users' ids are scrubbed first."""
+    memory = scrub_memory(memory, blocked_users)
     if not memory or memory.get("memory_enabled") is False:
         return ""
     sections = []
@@ -203,12 +208,13 @@ class GuildRuntime:
             )
 
         await self._load_history()
+        self._scrub_runner_history()
         if (
             not self.memory_refreshed_at
             or time.monotonic() - self.memory_refreshed_at >= MEMORY_REFRESH_SECONDS
         ):
             self.memory_block = render_memory_block(
-                await self.api.get_memory(self.guild_id)
+                await self.api.get_memory(self.guild_id), self.blocked_users
             )
             self.memory_refreshed_at = time.monotonic()
 
@@ -254,6 +260,7 @@ class GuildRuntime:
                 review_image_prompt=self.image_capabilities.review,
                 generate_image_bytes=self.image_capabilities.generate,
                 author_handler=self.author_handler,
+                blocked_users=self.blocked_users,
                 request_mode=request_mode,
                 drain_notifications=drain_notifications,
                 **kwargs,
@@ -349,11 +356,31 @@ class GuildRuntime:
             return list(notifications)
         kept = []
         for notification in notifications:
-            ids = _SNOWFLAKE_PATTERN.findall(notification.body)
+            ids = SNOWFLAKE_PATTERN.findall(notification.body)
             if any(self.blocked_users.is_blocked(user_id) for user_id in ids):
                 continue
             kept.append(notification)
         return kept
+
+    def _scrub_runner_history(self) -> None:
+        """Blank opted-out members in the history the model is about to see.
+
+        Run every wake, before the model: a history saved before someone
+        opted out (or one kept in memory across wakes) still holds their
+        lines. The runner keeps the scrubbed copy; stored bytes are left
+        alone, and the next save writes the scrubbed form.
+        """
+        if self.blocked_users is None or not self.engine.agent_runner.history:
+            return
+        dumped = json.loads(
+            ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
+        )
+        scrubbed = scrub_history(dumped, self.blocked_users)
+        if scrubbed == dumped:
+            return
+        self.engine.agent_runner.history = list(
+            ModelMessagesTypeAdapter.validate_python(scrubbed)
+        )
 
     def forget_history(self) -> None:
         """Drop the in-RAM history and memory so the next wake reloads both."""

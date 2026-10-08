@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
+from proactive_agent.optout_gate import scrub_blocked_ids
 from proactive_agent.types import BlockedMessage, ChannelMessage
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
-_MENTION_PATTERN = re.compile(r"<@!?([0-9]{15,22})>")
-_SNOWFLAKE_PATTERN = re.compile(r"(?<![0-9])([0-9]{15,22})(?![0-9])")
 
 
 class DiscordRESTError(Exception):
@@ -186,17 +184,7 @@ class DiscordREST:
         anything a bot or webhook wrote, so the content is scanned directly:
         `<@id>`/`<@!id>` become `@[blocked user]`, a bare id `[blocked user]`.
         """
-        if self._blocked_users is None:
-            return content
-
-        def mention(match: re.Match) -> str:
-            return "@[blocked user]" if self._blocked(match.group(1)) else match[0]
-
-        def bare(match: re.Match) -> str:
-            return "[blocked user]" if self._blocked(match.group(1)) else match[0]
-
-        content = _MENTION_PATTERN.sub(mention, content)
-        return _SNOWFLAKE_PATTERN.sub(bare, content)
+        return scrub_blocked_ids(content, self._blocked_users)
 
     def _message(
         self, record: dict[str, Any], role_names: dict[str, str]
