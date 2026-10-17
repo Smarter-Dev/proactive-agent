@@ -49,7 +49,9 @@ provider-key, and `brave-search-api-key` entries. `anthropic-api-key` becomes
 `ANTHROPIC_API_KEY`: any `claude-*` model id (for example
 `PROACTIVE_AGENT_MODEL=claude-opus-5-5`) calls Anthropic directly with it,
 with 1-hour prompt caching on the tools, system prompt and newest message.
-OpenRouter's `anthropic/*` ids are refused at startup. Production model calls use
+The defaults are `claude-opus-5-5` for the agent and `claude-haiku-5-5` for
+the web summarizer, which caches only its system prompt since each page is
+read once. OpenRouter's `anthropic/*` ids are refused at startup. Production model calls use
 those direct provider credentials; LiteLLM remains a local-development option.
 
 Deploy the additive application migration and REST endpoints from the bot

@@ -663,9 +663,13 @@ async def self_compaction_summary(
     """
     compaction_agent = Agent(model, output_type=str)
     # This request has no tools, so Claude thinking signed with the agent's
-    # tool set would not match it.
+    # tool set would not match it. It is also one request whose prefix no
+    # later request shares, so a message cache breakpoint would only bill the
+    # folded transcript at Claude's 1-hour write rate (twice the input rate).
     result = await compaction_agent.run(
-        COMPACTION_PROMPT, message_history=strip_claude_thinking(messages)
+        COMPACTION_PROMPT,
+        message_history=strip_claude_thinking(messages),
+        model_settings={"anthropic_cache_messages": False},
     )
     return result.output, usage_dict(result.usage)
 

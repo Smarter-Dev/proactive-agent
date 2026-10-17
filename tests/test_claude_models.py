@@ -6,6 +6,7 @@ Every model call here goes to ``claude_fakes.ClaudeServer``.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -30,6 +31,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.test import TestModel
 
 from proactive_agent import models
 from proactive_agent.agent import (
@@ -40,6 +42,8 @@ from proactive_agent.agent import (
     strip_claude_thinking,
     usage_dict,
 )
+from proactive_agent.capabilities import WebSummarizer
+from proactive_agent.config import Settings
 from proactive_agent.runtime import GuildRuntime
 
 ONE_HOUR = {"type": "ephemeral", "ttl": "1h"}
@@ -278,6 +282,50 @@ async def test_the_summarizer_never_receives_claude_thinking(
     assert note == "memory note"
     assert thinking_blocks(server.requests[0]) == []
     assert kinds(history[1]) == ["thinking", "tool-call"]  # stored copy intact
+    # One request whose prefix nothing reuses: no 1-hour write of the history.
+    assert cache_controls(server.requests[0]) == []
+
+
+# --- the models this worker runs (#199) -----------------------------------------
+
+
+def test_the_defaults_are_opus_and_haiku_on_the_direct_key(monkeypatch) -> None:
+    for name in ("PROACTIVE_AGENT_MODEL", "PROACTIVE_WEB_SUMMARIZER_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None)
+
+    assert settings.proactive_agent_model == "claude-opus-5-5"
+    # Was OpenRouter's retired openai/gpt-5.6-luna, which nothing overrode.
+    assert settings.proactive_web_summarizer_model == "claude-haiku-5-5"
+
+
+async def test_the_web_summarizer_speaks_claude_and_caches_only_its_prompt(
+    monkeypatch, no_keys
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    server = serve(monkeypatch, text_reply("the page says hi", cache_write_1h=600))
+    summarize = WebSummarizer(models.build_model("claude-haiku-5-5"))
+
+    summary = await summarize(
+        instruction="what does it say", content="hi", title="t", url="https://x.test"
+    )
+
+    assert summary == "the page says hi"
+    (body,) = server.requests
+    assert body["model"] == "claude-haiku-5-5"
+    # Luna's openai_reasoning_effort became Claude's own effort knob.
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"]["effort"] == "medium"
+    assert "reasoning_effort" not in json.dumps(body)
+    # The page is read once: only the system prompt carries a breakpoint.
+    assert body["system"][-1]["cache_control"] == ONE_HOUR
+    assert cache_controls(body) == [ONE_HOUR]
+
+
+def test_reasoning_settings_keep_openai_effort_for_other_models() -> None:
+    assert models.reasoning_settings(TestModel(), "low") == {
+        "openai_reasoning_effort": "low"
+    }
 
 
 def test_a_model_switch_drops_the_earlier_models_leading_blocks() -> None:

@@ -18,9 +18,13 @@ class Settings(BaseSettings):
     api_base_url: str = "http://localhost:8000/api"
     proactive_agent_api_key: str = ""
     discord_bot_token: str = ""
-    proactive_agent_model: str = "gemini-3.7-flash"
+    # Claude Opus 5.5 and Haiku 5.5 on the direct Anthropic key since
+    # 2026-10-17 (smarter-dev #199); production sets PROACTIVE_AGENT_MODEL in
+    # the smarter-dev ConfigMap too. The summarizer was OpenRouter's retired
+    # GPT-5.6 Luna, which nothing overrode.
+    proactive_agent_model: str = "claude-opus-5-5"
     proactive_skim_model: str = "z-ai/glm-5.3-flash"
-    proactive_web_summarizer_model: str = "openai/gpt-5.6-luna"
+    proactive_web_summarizer_model: str = "claude-haiku-5-5"
     proactive_web_summarizer_fallback_model: str = "gemini-3.5-flash-lite"
     proactive_handler_model: str = "gemini-3-flash-preview"
     proactive_image_reviewer_model: str = "gemini-3.1-flash-lite"

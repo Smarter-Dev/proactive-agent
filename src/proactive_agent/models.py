@@ -7,13 +7,14 @@ import os
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
 from pydantic_ai.models.google import GoogleModel
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.profiles import ModelProfile, merge_profile
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.settings import ModelSettings
 
 # Prompt caching on every Claude request: the tool definitions, the system
 # prompt and the newest message, three of Anthropic's four breakpoints, all on
@@ -56,6 +57,27 @@ def build_claude_model(model_id: str) -> AnthropicModel:
         ),
         settings=ANTHROPIC_CACHE_SETTINGS,
     )
+
+
+def reasoning_settings(
+    model: Model, effort: str, *, cache_messages: bool = True
+) -> ModelSettings:
+    """Reasoning ``effort`` in ``model``'s own dialect.
+
+    A Claude model gets adaptive thinking at that effort, never an OpenAI
+    ``openai_reasoning_effort`` it would not read. ``cache_messages=False`` is
+    for an agent that answers in one request (a web summary): it drops the
+    message cache breakpoint, which would only bill the prompt at the 1-hour
+    write rate; the system-prompt breakpoint stays.
+    """
+    if isinstance(model, AnthropicModel):
+        settings = AnthropicModelSettings(
+            anthropic_thinking={"type": "adaptive"}, anthropic_effort=effort
+        )
+        if not cache_messages:
+            settings["anthropic_cache_messages"] = False
+        return settings
+    return OpenAIChatModelSettings(openai_reasoning_effort=effort)
 
 
 def build_model(model_id: str) -> Model:
