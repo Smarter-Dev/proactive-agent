@@ -45,7 +45,11 @@ Before the first deployment, add this key to the existing
 - `proactive-agent-api-key`: a distinct Skrift key with `bot-api` permission
 
 The manifest continues to use the existing `redis-url`, `discord-bot-token`,
-provider-key, and `brave-search-api-key` entries. Production model calls use
+provider-key, and `brave-search-api-key` entries. `anthropic-api-key` becomes
+`ANTHROPIC_API_KEY`: any `claude-*` model id (for example
+`PROACTIVE_AGENT_MODEL=claude-opus-5-5`) calls Anthropic directly with it,
+with 1-hour prompt caching on the tools, system prompt and newest message.
+OpenRouter's `anthropic/*` ids are refused at startup. Production model calls use
 those direct provider credentials; LiteLLM remains a local-development option.
 
 Deploy the additive application migration and REST endpoints from the bot

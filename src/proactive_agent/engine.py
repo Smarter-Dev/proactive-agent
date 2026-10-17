@@ -159,14 +159,15 @@ class AgentEngine:
         note, usage = await self.agent_runner.wake(brief, deps)
         _merge_usage(usage_by_model, self.agent_model_id, usage)
         totals = {
-            key: sum(entry[key] for entry in usage_by_model.values())
-            for key in ("input_tokens", "output_tokens", "cache_read_tokens")
+            key: sum(entry.get(key, 0) for entry in usage_by_model.values())
+            for key in ZERO_USAGE
         }
         return ActivationResult(
             responses=list(actions.sent),
             input_tokens=totals["input_tokens"],
             output_tokens=totals["output_tokens"],
             cache_read_tokens=totals["cache_read_tokens"],
+            cache_write_tokens=totals["cache_write_tokens"],
             model_id=self.agent_model_id,
             reactions=tuple(actions.reactions),
             usage_by_model=usage_by_model,

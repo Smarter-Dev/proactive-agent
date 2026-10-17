@@ -48,7 +48,12 @@ from proactive_agent.queue import RedisWakeQueue
 
 IDLE = IDLE_WINDOW.total_seconds()
 VERBATIM = "my cat Miso is sick"
-SPENT = {"input_tokens": 900, "output_tokens": 120, "cache_read_tokens": 30}
+SPENT = {
+    "input_tokens": 900,
+    "output_tokens": 120,
+    "cache_read_tokens": 30,
+    "cache_write_tokens": 0,
+}
 
 
 @pytest.fixture
@@ -440,7 +445,12 @@ async def test_wake_bills_its_compaction_with_its_own_turn():
     )
     _note, usage = await runner.wake("brief", deps=None)
 
-    assert usage == {"input_tokens": 940, "output_tokens": 124, "cache_read_tokens": 30}
+    assert usage == {
+        "input_tokens": 940,
+        "output_tokens": 124,
+        "cache_read_tokens": 30,
+        "cache_write_tokens": 0,
+    }
 
 
 async def test_wake_without_compaction_bills_only_its_turn():
@@ -449,7 +459,12 @@ async def test_wake_without_compaction_bills_only_its_turn():
     )
     _note, usage = await runner.wake("brief", deps=None)
 
-    assert usage == {"input_tokens": 40, "output_tokens": 4, "cache_read_tokens": 0}
+    assert usage == {
+        "input_tokens": 40,
+        "output_tokens": 4,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
 
 
 async def test_an_idle_fold_bills_the_agent_model(setup):

@@ -17,7 +17,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from proactive_agent.agent import OPERATING_POLICY_BRIEF
+from proactive_agent.agent import OPERATING_POLICY_BRIEF, strip_claude_thinking
 from proactive_agent.contracts import ControlCommand, NotificationEnvelope
 from proactive_agent.engine import AgentEngine, render_notifications
 from proactive_agent.environment import ChannelEnvironment, InstructionStore
@@ -378,8 +378,16 @@ class GuildRuntime:
         scrubbed = scrub_history(dumped, self.blocked_users)
         if scrubbed == dumped:
             return
-        self.engine.agent_runner.history = list(
-            ModelMessagesTypeAdapter.validate_python(scrubbed)
+        # Blanking a line edits a past turn, and Claude thinking signed after
+        # it no longer matches its prefix; drop those blocks with it.
+        first_edit = next(
+            index
+            for index, (before, after) in enumerate(zip(dumped, scrubbed, strict=True))
+            if before != after
+        )
+        self.engine.agent_runner.history = strip_claude_thinking(
+            list(ModelMessagesTypeAdapter.validate_python(scrubbed)),
+            start=first_edit,
         )
 
     def forget_history(self) -> None:
@@ -597,6 +605,7 @@ class GuildRuntime:
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
                 "cache_read_tokens": usage.get("cache_read_tokens", 0),
+                "cache_write_tokens": usage.get("cache_write_tokens", 0),
             }
             for model_id, usage in (result.usage_by_model or {}).items()
         ]
