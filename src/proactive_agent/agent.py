@@ -15,7 +15,7 @@ import logging
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from inspect import isawaitable
 from typing import Literal
 
@@ -26,7 +26,9 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    ModelResponsePart,
     TextPart,
+    ThinkingPart,
     UserPromptPart,
 )
 from pydantic_ai.models import Model
@@ -46,7 +48,14 @@ TOOL_CALL_LIMIT = 8
 MAX_SENDS_PER_WAKE = 2
 logger = logging.getLogger(__name__)
 
-ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
+# Cache reads and writes are both subsets of input_tokens, as pydantic-ai and
+# smarter-dev's llm_pricing count them. Only Claude reports writes.
+ZERO_USAGE = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+}
 
 
 def usage_dict(usage) -> dict[str, int]:
@@ -55,6 +64,7 @@ def usage_dict(usage) -> dict[str, int]:
         "input_tokens": usage.input_tokens or 0,
         "output_tokens": usage.output_tokens or 0,
         "cache_read_tokens": usage.cache_read_tokens or 0,
+        "cache_write_tokens": usage.cache_write_tokens or 0,
     }
     if not (tokens["input_tokens"] or tokens["output_tokens"]) and usage.details:
         # pydantic-ai 1.107 with genai-prices 0.1.5 filled only details for
@@ -653,8 +663,105 @@ async def self_compaction_summary(
     decides what its future self most needs to keep.
     """
     compaction_agent = Agent(model, output_type=str)
-    result = await compaction_agent.run(COMPACTION_PROMPT, message_history=messages)
+    # This request has no tools, so no thinking block signed with the agent's
+    # tool set would match it: none is sent, from any provider, and a turn that
+    # held only thinking goes with it. It is also one request whose prefix no
+    # later request shares, so a message cache breakpoint would only bill the
+    # folded transcript at Claude's 1-hour write rate (twice the input rate).
+    result = await compaction_agent.run(
+        COMPACTION_PROMPT,
+        message_history=without_thinking(messages),
+        model_settings={"anthropic_cache_messages": False},
+    )
     return result.output, usage_dict(result.usage)
+
+
+def _is_claude_thinking(part: ModelResponsePart) -> bool:
+    return isinstance(part, ThinkingPart) and part.provider_name == "anthropic"
+
+
+def _without_parts(
+    messages: list[ModelMessage],
+    drops: Callable[[int, ModelResponse, ModelResponsePart], bool],
+) -> list[ModelMessage]:
+    """``messages`` minus the response parts ``drops`` names; ``messages``
+    itself when it names none.
+
+    A response left empty is dropped and the requests either side of it
+    merged, so no empty assistant turn is sent and tool calls stay next to
+    their results (a thinking-only response holds no tool call).
+    """
+    kept: list[ModelMessage] = []
+    changed = False
+    merge_next = False
+    for index, message in enumerate(messages):
+        if isinstance(message, ModelResponse):
+            parts = [part for part in message.parts if not drops(index, message, part)]
+            if len(parts) != len(message.parts):
+                changed = True
+                if not parts:
+                    merge_next = bool(kept) and isinstance(kept[-1], ModelRequest)
+                    continue
+                message = replace(message, parts=parts)
+        elif merge_next and isinstance(message, ModelRequest):
+            # The later request keeps its instructions and metadata; the
+            # earlier one's parts (tool results first) lead.
+            message = replace(message, parts=[*kept.pop().parts, *message.parts])
+        merge_next = False
+        kept.append(message)
+    return kept if changed else messages
+
+
+def strip_claude_thinking(
+    messages: list[ModelMessage], *, start: int = 0
+) -> list[ModelMessage]:
+    """The messages with Claude's thinking blocks removed from ``start`` on.
+
+    Returns ``messages`` itself when there was nothing to remove.
+
+    A Claude 5.5 thinking block is signed against the model and the exact
+    conversation prefix that produced it (system prompt, tools, every earlier
+    message, the block before it). Replayed after that prefix changes, it is a
+    400 on accounts the API enforces, and the new Claude key's account is one.
+    An edit therefore takes every block after it, never one from the middle
+    alone. Text and tool calls stay; other providers' thinking is left alone.
+    pydantic-ai retries a rejected block once with drop_block.
+    """
+    return _without_parts(
+        messages, lambda index, _, part: index >= start and _is_claude_thinking(part)
+    )
+
+
+def without_thinking(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """The messages with no thinking at all, from any provider.
+
+    For a summarizer: it reads the transcript as a new conversation, where no
+    block's prefix holds, and the reasoning is not what it summarizes.
+    """
+    return _without_parts(messages, lambda _, __, part: isinstance(part, ThinkingPart))
+
+
+def drop_other_models_claude_thinking(
+    history: list[ModelMessage], model_name: object
+) -> list[ModelMessage]:
+    """The history as ``model_name`` is sent it: its own Claude thinking only.
+
+    Every Claude block another model wrote goes, wherever it sits (A, then B,
+    then A again sends A none of B's), and the model's own blocks stay.
+    Computed from the stored history on every request, each model's blocks
+    keep the prefix they were signed with: the other models' blocks were
+    already absent when they were written. ``history`` itself is returned
+    when there is nothing to drop.
+    """
+    if not isinstance(model_name, str) or not model_name:
+        return history
+    return _without_parts(
+        history,
+        lambda _, message, part: (
+            _is_claude_thinking(part)
+            and not (message.model_name or "").startswith(model_name)
+        ),
+    )
 
 
 def starts_wake_turn(message: ModelMessage) -> bool:
@@ -761,7 +868,9 @@ async def compact_agent_history(
         return history
     old, tail = history[:cut], history[cut:]
     summary = await summarize(old)
-    return [*memory_note_pair(summary), *tail]
+    # The kept tail's Claude thinking was signed with the folded turns in its
+    # prefix; behind the note it would no longer match.
+    return [*memory_note_pair(summary), *strip_claude_thinking(tail)]
 
 
 PRIVACY_PURGE_PROMPT = """\
@@ -976,7 +1085,8 @@ async def privacy_compaction_summary(
     """
     compaction_agent = Agent(model, output_type=str)
     prompt = build_privacy_purge_prompt(user_id, names)
-    history: list[ModelMessage] = list(messages)
+    # No tools here either; see self_compaction_summary.
+    history: list[ModelMessage] = without_thinking(messages)
     usage = dict(ZERO_USAGE)
     id_retries = name_retries = attempts = 0
     while True:
@@ -1141,9 +1251,13 @@ class KimiAgentRunner:
             self.history = compacted
             if self.on_compacted is not None:
                 await self.on_compacted(compacted)
-        result = await self.agent.run(
-            brief, deps=deps, message_history=self.history or None
+        # The model is sent its own Claude thinking only; the stored history
+        # keeps every block, so a model the agent moves back to finds its own.
+        model = getattr(self.agent, "model", None)
+        sent = drop_other_models_claude_thinking(
+            self.history, getattr(model, "model_name", None)
         )
-        self.history = result.all_messages()
+        result = await self.agent.run(brief, deps=deps, message_history=sent or None)
+        self.history = [*self.history, *result.new_messages()]
         add_usage(usage, usage_dict(result.usage))
         return result.output, usage

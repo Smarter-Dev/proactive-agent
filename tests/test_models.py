@@ -25,6 +25,7 @@ def test_usage_dict_reads_the_run_usage_property() -> None:
         "input_tokens": 3,
         "output_tokens": 2,
         "cache_read_tokens": 1,
+        "cache_write_tokens": 0,
     }
 
 

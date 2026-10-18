@@ -14,7 +14,6 @@ from google.genai import types
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.models.google import GoogleModelSettings
-from pydantic_ai.models.openai import OpenAIChatModelSettings
 
 from proactive_agent.handler_lint import lint_script
 from proactive_agent.handler_schedule import (
@@ -22,6 +21,7 @@ from proactive_agent.handler_schedule import (
     validate_time_trigger_settings,
 )
 from proactive_agent.image_generator import apply_palette
+from proactive_agent.models import reasoning_settings
 
 WEB_SUMMARY_PROMPT = """\
 You summarize fetched web content to satisfy a specific INSTRUCTION from \
@@ -168,7 +168,8 @@ class WebSummarizer:
             model,
             output_type=str,
             system_prompt=WEB_SUMMARY_PROMPT,
-            model_settings=OpenAIChatModelSettings(openai_reasoning_effort="medium"),
+            # One request per page, so no message cache breakpoint on Claude.
+            model_settings=reasoning_settings(model, "medium", cache_messages=False),
         )
         self._fallback = (
             Agent(
