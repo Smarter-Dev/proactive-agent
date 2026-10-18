@@ -312,14 +312,19 @@ class GuildRuntime:
         except BaseException:
             await self._record_failed_usage(batch)
             raise
-        responses = await self._dispatch(batch, result, enabled_channels)
-        await self._persist_instructions(
-            enabled_channels, instruction_stores, persisted_addenda
-        )
-        serialized_history = json.loads(
-            ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
-        )
-        snapshot = await self._save_history(serialized_history)
+        try:
+            responses = await self._dispatch(batch, result, enabled_channels)
+            await self._persist_instructions(
+                enabled_channels, instruction_stores, persisted_addenda
+            )
+            serialized_history = json.loads(
+                ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
+            )
+            snapshot = await self._save_history(serialized_history)
+        except BaseException:
+            # The model ran and was billed; the retry runs it again.
+            await self._record_usage_best_effort(batch, result)
+            raise
         self.history_revision = snapshot.revision
         await self._record_usage(batch, result, responses)
         return result
@@ -643,6 +648,19 @@ class GuildRuntime:
                 passive=batch.passive,
                 responses=responses,
                 entries=entries,
+            )
+
+    async def _record_usage_best_effort(
+        self, batch: WakeBatch, result: ActivationResult
+    ) -> None:
+        try:
+            await self._record_usage(batch, result, 0)
+        except Exception as error:  # noqa: BLE001 — the wake's error goes on
+            logger.error(
+                "proactive wake usage report failed guild=%s wake=%s\n%s",
+                self.guild_id,
+                batch.wake_id,
+                exception_trace(error),
             )
 
     async def _record_failed_usage(self, batch: WakeBatch) -> None:

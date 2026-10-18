@@ -181,3 +181,23 @@ async def test_watcher_usage_with_requests_crosses_the_contract():
     assert TokenUsage(input_tokens=1).requests is None
     with pytest.raises(ValueError):
         TokenUsage(input_tokens=1, unknown=2)
+
+
+async def test_a_wake_that_fails_after_the_model_ran_still_reports(runtime_and_api):
+    # The model finished and was billed; the history write then failed (a
+    # purge or another replica wrote first), and the retry runs it again.
+    use, api, writer = runtime_and_api
+    runtime = use(agent_model())
+
+    async def history_lost(serialized):
+        raise RuntimeError("history write lost")
+
+    runtime._save_history = history_lost
+    with pytest.raises(RuntimeError, match="history write lost"):
+        await runtime.process(batch())
+    await writer.close(timeout=1)
+
+    [report] = api.usage_reports
+    entries = {entry["model_id"]: entry for entry in report["entries"]}
+    assert entries[AGENT]["requests"] == [request(FIRST), request(SECOND)]
+    assert report["responses"] == 0
