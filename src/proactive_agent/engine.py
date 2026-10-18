@@ -24,6 +24,7 @@ from proactive_agent.environment import (
     WakeActions,
 )
 from proactive_agent.types import ActivationResult
+from proactive_agent.usage_meter import wake_meter
 
 SKIM_SYSTEM_PROMPT = """\
 You skim Discord transcripts for a chat agent. Summarize what is happening
@@ -48,7 +49,7 @@ class SkimRunner:
 
     async def skim(self, transcript: str) -> tuple[str, dict]:
         result = await self._agent.run(transcript)
-        return result.output, usage_dict(result.usage)
+        return result.output, usage_dict(result.usage, result.new_messages())
 
 
 def render_channel_instructions(
@@ -156,8 +157,22 @@ class AgentEngine:
         )
         if brief_preamble:
             brief = f"{brief_preamble}\n\n{brief}"
-        note, usage = await self.agent_runner.wake(brief, deps)
+        # The capabilities the agent's tools call bill to the wake's meter. A
+        # wake that raises leaves their spend and its skims' with the runner,
+        # whose own spend is already there, for the runtime to report.
+        async with wake_meter() as meter:
+            try:
+                note, usage = await self.agent_runner.wake(brief, deps)
+            except BaseException:
+                for model_id, spent in meter.usage_by_model().items():
+                    _merge_usage(usage_by_model, model_id, spent)
+                unreported = self.agent_runner.unreported_usage
+                for model_id, spent in usage_by_model.items():
+                    _merge_usage(unreported, model_id, spent)
+                raise
         _merge_usage(usage_by_model, self.agent_model_id, usage)
+        for model_id, spent in meter.usage_by_model().items():
+            _merge_usage(usage_by_model, model_id, spent)
         totals = {
             key: sum(entry.get(key, 0) for entry in usage_by_model.values())
             for key in ZERO_USAGE

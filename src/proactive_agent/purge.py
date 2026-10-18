@@ -22,6 +22,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -43,6 +44,7 @@ from proactive_agent.agent import (
 )
 from proactive_agent.contracts import PurgeCommand
 from proactive_agent.environment import InstructionStore
+from proactive_agent.errors import exception_type_name
 from proactive_agent.history import PartialPurgeError
 from proactive_agent.keys import (
     DEAD_LETTER_STREAM_KEY,
@@ -60,6 +62,7 @@ from proactive_agent.keys import (
     wake_stream_key,
 )
 from proactive_agent.queue import WAKE_GROUP
+from proactive_agent.usage_meter import UsageMeter, wake_meter
 
 logger = logging.getLogger(__name__)
 
@@ -797,7 +800,13 @@ class PrivacyPurgeConsumer:
 
     async def purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         """Purge one guild. Never raises; failures come back as an outcome."""
-        result = await self._purge_guild(command, guild_id)
+        # The rewrites run the agent's own model; what they were billed for,
+        # a failed or retried step's too, is reported once the guild is done.
+        async with wake_meter() as meter:
+            try:
+                result = await self._purge_guild(command, guild_id)
+            finally:
+                await self._record_usage(command, guild_id, meter)
         if result.outcome == "unchanged":
             try:
                 how = await self._redis.hget(
@@ -820,6 +829,36 @@ class PrivacyPurgeConsumer:
             # them, the checks could not; the web shows the count.
             result.detail = _join(f"unchecked_names={unchecked}", result.detail)
         return result
+
+    async def _record_usage(
+        self, command: PurgeCommand, guild_id: str, meter: UsageMeter
+    ) -> None:
+        """Bill the purge's model requests like a wake's (operation "agent").
+
+        Each delivery is its own id: a redelivered command runs the model
+        again. Never names the user being forgotten.
+        """
+        usage_by_model = meter.usage_by_model()
+        if not usage_by_model:
+            return
+        try:
+            await self._api.record_usage(
+                guild_id=guild_id,
+                wake_id=f"purge-{command.run_id}:{uuid4().hex[:12]}",
+                metered_at=datetime.now(UTC),
+                passive=True,
+                responses=0,
+                entries=[
+                    {"model_id": model_id, "operation": "agent", **usage}
+                    for model_id, usage in usage_by_model.items()
+                ],
+            )
+        except Exception as error:  # noqa: BLE001 — the purge's outcome stands
+            logger.error(
+                "proactive purge usage report failed guild=%s\n%s",
+                guild_id,
+                exception_type_name(error),
+            )
 
     async def _purge_guild(self, command: PurgeCommand, guild_id: str) -> GuildOutcome:
         stores: list[str] = []
