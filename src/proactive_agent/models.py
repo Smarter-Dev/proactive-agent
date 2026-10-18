@@ -82,6 +82,17 @@ def reasoning_settings(
 
 def build_model(model_id: str) -> Model:
     """Build the same provider class used by the integrated proactive bot."""
+    # Claude first: Anthropic serves it directly, with the funded key and
+    # 1-hour prompt caching, even when a LiteLLM proxy is configured.
+    if model_id.startswith("claude-"):
+        return build_claude_model(model_id)
+    if model_id.startswith("anthropic/"):
+        # OpenRouter's Claude ids would skip the direct key and its caching,
+        # and price as OpenRouter rows. Fail at startup with the fix instead.
+        raise ValueError(
+            f"{model_id!r}: Claude models are served directly by Anthropic; "
+            "use the direct id (e.g. claude-opus-5-5)"
+        )
     litellm_endpoint = os.getenv("LITELLM_ENDPOINT", "").rstrip("/")
     litellm_api_key = os.getenv("LITELLM_API_KEY", "")
     if litellm_endpoint and litellm_api_key:
@@ -97,15 +108,6 @@ def build_model(model_id: str) -> Model:
                 openai_supports_tool_choice_required=False,
                 openai_chat_supports_multiple_system_messages=False,
             ),
-        )
-    if model_id.startswith("claude-"):
-        return build_claude_model(model_id)
-    if model_id.startswith("anthropic/"):
-        # OpenRouter's Claude ids would skip the direct key and its caching,
-        # and price as OpenRouter rows. Fail at startup with the fix instead.
-        raise ValueError(
-            f"{model_id!r}: Claude models are served directly by Anthropic; "
-            "use the direct id (e.g. claude-opus-5-5)"
         )
     if model_id.startswith("gemini-"):
         return GoogleModel(

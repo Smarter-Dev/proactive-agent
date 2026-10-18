@@ -293,7 +293,7 @@ class _FakeAgent:
         self.started_from = None
 
     async def run(self, brief, *, deps, message_history):
-        self.started_from = list(message_history or [])
+        self.started_from = started_from = list(message_history or [])
         messages = [
             *self.started_from,
             ModelRequest(parts=[UserPromptPart(brief)]),
@@ -305,6 +305,9 @@ class _FakeAgent:
 
             def all_messages(self):
                 return messages
+
+            def new_messages(self):
+                return messages[len(started_from) :]
 
             usage = RunUsage(input_tokens=40, output_tokens=4, requests=1)
 

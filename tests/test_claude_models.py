@@ -132,6 +132,22 @@ def test_openrouter_claude_ids_are_refused(no_keys) -> None:
         models.build_model("anthropic/claude-sonnet-5.5")
 
 
+def test_claude_skips_the_litellm_proxy(monkeypatch, no_keys) -> None:
+    from pydantic_ai.models.openai import OpenAIChatModel
+
+    monkeypatch.setenv("CLAUDE_API_KEY", "claude")
+    monkeypatch.setenv("LITELLM_ENDPOINT", "http://litellm.test")
+    monkeypatch.setenv("LITELLM_API_KEY", "litellm")
+    server = serve(monkeypatch)
+
+    assert isinstance(models.build_model("claude-opus-5-5"), AnthropicModel)
+    assert server.keys == ["claude"]
+    with pytest.raises(ValueError, match="claude-opus-5-5"):
+        models.build_model("anthropic/claude-sonnet-5.5")
+    # Everything else still goes through the proxy when it is configured.
+    assert isinstance(models.build_model("z-ai/glm-5.3-flash"), OpenAIChatModel)
+
+
 def test_bare_non_claude_ids_still_go_to_zen(monkeypatch, no_keys) -> None:
     monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "zen")
 
@@ -273,6 +289,14 @@ async def test_the_summarizer_never_receives_claude_thinking(
         ),
         ModelRequest(parts=[ToolReturnPart("lookup", "found", tool_call_id="c1")]),
         thinking("two"),
+        turn("c"),
+        # A reply of nothing but thinking: it goes whole, never sent empty.
+        ModelResponse(
+            parts=[ThinkingPart(content="o", signature="s", provider_name="anthropic")],
+            model_name="claude-opus-5-5",
+            provider_name="anthropic",
+        ),
+        turn("d"),
     ]
 
     note, _ = await self_compaction_summary(
@@ -281,6 +305,7 @@ async def test_the_summarizer_never_receives_claude_thinking(
 
     assert note == "memory note"
     assert thinking_blocks(server.requests[0]) == []
+    assert all(message["content"] for message in server.requests[0]["messages"])
     assert kinds(history[1]) == ["thinking", "tool-call"]  # stored copy intact
     # One request whose prefix nothing reuses: no 1-hour write of the history.
     assert cache_controls(server.requests[0]) == []
@@ -353,15 +378,48 @@ async def test_a_wake_on_a_new_claude_model_sends_no_foreign_thinking(
 ) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     server = serve(monkeypatch, text_reply("ok"))
+    # Opus, then Sonnet, then back to Opus: Sonnet's block sits in the middle.
+    history = [
+        turn("a"),
+        thinking("opus-1"),
+        turn("b"),
+        thinking("sonnet", model="claude-sonnet-5-5"),
+        turn("c"),
+        thinking("opus-2"),
+    ]
     runner = KimiAgentRunner(
         agent=Agent(models.build_model("claude-opus-5-5"), system_prompt="guild"),
         summarize=AsyncMock(),
-        history=[turn("a"), thinking("old", model="claude-sonnet-5-5")],
+        history=list(history),
     )
 
     await runner.wake("brief", deps=None)
 
-    assert thinking_blocks(server.requests[0]) == []
+    assert [block["thinking"] for block in thinking_blocks(server.requests[0])] == [
+        "opus-1",
+        "opus-2",
+    ]
+    # The stored history keeps Sonnet's block for a move back to Sonnet.
+    assert runner.history[: len(history)] == history
+
+
+def test_a_thinking_only_response_goes_and_its_neighbours_merge() -> None:
+    from pydantic_ai.messages import RetryPromptPart
+
+    only = ModelResponse(
+        parts=[ThinkingPart(content="t", signature="s", provider_name="anthropic")],
+        model_name="claude-sonnet-5-5",
+        provider_name="anthropic",
+    )
+    retry = ModelRequest(parts=[RetryPromptPart("Please answer.")])
+    history = [turn("a"), only, retry, ModelResponse(parts=[TextPart("x")]), turn("b")]
+
+    sent = drop_other_models_claude_thinking(history, "claude-opus-5-5")
+
+    assert len(sent) == 3
+    assert [part.part_kind for part in sent[0].parts] == ["user-prompt", "retry-prompt"]
+    # The same holds for an edit: everything after it goes, none before.
+    assert strip_claude_thinking(history, start=1) == sent
 
 
 def test_blanking_an_opted_out_member_drops_thinking_after_the_edit() -> None:
