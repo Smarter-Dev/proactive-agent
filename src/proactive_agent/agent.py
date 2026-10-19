@@ -40,6 +40,7 @@ from proactive_agent.environment import (
 )
 from proactive_agent.errors import exception_trace
 from proactive_agent.types import ProposedReaction, ProposedResponse
+from proactive_agent.usage_meter import UsageMeter, current_meter, metered, request_dict
 
 SUMMARIZE_THRESHOLD = 3000
 
@@ -58,8 +59,13 @@ ZERO_USAGE = {
 }
 
 
-def usage_dict(usage) -> dict[str, int]:
-    """Stable token fields from a pydantic-ai RunUsage instance."""
+def usage_dict(usage, messages=None) -> dict:
+    """Stable token fields from a pydantic-ai RunUsage instance.
+
+    With the run's new *messages*, each of its provider requests' own counts
+    too (``requests``): the ledger prices each request on its own, as a
+    long-context tier is decided per request.
+    """
     tokens = {
         "input_tokens": usage.input_tokens or 0,
         "output_tokens": usage.output_tokens or 0,
@@ -72,12 +78,24 @@ def usage_dict(usage) -> dict[str, int]:
         logger.warning(
             "model usage has details but no token counts: %s", sorted(usage.details)
         )
+    requests = [
+        request
+        for message in messages or ()
+        if isinstance(message, ModelResponse)
+        and any((request := request_dict(message.usage)).values())
+    ]
+    if requests:
+        tokens["requests"] = requests
     return tokens
 
 
-def add_usage(total: dict[str, int], usage: dict[str, int]) -> None:
+def add_usage(total: dict, usage: dict) -> None:
+    """Add *usage* to *total*: token counts summed, requests listed."""
     for key, value in usage.items():
-        total[key] = total.get(key, 0) + value
+        if key == "requests":
+            total.setdefault("requests", []).extend(value)
+        else:
+            total[key] = total.get(key, 0) + value
 
 
 HISTORY_TOKEN_LIMIT = 100_000
@@ -668,12 +686,23 @@ async def self_compaction_summary(
     # held only thinking goes with it. It is also one request whose prefix no
     # later request shares, so a message cache breakpoint would only bill the
     # folded transcript at Claude's 1-hour write rate (twice the input rate).
-    result = await compaction_agent.run(
-        COMPACTION_PROMPT,
-        message_history=without_thinking(messages),
-        model_settings={"anthropic_cache_messages": False},
-    )
-    return result.output, usage_dict(result.usage)
+    meter = UsageMeter()
+    try:
+        result = await compaction_agent.run(
+            COMPACTION_PROMPT,
+            message_history=without_thinking(messages),
+            model_settings={"anthropic_cache_messages": False},
+            model=meter.wrap(model),
+        )
+    except BaseException:
+        # A summary that failed (a thinking-only answer cut off at its output
+        # limit, a timeout) was billed for every response it got: they go to
+        # the meter of the wake or idle fold it ran in, which reports them.
+        owner = current_meter.get()
+        if owner is not None:
+            owner.merge(meter)
+        raise
+    return result.output, usage_dict(result.usage, result.new_messages())
 
 
 def _is_claude_thinking(part: ModelResponsePart) -> bool:
@@ -1055,9 +1084,12 @@ def string_leaves(value) -> list[str]:
 
 
 async def _run_with_timeout(agent: Agent, prompt: str, history):
+    # Billed to the purge's meter (see purge.py), a failed step's requests too.
     try:
         return await asyncio.wait_for(
-            agent.run(prompt, message_history=history or None),
+            agent.run(
+                prompt, message_history=history or None, model=metered(agent.model)
+            ),
             timeout=PRIVACY_MODEL_TIMEOUT_SECONDS,
         )
     except TimeoutError as error:
@@ -1092,7 +1124,7 @@ async def privacy_compaction_summary(
     while True:
         attempts += 1
         result = await _run_with_timeout(compaction_agent, prompt, history)
-        add_usage(usage, usage_dict(result.usage))
+        add_usage(usage, usage_dict(result.usage, result.new_messages()))
         note = str(result.output)
         if not note.strip():
             raise PrivacyCompactionError("empty_output")
@@ -1235,9 +1267,28 @@ class KimiAgentRunner:
     # own turn runs, flagged so the idle sweep can drop the tail without a
     # model call if the wake never writes anything newer.
     on_compacted: Callable[[list[ModelMessage]], Awaitable[None]] | None = None
+    # A wake that raises after the provider answered was billed all the same:
+    # what it spent (its compaction's too) waits here, by model, for the
+    # runtime to report and clear.
+    model_id: str | None = None
+    unreported_usage: dict[str, dict] = field(default_factory=dict)
 
     async def wake(self, brief: str, deps: AgentDeps) -> tuple[str, dict]:
         usage = dict(ZERO_USAGE)
+        model = getattr(self.agent, "model", None)
+        model_id = self.model_id or getattr(model, "model_name", "unknown")
+        try:
+            return await self._wake(brief, deps, usage, model)
+        except BaseException:
+            if any(value for key, value in usage.items() if key != "requests"):
+                add_usage(
+                    self.unreported_usage.setdefault(model_id, dict(ZERO_USAGE)), usage
+                )
+            raise
+
+    async def _wake(
+        self, brief: str, deps: AgentDeps, usage: dict, model
+    ) -> tuple[str, dict]:
 
         async def summarize(messages: list[ModelMessage]) -> str:
             summary, spent = await self.summarize(messages)
@@ -1253,11 +1304,20 @@ class KimiAgentRunner:
                 await self.on_compacted(compacted)
         # The model is sent its own Claude thinking only; the stored history
         # keeps every block, so a model the agent moves back to finds its own.
-        model = getattr(self.agent, "model", None)
         sent = drop_other_models_claude_thinking(
             self.history, getattr(model, "model_name", None)
         )
-        result = await self.agent.run(brief, deps=deps, message_history=sent or None)
+        meter = UsageMeter()
+        # Wrapped only when it is a model: test doubles stand in for agents.
+        metered_run = {"model": meter.wrap(model)} if isinstance(model, Model) else {}
+        try:
+            result = await self.agent.run(
+                brief, deps=deps, message_history=sent or None, **metered_run
+            )
+        except BaseException:
+            for spent in meter.usage_by_model().values():
+                add_usage(usage, spent)
+            raise
         self.history = [*self.history, *result.new_messages()]
-        add_usage(usage, usage_dict(result.usage))
+        add_usage(usage, usage_dict(result.usage, result.new_messages()))
         return result.output, usage

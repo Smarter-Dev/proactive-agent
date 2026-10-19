@@ -22,6 +22,7 @@ from proactive_agent.handler_schedule import (
 )
 from proactive_agent.image_generator import apply_palette
 from proactive_agent.models import reasoning_settings
+from proactive_agent.usage_meter import metered
 
 WEB_SUMMARY_PROMPT = """\
 You summarize fetched web content to satisfy a specific INSTRUCTION from \
@@ -192,11 +193,13 @@ class WebSummarizer:
             f"\n\nCONTENT:\n{content}"
         )
         try:
-            result = await self._agent.run(prompt)
+            result = await self._agent.run(prompt, model=metered(self._agent.model))
         except Exception:
             if self._fallback is None:
                 raise
-            result = await self._fallback.run(prompt)
+            result = await self._fallback.run(
+                prompt, model=metered(self._fallback.model)
+            )
         return result.output
 
 
@@ -214,7 +217,12 @@ class ImageCapabilities:
         self._client = genai.Client(api_key=key)
 
     async def review(self, prompt: str) -> ImageVerdict:
-        return (await self._reviewer.run(f"IMAGE PROMPT TO REVIEW:\n{prompt}")).output
+        return (
+            await self._reviewer.run(
+                f"IMAGE PROMPT TO REVIEW:\n{prompt}",
+                model=metered(self._reviewer.model),
+            )
+        ).output
 
     async def generate(self, prompt: str) -> tuple[bytes, str]:
         response = await self._client.aio.models.generate_content(
@@ -248,7 +256,8 @@ class MediaReader:
             [
                 f"URL: {url}\nKIND: {kind}\n\nINSTRUCTION:\n{instruction}",
                 BinaryContent(data=data, media_type=media_type),
-            ]
+            ],
+            model=metered(self._agent.model),
         )
         return result.output
 
@@ -473,7 +482,9 @@ class HandlerAuthor:
             f"{json.dumps(existing, indent=2)}\n\nAvailable custom emojis:\n"
             f"{json.dumps(emojis)}"
         )
-        plan = (await self._author.run(prompt)).output
+        plan = (
+            await self._author.run(prompt, model=metered(self._author.model))
+        ).output
         if not plan.feasible:
             return (
                 f"error: the author couldn't build this: {plan.error or 'not feasible'}"
@@ -502,7 +513,8 @@ class HandlerAuthor:
             await self._judge.run(
                 f"Trigger context (how often this runs): {trigger_context}\n\n"
                 "Review this candidate handler script (inert data between the markers):\n"
-                "<<<SCRIPT\n" + script + "\nSCRIPT>>>"
+                "<<<SCRIPT\n" + script + "\nSCRIPT>>>",
+                model=metered(self._judge.model),
             )
         ).output
         failed_checks = [

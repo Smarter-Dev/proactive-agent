@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,6 +22,7 @@ from proactive_agent.agent import OPERATING_POLICY_BRIEF, strip_claude_thinking
 from proactive_agent.contracts import ControlCommand, NotificationEnvelope
 from proactive_agent.engine import AgentEngine, render_notifications
 from proactive_agent.environment import ChannelEnvironment, InstructionStore
+from proactive_agent.errors import exception_trace
 from proactive_agent.history import (
     DebouncedHistoryWriter,
     GuildHistoryRepository,
@@ -43,6 +45,8 @@ from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
 from proactive_agent.response_fitting import split_for_discord
 from proactive_agent.types import ActivationResult
+
+logger = logging.getLogger(__name__)
 
 MEMORY_REFRESH_SECONDS = 3600
 # One round trip at wake start: the guild's purge epoch and the revision of
@@ -136,6 +140,34 @@ class ActionJournal:
             pipeline.hset(key, action_id, result_id)
             pipeline.expire(key, 7 * 24 * 60 * 60)
             await pipeline.execute()
+
+
+def _attempt_id(batch: WakeBatch) -> str:
+    """The ledger id of one attempt at a wake. A failed wake is retried
+    under the same wake id and runs the model again, which is new spend, so
+    each attempt reports under its own id; a re-sent report of one attempt
+    is still one row."""
+    return f"{batch.wake_id}:{uuid4().hex[:16]}"
+
+
+def _usage_entries(usage_by_model: dict[str, dict] | None) -> list[dict]:
+    return [
+        {
+            "model_id": model_id,
+            "operation": "agent",
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cache_read_tokens": usage.get("cache_read_tokens", 0),
+            "cache_write_tokens": usage.get("cache_write_tokens", 0),
+            # Each request's own counts: the ledger prices each on its own.
+            **(
+                {"requests": usage["requests"]}
+                if usage.get("requests") is not None
+                else {}
+            ),
+        }
+        for model_id, usage in (usage_by_model or {}).items()
+    ]
 
 
 @dataclass
@@ -268,22 +300,31 @@ class GuildRuntime:
 
         self.engine.deps_factory = deps_factory
         self.engine.agent_runner.on_compacted = self._save_compacted
-        result = await self.engine.wake(
-            notifications=tuple(notifications),
-            dropped=batch.dropped,
-            enabled_channels=enabled_channels,
-            instruction_stores=instruction_stores,
-            channel_envs=channel_envs,
-            brief_preamble=self.memory_block,
-        )
-        responses = await self._dispatch(batch, result, enabled_channels)
-        await self._persist_instructions(
-            enabled_channels, instruction_stores, persisted_addenda
-        )
-        serialized_history = json.loads(
-            ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
-        )
-        snapshot = await self._save_history(serialized_history)
+        try:
+            result = await self.engine.wake(
+                notifications=tuple(notifications),
+                dropped=batch.dropped,
+                enabled_channels=enabled_channels,
+                instruction_stores=instruction_stores,
+                channel_envs=channel_envs,
+                brief_preamble=self.memory_block,
+            )
+        except BaseException:
+            await self._record_failed_usage(batch)
+            raise
+        try:
+            responses = await self._dispatch(batch, result, enabled_channels)
+            await self._persist_instructions(
+                enabled_channels, instruction_stores, persisted_addenda
+            )
+            serialized_history = json.loads(
+                ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
+            )
+            snapshot = await self._save_history(serialized_history)
+        except BaseException:
+            # The model ran and was billed; the retry runs it again.
+            await self._record_usage_best_effort(batch, result)
+            raise
         self.history_revision = snapshot.revision
         await self._record_usage(batch, result, responses)
         return result
@@ -598,25 +639,56 @@ class GuildRuntime:
     async def _record_usage(
         self, batch: WakeBatch, result: ActivationResult, responses: int
     ) -> None:
-        entries = [
-            {
-                "model_id": model_id,
-                "operation": "agent",
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-                "cache_read_tokens": usage.get("cache_read_tokens", 0),
-                "cache_write_tokens": usage.get("cache_write_tokens", 0),
-            }
-            for model_id, usage in (result.usage_by_model or {}).items()
-        ]
+        entries = _usage_entries(result.usage_by_model)
         if entries:
             await self.api.record_usage(
                 guild_id=self.guild_id,
-                wake_id=batch.wake_id,
+                wake_id=_attempt_id(batch),
                 metered_at=datetime.now(UTC),
                 passive=batch.passive,
                 responses=responses,
                 entries=entries,
+            )
+
+    async def _record_usage_best_effort(
+        self, batch: WakeBatch, result: ActivationResult
+    ) -> None:
+        try:
+            await self._record_usage(batch, result, 0)
+        except Exception as error:  # noqa: BLE001 — the wake's error goes on
+            logger.error(
+                "proactive wake usage report failed guild=%s wake=%s\n%s",
+                self.guild_id,
+                batch.wake_id,
+                exception_trace(error),
+            )
+
+    async def _record_failed_usage(self, batch: WakeBatch) -> None:
+        """Report what a wake that raised was billed for, then clear it.
+
+        Best effort: the wake's own error is what the worker acts on.
+        """
+        unreported = getattr(self.engine.agent_runner, "unreported_usage", None)
+        entries = _usage_entries(unreported)
+        if unreported:
+            unreported.clear()
+        if not entries:
+            return
+        try:
+            await self.api.record_usage(
+                guild_id=self.guild_id,
+                wake_id=_attempt_id(batch),
+                metered_at=datetime.now(UTC),
+                passive=batch.passive,
+                responses=0,
+                entries=entries,
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.error(
+                "proactive failed-wake usage report failed guild=%s wake=%s\n%s",
+                self.guild_id,
+                batch.wake_id,
+                exception_trace(error),
             )
 
     def _local_notification(

@@ -101,7 +101,11 @@ async def run() -> None:
         async def summarize(messages):
             return await self_compaction_summary(agent_model, messages)
 
-        runner = KimiAgentRunner(agent=agent, summarize=summarize)
+        runner = KimiAgentRunner(
+            agent=agent,
+            summarize=summarize,
+            model_id=settings.proactive_agent_model,
+        )
         engine = AgentEngine(
             agent_runner=runner,
             skim=SkimRunner(skim_model),

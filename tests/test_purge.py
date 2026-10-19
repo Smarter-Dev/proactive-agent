@@ -718,3 +718,27 @@ async def test_a_purge_waits_for_a_running_wake_then_purges_its_save(
     await asyncio.sleep(0.15)  # the wake's dirty copy never reaches Postgres
     assert not leaks(json.dumps(api.durable[GUILD].history))
     await replica.writer.close(timeout=1)
+
+
+async def test_purge_rewrites_bill_their_model_requests(redis_client, world):
+    # #211: the agent's own model rewrote the memory note and the watch
+    # instructions; each request it was billed for reaches the ledger, under
+    # an id of its own per delivery, never naming the forgotten user.
+    api = world
+    calls: list[str] = []
+    replica = Replica(redis_client, api, honest_model(calls), name="a")
+    await replica.consumer.initialize()
+    payload = command()
+    await submit(redis_client, payload)
+
+    assert await replica.consumer.poll_once() == 1
+
+    [report] = api.usage_reports
+    assert report["guild_id"] == GUILD
+    assert report["wake_id"].startswith(f"purge-{payload['run_id']}:")
+    assert len(report["wake_id"]) <= 64
+    [entry] = report["entries"]
+    assert entry["operation"] == "agent"
+    assert len(entry["requests"]) == len(calls) > 0
+    assert entry["input_tokens"] == sum(r["input_tokens"] for r in entry["requests"])
+    assert TARGET not in json.dumps(report, default=str)

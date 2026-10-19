@@ -54,6 +54,7 @@ from proactive_agent.history import HistoryChecksumError
 from proactive_agent.keys import lease_key, privacy_lock_key
 from proactive_agent.optout_gate import scrub_history
 from proactive_agent.purge import PrivacyLock
+from proactive_agent.usage_meter import wake_meter
 
 logger = logging.getLogger(__name__)
 
@@ -238,10 +239,16 @@ class IdleHistoryCompactor:
             return summary
 
         try:
-            folded = await asyncio.wait_for(
-                purge_agent_history(history, summarize=summarize),
-                timeout=SUMMARY_TIMEOUT_SECONDS,
-            )
+            # A summary that fails leaves what it was billed in the meter.
+            async with wake_meter() as meter:
+                try:
+                    folded = await asyncio.wait_for(
+                        purge_agent_history(history, summarize=summarize),
+                        timeout=SUMMARY_TIMEOUT_SECONDS,
+                    )
+                finally:
+                    for spent in meter.usage_by_model().values():
+                        add_usage(usage, spent)
         except Exception as error:
             # The bound holds even when the model does not answer: keep the
             # note the history already had, or say the rest was dropped.
