@@ -40,7 +40,7 @@ from proactive_agent.environment import (
 )
 from proactive_agent.errors import exception_trace
 from proactive_agent.types import ProposedReaction, ProposedResponse
-from proactive_agent.usage_meter import UsageMeter, metered, request_dict
+from proactive_agent.usage_meter import UsageMeter, current_meter, metered, request_dict
 
 SUMMARIZE_THRESHOLD = 3000
 
@@ -686,11 +686,22 @@ async def self_compaction_summary(
     # held only thinking goes with it. It is also one request whose prefix no
     # later request shares, so a message cache breakpoint would only bill the
     # folded transcript at Claude's 1-hour write rate (twice the input rate).
-    result = await compaction_agent.run(
-        COMPACTION_PROMPT,
-        message_history=without_thinking(messages),
-        model_settings={"anthropic_cache_messages": False},
-    )
+    meter = UsageMeter()
+    try:
+        result = await compaction_agent.run(
+            COMPACTION_PROMPT,
+            message_history=without_thinking(messages),
+            model_settings={"anthropic_cache_messages": False},
+            model=meter.wrap(model),
+        )
+    except BaseException:
+        # A summary that failed (a thinking-only answer cut off at its output
+        # limit, a timeout) was billed for every response it got: they go to
+        # the meter of the wake or idle fold it ran in, which reports them.
+        owner = current_meter.get()
+        if owner is not None:
+            owner.merge(meter)
+        raise
     return result.output, usage_dict(result.usage, result.new_messages())
 
 

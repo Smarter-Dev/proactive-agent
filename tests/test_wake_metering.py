@@ -15,19 +15,28 @@ from types import SimpleNamespace
 import fakeredis.aioredis
 import jsonschema
 import pytest
-from purge_fakes import CHANNEL, GUILD, FakeAPI, batch, make_runtime
+from purge_fakes import (
+    CHANNEL,
+    GUILD,
+    FakeAPI,
+    batch,
+    make_runtime,
+    raw_history_with_target,
+)
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
-from proactive_agent.agent import KimiAgentRunner
+from proactive_agent.agent import KimiAgentRunner, self_compaction_summary
 from proactive_agent.capabilities import WebSummarizer
 from proactive_agent.contracts import NotificationEnvelope, TokenUsage
 from proactive_agent.engine import AgentEngine, SkimRunner
 from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
+from proactive_agent.idle import IdleHistoryCompactor
 from proactive_agent.parity import ProactiveDeps
+from proactive_agent.queue import RedisWakeQueue
 
 AGENT = "claude-opus-5-5"
 SUMMARIZER = "claude-haiku-5-5"
@@ -155,11 +164,15 @@ async def test_watcher_usage_with_requests_crosses_the_contract():
             / "contracts/proactive/v1/notification.schema.json"
         ).read_text()
     )
+    # A Claude watcher's: the totals hold the cache write its request did.
     usage = {
         "input_tokens": 3,
         "output_tokens": 1,
         "cache_read_tokens": 0,
-        "requests": [request(RequestUsage(input_tokens=3, output_tokens=1))],
+        "cache_write_tokens": 2,
+        "requests": [
+            request(RequestUsage(input_tokens=3, output_tokens=1, cache_write_tokens=2))
+        ],
     }
     envelope = NotificationEnvelope(
         schema_version=1,
@@ -177,6 +190,7 @@ async def test_watcher_usage_with_requests_crosses_the_contract():
         trace_id="00000000-0000-4000-8000-000000000002",
     )
     jsonschema.validate(envelope.model_dump(mode="json"), schema)
+    assert envelope.watcher_usage["typesafe:jev-1.13.0"].cache_write_tokens == 2
     # An old bot's usage, without requests, still validates.
     assert TokenUsage(input_tokens=1).requests is None
     with pytest.raises(ValueError):
@@ -201,3 +215,81 @@ async def test_a_wake_that_fails_after_the_model_ran_still_reports(runtime_and_a
     entries = {entry["model_id"]: entry for entry in report["entries"]}
     assert entries[AGENT]["requests"] == [request(FIRST), request(SECOND)]
     assert report["responses"] == 0
+
+
+# A compaction whose summary fails: a thinking-only answer cut off at its
+# output limit, billed all the same (Astra's #211 reproduction).
+CUT_OFF = RequestUsage(input_tokens=90_000, output_tokens=4_096)
+
+
+def cut_off_compaction_model() -> FunctionModel:
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[ThinkingPart("still thinking")],
+            usage=CUT_OFF,
+            finish_reason="length",
+        )
+
+    return FunctionModel(respond, model_name=AGENT)
+
+
+async def test_a_wake_whose_compaction_fails_reports_its_billed_summary(
+    runtime_and_api,
+):
+    use, api, writer = runtime_and_api
+    runtime = use(agent_model())
+    runner = runtime.engine.agent_runner
+    compaction_model = cut_off_compaction_model()
+
+    async def summarize(messages):
+        return await self_compaction_summary(compaction_model, messages)
+
+    runner.summarize = summarize
+    runner.token_limit = 1
+
+    async def long_history():
+        # Three earlier wakes: past the limit, with turns to fold.
+        runner.history = [
+            message for _ in range(3) for message in raw_history_with_target()
+        ]
+
+    runtime._load_history = long_history
+
+    with pytest.raises(UnexpectedModelBehavior):
+        await runtime.process(batch())
+    await writer.close(timeout=1)
+
+    [report] = api.usage_reports
+    entries = {entry["model_id"]: entry for entry in report["entries"]}
+    assert entries[AGENT]["requests"] == [request(CUT_OFF)]
+    assert entries[AGENT]["output_tokens"] == CUT_OFF.output_tokens
+    assert runner.unreported_usage == {}
+
+
+async def test_an_idle_fold_whose_summary_fails_reports_its_billed_summary():
+    redis_client = fakeredis.aioredis.FakeRedis(decode_responses=False)
+    api = FakeAPI()
+    repository = GuildHistoryRepository(redis_client, api)
+    writer = DebouncedHistoryWriter(repository, api, debounce_seconds=0)
+    compaction_model = cut_off_compaction_model()
+
+    async def summarize(messages):
+        return await self_compaction_summary(compaction_model, messages)
+
+    compactor = IdleHistoryCompactor(
+        redis_client,
+        RedisWakeQueue(redis_client, consumer_name="test"),
+        repository,
+        writer,
+        summarize=summarize,
+        api=api,
+        model_id=AGENT,
+    )
+
+    folded, usage = await compactor._fold(raw_history_with_target())
+    await writer.close(timeout=1)
+
+    # The fold still degrades to its note; the summary it paid for is kept.
+    assert folded
+    assert usage["requests"] == [request(CUT_OFF)]
+    assert usage["input_tokens"] == CUT_OFF.input_tokens

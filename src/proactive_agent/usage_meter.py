@@ -81,6 +81,10 @@ class UsageMeter:
             if requests
         }
 
+    def merge(self, other: UsageMeter) -> None:
+        for model_id, requests in other.requests.items():
+            self.requests.setdefault(model_id, []).extend(requests)
+
     def clear(self) -> None:
         self.requests.clear()
 
