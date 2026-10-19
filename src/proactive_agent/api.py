@@ -52,6 +52,17 @@ class ApplicationAPI:
         response = await self._request("GET", f"/guilds/{guild_id}/proactive-settings")
         return tuple(EnabledChannel.model_validate(item) for item in response.json())
 
+    async def get_channel_settings(
+        self, guild_id: str, channel_id: str
+    ) -> dict[str, Any] | None:
+        """One channel's own settings row, on or off; None when it has none."""
+        response = await self._request(
+            "GET",
+            f"/guilds/{guild_id}/channels/{channel_id}/proactive-settings",
+            allow_not_found=True,
+        )
+        return None if response is None else response.json()
+
     async def get_history(self, guild_id: str) -> HistorySnapshot | None:
         response = await self._request(
             "GET",
