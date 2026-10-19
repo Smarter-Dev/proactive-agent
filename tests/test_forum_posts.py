@@ -349,3 +349,28 @@ async def test_a_failure_notice_with_only_a_forum_on_and_no_post_is_skipped():
 
     assert await runtime.report_failure(wake_batch(TEXT_THREAD), "boom") is None
     runtime.discord.send_message.assert_not_awaited()
+
+
+def test_an_opted_out_authors_post_title_is_hidden():
+    post = {**CHANNELS[POST], "owner_id": "123456789012345678"}
+    blocked = SimpleNamespace(is_blocked=lambda user_id, _message_id=None: True)
+
+    label = forum_post_label(post, CHANNELS[FORUM], blocked)
+
+    assert "How do I sort a dict?" not in label
+    assert label.startswith("a post by someone who opted out (post in forum")
+
+
+async def test_the_runtime_hides_an_opted_out_authors_post_title():
+    engine = FakeEngine()
+    runtime = make_runtime([forum_row()], engine=engine)
+    runtime.blocked_users = SimpleNamespace(
+        is_blocked=lambda user_id, _message_id=None: str(user_id) == "42"
+    )
+    CHANNELS[POST]["owner_id"] = "42"
+    try:
+        await runtime.process(wake_batch(POST))
+    finally:
+        del CHANNELS[POST]["owner_id"]
+
+    assert "How do I sort a dict?" not in engine.seen["enabled"][POST]

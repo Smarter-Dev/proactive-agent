@@ -75,9 +75,15 @@ THREAD_CHANNEL_TYPES = frozenset({10, 11, 12})
 FORUM_PARENT_CACHE_MAX_ENTRIES = 10_000
 
 
-def forum_post_label(post: dict, forum: dict) -> str:
+# Shown instead of the title of a post whose author opted out: their words
+# never reach a model, and a post's title is theirs.
+HIDDEN_POST_TITLE = "a post by someone who opted out"
+
+
+def forum_post_label(post: dict, forum: dict, blocked_users=None) -> str:
     """How the agent sees a forum post among its channels: its title, its
-    forum, and its applied tag names."""
+    forum, and its applied tag names. ``blocked_users`` hides the title of
+    an opted-out author's post."""
     tag_names = {
         str(tag.get("id")): tag.get("name") for tag in forum.get("available_tags") or ()
     }
@@ -88,6 +94,13 @@ def forum_post_label(post: dict, forum: dict) -> str:
     ]
     tag_text = f"; tags: {', '.join(tags)}" if tags else ""
     title = post.get("name") or post.get("id") or "untitled post"
+    owner_id = post.get("owner_id")
+    if (
+        owner_id is not None
+        and blocked_users is not None
+        and blocked_users.is_blocked(owner_id, post.get("id"))
+    ):
+        title = HIDDEN_POST_TITLE
     forum_name = forum.get("name") or forum.get("id") or "forum"
     return f"{title} (post in forum #{forum_name}{tag_text})"
 
@@ -748,7 +761,7 @@ class GuildRuntime:
         own = await self.api.get_channel_settings(self.guild_id, channel_id)
         if own is not None and not own.get("enabled"):
             return None  # /proactive off in the post: just this post is off
-        return forum_id, forum_post_label(post, forums[forum_id])
+        return forum_id, forum_post_label(post, forums[forum_id], self.blocked_users)
 
     async def _record_usage(
         self, batch: WakeBatch, result: ActivationResult, responses: int
