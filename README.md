@@ -66,6 +66,10 @@ marked that guild `external` in Redis.
   gates its posts (a post inherits the forum's row unless it has its own);
   the worker admits each post a wake names as a channel of its own, never
   the forum itself, and every post shares the forum's watch instructions.
+  The worker asks the application for forum rows (`?forums=true`); one that
+  does not is never shown them. While running it keeps
+  `proactive:v1:capability:forum-posts` set (3-minute expiry), and the bot
+  routes a forum post's messages to the worker only while that key is set.
 - Waking envelopes go to `proactive:v1:{guild:<id>}:wake`; non-waking context
   waits in the guild's bounded pending list until the next wake.
 - Workers use consumer groups and a guild lease, so replicas process different

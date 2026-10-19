@@ -146,3 +146,10 @@ def privacy_consumer_key(component: str, replica_id: str) -> str:
 def tombstone_cleared_key(run_id: str) -> str:
     """Hash guild_id -> how the tombstone left by this run was cleared."""
     return f"privacy:v1:tombstone-cleared:{run_id}"
+
+
+# Set, with a short expiry, by every worker that runs a whole forum's posts as
+# channels of their own (#248). The bot routes a forum post's messages here
+# only while it is set, so a worker without forum support (an older one, or a
+# rollback) never gets them.
+FORUM_POSTS_CAPABILITY_KEY = f"{KEY_PREFIX}:capability:forum-posts"

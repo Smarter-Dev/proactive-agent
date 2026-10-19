@@ -252,7 +252,7 @@ class GuildRuntime:
         for row in enabled_rows:
             channel = await self.discord.channel(row.channel_id)
             channel_name = channel.get("name") or row.channel_id
-            if channel.get("type") in FORUM_CHANNEL_TYPES:
+            if row.is_forum or channel.get("type") in FORUM_CHANNEL_TYPES:
                 forums[row.channel_id] = channel
             else:
                 enabled_channels[row.channel_id] = channel_name
@@ -412,36 +412,34 @@ class GuildRuntime:
     async def _failure_notice_channel(self, batch: WakeBatch) -> str | None:
         """The channel the wake was for, else any the agent is enabled in.
 
-        Never a forum itself, which takes no messages: one of its posts the
-        wake was for, else another enabled channel, else no notice.
+        Never a forum itself, which takes no messages, nor a channel whose
+        type Discord would not tell: one of a forum's posts the wake was
+        for, else another enabled channel, else no notice.
         """
-        rows = [
-            row.channel_id
-            for row in await self.api.list_enabled_channels(self.guild_id)
-        ]
+        rows = await self.api.list_enabled_channels(self.guild_id)
         if not rows:
             return None
+        forums: dict[str, dict] = {}
+        plain: list[str] = []
+        for row in rows:
+            try:
+                channel = await self.discord.channel(row.channel_id)
+            except Exception:  # noqa: BLE001 — unknown type: never a destination
+                continue
+            if row.is_forum or channel.get("type") in FORUM_CHANNEL_TYPES:
+                forums[row.channel_id] = channel
+            else:
+                plain.append(row.channel_id)
         candidates = [item.envelope.channel_id for item in batch.waking]
         candidates += [envelope.channel_id for envelope in batch.notifications]
         candidates = list(dict.fromkeys(candidates))
         for channel_id in candidates:
-            if channel_id in rows:
+            if channel_id in plain:
                 return channel_id
-        forums: dict[str, dict] = {}
-        plain: list[str] = []
-        for channel_id in rows:
-            try:
-                channel = await self.discord.channel(channel_id)
-            except Exception:  # noqa: BLE001 — unknown: treated as before #248
-                channel = {}
-            if channel.get("type") in FORUM_CHANNEL_TYPES:
-                forums[channel_id] = channel
-            else:
-                plain.append(channel_id)
-        if forums:
-            for channel_id in candidates:
-                if await self._forum_post(channel_id, forums) is not None:
-                    return channel_id
+            if channel_id in forums:
+                continue
+            if forums and await self._forum_post(channel_id, forums) is not None:
+                return channel_id
         return plain[0] if plain else None
 
     async def _save_compacted(self, history: list[ModelMessage]) -> None:
@@ -729,7 +727,9 @@ class GuildRuntime:
         try:
             post = await self.discord.channel(channel_id)
         except DiscordRESTError as error:
-            if error.status_code in (403, 404):
+            # Gone for good; a refusal (403) can be undone by a permission
+            # change, so it is asked again next time.
+            if error.status_code == 404:
                 self._remember_forum_parent(channel_id, None)
             return None, None
         if channel_id not in self.forum_parents:

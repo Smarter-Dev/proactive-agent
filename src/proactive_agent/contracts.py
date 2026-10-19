@@ -94,6 +94,9 @@ class HistorySnapshot(BaseModel):
 class EnabledChannel(BaseModel):
     channel_id: str
     watch_addendum: str
+    # A whole forum switched on (#248); an application that predates the
+    # flag leaves it out, and the worker then asks Discord.
+    is_forum: bool = False
 
 
 SNOWFLAKE_PATTERN = r"^[0-9]{15,22}$"

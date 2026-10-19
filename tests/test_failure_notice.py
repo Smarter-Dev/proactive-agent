@@ -41,7 +41,9 @@ def batch(
 def runtime(enabled: tuple[str, ...], *, claimed: bool = True) -> GuildRuntime:
     api = SimpleNamespace(
         list_enabled_channels=AsyncMock(
-            return_value=tuple(SimpleNamespace(channel_id=cid) for cid in enabled)
+            return_value=tuple(
+                SimpleNamespace(channel_id=cid, is_forum=False) for cid in enabled
+            )
         )
     )
     return GuildRuntime(
@@ -50,7 +52,11 @@ def runtime(enabled: tuple[str, ...], *, claimed: bool = True) -> GuildRuntime:
         history_repository=None,
         history_writer=None,
         api=api,
-        discord=SimpleNamespace(send_message=AsyncMock()),
+        # Every destination is checked to be a channel that takes messages.
+        discord=SimpleNamespace(
+            send_message=AsyncMock(),
+            channel=AsyncMock(side_effect=lambda cid: {"id": cid, "type": 0}),
+        ),
         redis=None,
         queue=SimpleNamespace(claim_failure_notice=AsyncMock(return_value=claimed)),
         journal=None,

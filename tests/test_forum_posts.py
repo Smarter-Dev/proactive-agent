@@ -8,16 +8,26 @@ and every post shares the forum's watch instructions, saved on the forum.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import subprocess
+import sys
+import types
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import httpx
+import pytest
+
 from proactive_agent.agent import ToolBudget
+from proactive_agent.api import ApplicationAPI
+from proactive_agent.beacon import CapabilityBeacon
 from proactive_agent.contracts import EnabledChannel, NotificationEnvelope
 from proactive_agent.discord import DiscordRESTError
 from proactive_agent.environment import WakeActions
+from proactive_agent.keys import FORUM_POSTS_CAPABILITY_KEY
 from proactive_agent.queue import StreamNotification, WakeBatch
 from proactive_agent.runtime import GuildRuntime, forum_post_label
 from proactive_agent.types import ActivationResult, ProposedResponse
@@ -203,8 +213,10 @@ def make_runtime(rows, *, own_rows=None, engine=None, discord_errors=()):
     return runtime
 
 
-def forum_row(text="watch python questions"):
-    return EnabledChannel(channel_id=FORUM, watch_addendum=addendum(text))
+def forum_row(text="watch python questions", *, is_forum=True):
+    return EnabledChannel(
+        channel_id=FORUM, watch_addendum=addendum(text), is_forum=is_forum
+    )
 
 
 async def test_a_post_of_an_enabled_forum_is_its_own_channel():
@@ -374,3 +386,155 @@ async def test_the_runtime_hides_an_opted_out_authors_post_title():
         del CHANNELS[POST]["owner_id"]
 
     assert "How do I sort a dict?" not in engine.seen["enabled"][POST]
+
+
+async def test_a_forum_row_from_an_application_without_the_flag_is_still_a_forum():
+    # New worker, older application: the row carries no is_forum, so the
+    # worker asks Discord, and the forum is still never a channel itself.
+    engine = FakeEngine(respond_in=(POST, FORUM))
+    runtime = make_runtime([forum_row(is_forum=False)], engine=engine)
+
+    await runtime.process(wake_batch(POST))
+
+    assert list(engine.seen["enabled"]) == [POST]
+    sent_to = [call.args[0] for call in runtime.discord.send_message.await_args_list]
+    assert sent_to == [POST]
+
+
+async def test_the_worker_asks_for_forum_rows_and_reads_the_flag():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json=[
+                {"channel_id": TEXT, "watch_addendum": ""},
+                {"channel_id": FORUM, "watch_addendum": "", "is_forum": True},
+            ],
+        )
+
+    api = ApplicationAPI(
+        base_url="https://app.test/api",
+        api_key="sk_test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        rows = await api.list_enabled_channels(GUILD)
+    finally:
+        await api.close()
+
+    assert seen[0].url.params["forums"] == "true"
+    assert [(row.channel_id, row.is_forum) for row in rows] == [
+        (TEXT, False),
+        (FORUM, True),
+    ]
+
+
+async def test_a_post_discord_refused_once_is_asked_about_again():
+    runtime = make_runtime([forum_row()])
+    original = runtime.discord.channel
+    runtime.discord.channel = AsyncMock(side_effect=DiscordRESTError(403, "no"))
+    forums = {FORUM: CHANNELS[FORUM]}
+
+    assert await runtime._forum_post(POST, forums) is None
+    assert POST not in runtime.forum_parents
+
+    runtime.discord.channel = original
+    assert await runtime._forum_post(POST, forums) is not None
+
+
+async def test_a_post_discord_says_is_gone_is_remembered():
+    runtime = make_runtime([forum_row()])
+    runtime.discord.channel = AsyncMock(side_effect=DiscordRESTError(404, "gone"))
+
+    assert await runtime._forum_post(POST, {FORUM: CHANNELS[FORUM]}) is None
+    assert runtime.forum_parents[POST] is None
+
+
+async def test_a_failure_notice_for_a_wake_about_the_forum_is_skipped():
+    runtime = make_runtime([forum_row()])
+
+    assert await runtime._failure_notice_channel(wake_batch(FORUM)) is None
+
+
+async def test_a_failure_notice_skips_a_forum_discord_will_not_type():
+    # The forum's row carries no flag and Discord will not say what it is:
+    # it is not a destination, and the plain channel is.
+    runtime = make_runtime(
+        [
+            forum_row(is_forum=False),
+            EnabledChannel(channel_id=TEXT, watch_addendum=""),
+        ],
+        discord_errors={FORUM},
+    )
+
+    assert await runtime._failure_notice_channel(wake_batch(FORUM)) == TEXT
+
+
+async def test_a_failure_notice_never_goes_to_a_flagged_forum_even_if_listed_first():
+    runtime = make_runtime(
+        [forum_row(), EnabledChannel(channel_id=TEXT, watch_addendum="")]
+    )
+
+    assert await runtime._failure_notice_channel(wake_batch(TEXT_THREAD)) == TEXT
+
+
+async def test_the_beacon_keeps_the_forum_posts_capability_set_while_running():
+    redis = SimpleNamespace(set=AsyncMock())
+    stop = asyncio.Event()
+    beacon = CapabilityBeacon(redis, ttl_seconds=30, refresh_seconds=0.01)
+
+    task = asyncio.create_task(beacon.run(stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await asyncio.wait_for(task, 1)
+
+    assert redis.set.await_count >= 2
+    call = redis.set.await_args
+    assert (
+        call.args[0]
+        == FORUM_POSTS_CAPABILITY_KEY
+        == ("proactive:v1:capability:forum-posts")
+    )
+    assert call.kwargs["ex"] == 30
+
+
+def _main_runtime_module():
+    """The worker as it was before forum support, from git main."""
+    try:
+        source = subprocess.check_output(
+            ["git", "show", "main:src/proactive_agent/runtime.py"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("git main is not available")
+    if "FORUM_CHANNEL_TYPES" in source:
+        pytest.skip("main already supports forums")
+    module = types.ModuleType("proactive_agent._main_runtime")
+    module.__dict__["__builtins__"] = __builtins__
+    sys.modules[module.__name__] = module
+    exec(compile(source, "main:runtime.py", "exec"), module.__dict__)  # noqa: S102
+    return module
+
+
+async def test_an_old_worker_never_sees_a_forum_and_answers_no_post():
+    # New application, old worker: the old worker does not ask for forum
+    # rows, so the application leaves the forum's row out. Even a post wake
+    # reaching it (the bot sends none without the capability key) is
+    # answered nowhere: not in the post, not in the forum.
+    old = _main_runtime_module()
+    engine = FakeEngine(respond_in=(POST, FORUM))
+    runtime = make_runtime(
+        [EnabledChannel(channel_id=TEXT, watch_addendum="")], engine=engine
+    )
+    runtime._persist_instructions = old.GuildRuntime._persist_instructions.__get__(
+        runtime
+    )
+
+    await old.GuildRuntime.process(runtime, wake_batch(POST))
+
+    assert FORUM not in engine.seen["enabled"]
+    assert POST not in engine.seen["enabled"]
+    runtime.discord.send_message.assert_not_awaited()
