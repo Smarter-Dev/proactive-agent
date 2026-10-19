@@ -24,7 +24,7 @@ from proactive_agent.environment import (
     WakeActions,
 )
 from proactive_agent.types import ActivationResult
-from proactive_agent.usage_meter import wake_meter
+from proactive_agent.usage_meter import UsageMeter, wake_meter
 
 SKIM_SYSTEM_PROMPT = """\
 You skim Discord transcripts for a chat agent. Summarize what is happening
@@ -47,8 +47,13 @@ class SkimRunner:
             self.model, output_type=str, system_prompt=SKIM_SYSTEM_PROMPT
         )
 
-    async def skim(self, transcript: str) -> tuple[str, dict]:
-        result = await self._agent.run(transcript)
+    async def skim(
+        self, transcript: str, meter: UsageMeter | None = None
+    ) -> tuple[str, dict]:
+        """The skim and its usage. With *meter*, every response the run gets
+        lands there too, so a skim that raises still shows what it was billed."""
+        metered_run = {} if meter is None else {"model": meter.wrap(self._agent.model)}
+        result = await self._agent.run(transcript, **metered_run)
         return result.output, usage_dict(result.usage, result.new_messages())
 
 
@@ -134,7 +139,15 @@ class AgentEngine:
         actions = WakeActions()
 
         async def skim_transcript(transcript: str) -> str:
-            text, usage = await self.skim.skim(transcript)
+            meter = UsageMeter()
+            try:
+                text, usage = await self.skim.skim(transcript, meter=meter)
+            except BaseException:
+                # A skim that failed (its tool hands the error back to the
+                # agent and the wake goes on) was billed for what it got.
+                for spent in meter.usage_by_model().values():
+                    _merge_usage(usage_by_model, self.skim_model_id, spent)
+                raise
             _merge_usage(usage_by_model, self.skim_model_id, usage)
             return text
 
