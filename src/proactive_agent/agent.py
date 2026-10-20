@@ -159,6 +159,10 @@ class AgentDeps:
     # a refusal for one that is unknown or switched off. None means there
     # are no recipes here (replay evals).
     open_recipe: Callable[[str], Awaitable[str]] | None = None
+    # Reads one channel's details by id (#278): its description, a forum's
+    # guidelines and tags, and a thread's or post's parent too, or a refusal
+    # for a channel out of reach. None means there are none (replay evals).
+    channel_details: Callable[[str], Awaitable[str]] | None = None
     # Environments already resolved from a callable provider this wake; in
     # production the provider hits Discord REST, so each channel is fetched
     # at most once no matter how many tools read it.
@@ -367,7 +371,7 @@ channels and earlier wakes.
 Every tool that reads from or acts in a channel requires a `channel_id`. Your
 wake brief's WATCH INSTRUCTIONS BY CHANNEL section lists every enabled
 channel with its channel_id — that is the complete set of channels you may
-inspect or act in; the budget-free list_channels tool lists it on demand. Never guess another id or attempt to access a channel
+inspect or act in; the budget-free list_channels tool lists it on demand, and the budget-free channel_details tool reads one's description (a forum's guidelines) when you need it. Never guess another id or attempt to access a channel
 outside that set. Notifications and watch instructions are labeled by channel;
 keep each conversation and watch instruction routed to its named channel.
 
@@ -652,6 +656,17 @@ def build_kimi_agent(
         """List every channel you are enabled in, with its channel_id. Free —
         never spends your tool budget."""
         return render_channel_list(ctx.deps.enabled_channels)
+
+    @agent.tool
+    @tool_errors_returned
+    async def channel_details(ctx: RunContext[AgentDeps], channel_id: str) -> str:
+        """Read one channel's details by its channel_id: its kind and full
+        description, or for a forum its guidelines and tags. A thread or
+        forum post comes with its parent channel's details too. Free —
+        never spends your tool budget."""
+        if ctx.deps.channel_details is None:
+            return "Channel details are not available here."
+        return await ctx.deps.channel_details(channel_id)
 
     # Parity tools (web search, code run, …) register here; in replay evals
     # the Discord/API-bound ones are stubbed by the caller.

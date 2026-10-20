@@ -116,6 +116,79 @@ def forum_post_label(post: dict, forum: dict, blocked_users=None) -> str:
     return f"{title} (post in forum #{forum_name}{tag_text})"
 
 
+# channel_details (#278): a channel's own text, read on demand. Discord
+# allows a 4,096-character forum guideline; past this it is cut, and says so.
+CHANNEL_TEXT_MAX_CHARS = 4_000
+CHANNEL_KINDS = {
+    0: "text channel",
+    2: "voice channel",
+    5: "announcement channel",
+    10: "announcement thread",
+    11: "thread",
+    12: "private thread",
+    13: "stage channel",
+    15: "forum",
+    16: "media channel",
+}
+
+
+def _capped(text: str | None) -> str:
+    text = (text or "").strip()
+    if len(text) <= CHANNEL_TEXT_MAX_CHARS:
+        return text
+    cut = len(text) - CHANNEL_TEXT_MAX_CHARS
+    return f"{text[:CHANNEL_TEXT_MAX_CHARS]}\n[cut here: {cut} more characters]"
+
+
+def _tag_names(forum: dict, tag_ids=None) -> list[str]:
+    names = {
+        str(tag.get("id")): tag.get("name") for tag in forum.get("available_tags") or ()
+    }
+    ids = names if tag_ids is None else [str(tag_id) for tag_id in tag_ids]
+    return [names[tag_id] for tag_id in ids if names.get(tag_id)]
+
+
+def _channel_detail_lines(channel: dict, parent: dict | None, blocked_users) -> str:
+    kind = channel.get("type")
+    in_forum = parent is not None and parent.get("type") in FORUM_CHANNEL_TYPES
+    name = channel.get("name") or channel.get("id")
+    owner_id = channel.get("owner_id")
+    if (
+        kind in THREAD_CHANNEL_TYPES
+        and owner_id is not None
+        and blocked_users is not None
+        and blocked_users.is_blocked(owner_id, channel.get("id"))
+    ):
+        name = HIDDEN_POST_TITLE
+    label = "forum post" if in_forum else CHANNEL_KINDS.get(kind, "channel")
+    lines = [f"#{name} (channel_id {channel.get('id')}): {label}"]
+    if kind in FORUM_CHANNEL_TYPES:
+        guidelines = _capped(channel.get("topic"))
+        lines.append(f"Guidelines:\n{guidelines}" if guidelines else "Guidelines: none")
+        lines.append(f"Tags: {', '.join(_tag_names(channel)) or 'none'}")
+    elif in_forum:
+        tags = _tag_names(parent, channel.get("applied_tags") or ())
+        lines.append(f"Tags: {', '.join(tags) or 'none'}")
+    elif kind not in THREAD_CHANNEL_TYPES:
+        description = _capped(channel.get("topic"))
+        lines.append(
+            f"Description:\n{description}" if description else "Description: none"
+        )
+    return "\n".join(lines)
+
+
+def channel_details_text(
+    channel: dict, parent: dict | None = None, blocked_users=None
+) -> str:
+    """What channel_details returns: the channel, then its parent if any,
+    without opted-out members' ids."""
+    text = _channel_detail_lines(channel, parent, blocked_users)
+    if parent is not None:
+        heading = "In forum" if parent.get("type") in FORUM_CHANNEL_TYPES else "In"
+        text += f"\n\n{heading}:\n" + _channel_detail_lines(parent, None, blocked_users)
+    return scrub_blocked_ids(text, blocked_users)
+
+
 def failure_notice_text(error_type: str) -> str:
     """The single message a guild sees when a wake is given up on.
 
@@ -264,9 +337,12 @@ class GuildRuntime:
         # An enabled forum's posts are the channels; the agent never acts in
         # the forum itself, and its watch instructions are every post's.
         forums: dict[str, dict] = {}
+        # Every enabled row's channel as fetched, for channel_details.
+        fetched_channels: dict[str, dict] = {}
         notifications = self._without_blocked(batch.notifications)
         for row in enabled_rows:
             channel = await self.discord.channel(row.channel_id)
+            fetched_channels[row.channel_id] = channel
             channel_name = channel.get("name") or row.channel_id
             if row.is_forum or channel.get("type") in FORUM_CHANNEL_TYPES:
                 forums[row.channel_id] = channel
@@ -360,6 +436,11 @@ class GuildRuntime:
             # like the memory block, it reaches the model without their id.
             return scrub_blocked_ids(format_opened_recipe(recipe), self.blocked_users)
 
+        async def channel_details(channel_id: str) -> str:
+            return await self._channel_details(
+                str(channel_id).strip(), enabled_channels, forums, fetched_channels
+            )
+
         async def channel_envs(channel_id: str) -> ChannelEnvironment:
             messages = await self.discord.channel_history(
                 channel_id,
@@ -409,6 +490,7 @@ class GuildRuntime:
                 request_mode=request_mode,
                 drain_notifications=drain_notifications,
                 open_recipe=open_recipe,
+                channel_details=channel_details,
                 **kwargs,
             )
 
@@ -815,6 +897,48 @@ class GuildRuntime:
                     forum_id = str(parent_id)
             self._remember_forum_parent(channel_id, forum_id)
         return self.forum_parents[channel_id], post
+
+    async def _channel_details(
+        self,
+        channel_id: str,
+        enabled_channels: dict[str, str],
+        forums: dict[str, dict],
+        fetched: dict[str, dict],
+    ) -> str:
+        """channel_details for one id: an enabled channel or forum, or a
+        thread or post under one that is not switched off on its own, with
+        its parent. Anything else is refused, so the bot's token reads no
+        channel the agent is not watching."""
+        refusal = (
+            f"Channel {channel_id} is not one you can read: only the channels "
+            "you are enabled in, their threads and posts, and their parents."
+        )
+        enabled = channel_id in enabled_channels or channel_id in forums
+        try:
+            channel = fetched.get(channel_id) or forums.get(channel_id)
+            if channel is None:
+                channel = await self.discord.channel(channel_id)
+        except DiscordRESTError:
+            return refusal
+        parent_id = str(channel.get("parent_id") or "")
+        is_thread = channel.get("type") in THREAD_CHANNEL_TYPES and parent_id
+        if not enabled:
+            if not is_thread or not (
+                parent_id in enabled_channels or parent_id in forums
+            ):
+                return refusal
+            own = await self.api.get_channel_settings(self.guild_id, channel_id)
+            if own is not None and not own.get("enabled"):
+                return refusal
+        parent = None
+        if is_thread:
+            parent = fetched.get(parent_id) or forums.get(parent_id)
+            if parent is None:
+                try:
+                    parent = await self.discord.channel(parent_id)
+                except DiscordRESTError:
+                    parent = None
+        return channel_details_text(channel, parent, self.blocked_users)
 
     def _remember_forum_parent(self, channel_id: str, forum_id: str | None) -> None:
         self.forum_parents[channel_id] = forum_id
