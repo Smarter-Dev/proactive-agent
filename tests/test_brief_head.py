@@ -76,11 +76,12 @@ def text_row(channel_id: str = TEXT, text: str = "watch rust news") -> EnabledCh
     return EnabledChannel(channel_id=channel_id, watch_addendum=addendum(text))
 
 
-def list_runtime(rows, script=None):
+def list_runtime(rows, script=None, *, redis_client=None, api=None):
     """The real tool loop over these enabled rows; ``rows`` can change
-    between wakes."""
-    redis_client = fakeredis.aioredis.FakeRedis(decode_responses=False)
-    api = RecipeAPI()
+    between wakes. Pass another runtime's ``redis_client`` and ``api`` to
+    start over the same stores, as after a restart."""
+    redis_client = redis_client or fakeredis.aioredis.FakeRedis(decode_responses=False)
+    api = api or RecipeAPI()
     api.rows = list(rows)
 
     async def list_enabled_channels(_guild_id):
@@ -210,6 +211,44 @@ async def test_the_whole_head_comes_back_after_an_idle_fold_as_it_is_now():
         brief, CHANNEL_LIST_INTRO
     )
     assert CHANNEL_CHANGES_INTRO not in brief
+    assert "YOUR MEMORY (refreshed at most hourly):" in brief
+    await writer.close()
+
+
+async def test_after_a_restart_the_changes_are_against_the_stored_history():
+    runtime, writer, api = list_runtime([text_row(), forum_row()])
+    redis_client = runtime.redis
+    await runtime.process(wake_batch(TEXT))
+    await writer.close()  # the history is in the store
+
+    # A restart: a new runtime over the same stores, nothing kept in memory.
+    # What the agent was told is read from the history it loads, which is
+    # exactly what the model is sent, so the changes are against that.
+    rows = [*api.rows, text_row(RANDOM, "watch for memes")]
+    restarted, writer, _ = list_runtime(rows, redis_client=redis_client, api=api)
+    await restarted.process(wake_batch(TEXT))
+
+    first, second = briefs(restarted)
+    assert CHANNEL_LIST_INTRO in first
+    assert CHANNEL_LIST_INTRO not in second
+    assert block(second, CHANNEL_CHANGES_INTRO).split("\n")[1] == (
+        f"- new channel #random (channel_id={RANDOM})"
+    )
+    await writer.close()
+
+
+async def test_after_a_restart_that_lost_the_history_the_head_goes_whole():
+    runtime, writer, api = list_runtime([text_row(), forum_row()])
+    await runtime.process(wake_batch(TEXT))
+    await writer.close()
+
+    # The stored history is gone: nothing says what the agent was told.
+    api.durable.clear()
+    restarted, writer, _ = list_runtime(api.rows, api=api)
+    await restarted.process(wake_batch(TEXT))
+
+    (brief,) = briefs(restarted)
+    assert CHANNEL_LIST_INTRO in brief
     assert "YOUR MEMORY (refreshed at most hourly):" in brief
     await writer.close()
 
