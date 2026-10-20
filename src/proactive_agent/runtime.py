@@ -19,7 +19,12 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from proactive_agent.agent import OPERATING_POLICY_BRIEF, strip_claude_thinking
+from proactive_agent.agent import (
+    OPERATING_POLICY_BRIEF,
+    RECIPE_CHANNEL_HINT,
+    strip_claude_thinking,
+)
+from proactive_agent.brief import Channels, memory_changes, recipe_changes, told
 from proactive_agent.contracts import ControlCommand, NotificationEnvelope
 from proactive_agent.discord import DiscordRESTError
 from proactive_agent.engine import AgentEngine, render_notifications
@@ -85,6 +90,7 @@ FAILURE_NOTICE_ERROR_LIMIT = 1500
 # types a forum's posts are. A post never moves, so its forum is remembered.
 FORUM_CHANNEL_TYPES = frozenset({15, 16})
 THREAD_CHANNEL_TYPES = frozenset({10, 11, 12})
+PRIVATE_THREAD_TYPE = 12
 FORUM_PARENT_CACHE_MAX_ENTRIES = 10_000
 
 
@@ -378,6 +384,11 @@ class GuildRuntime:
                 )
             instruction_stores[row.channel_id] = store
 
+        # The enabled rows' text channels, before any post joins them.
+        row_channels = dict(enabled_channels)
+        # Forum posts admitted this wake: post id -> label.
+        posts: dict[str, str] = {}
+
         async def admit_posts(channel_ids) -> None:
             for channel_id in dict.fromkeys(channel_ids):
                 if channel_id in enabled_channels or channel_id in forums:
@@ -387,6 +398,7 @@ class GuildRuntime:
                     continue
                 forum_id, label = admitted
                 enabled_channels[channel_id] = label
+                posts[channel_id] = label
                 instruction_stores[channel_id] = instruction_stores[forum_id]
 
         await admit_posts(
@@ -425,14 +437,23 @@ class GuildRuntime:
         # The notices start the brief, the only place their markers are read
         # back; a list that failed to refresh is no evidence of a change.
         notices = recipe_notices(opened, self.recipe_listing) if listed else ""
-        preamble = "\n\n".join(
-            block
-            for block in (
-                scrub_blocked_ids(notices, self.blocked_users),
-                self.memory_block,
-                scrub_blocked_ids(self.recipe_block, self.blocked_users),
-            )
-            if block
+        # The head of the brief goes whole to a history without one, and as
+        # changes otherwise (#278); the recipe notices start both, where
+        # they are read back, and the memory ends them.
+        told_so_far = told(self.engine.agent_runner.history)
+        current = Channels(row_channels, forums, dict(posts), instruction_stores)
+
+        def scrub(text: str) -> str:
+            return scrub_blocked_ids(text, self.blocked_users)
+
+        def preamble(*blocks: str) -> str:
+            return "\n\n".join(scrub(block) for block in (notices, *blocks) if block)
+
+        whole_preamble = preamble(current.whole(), self.recipe_block, self.memory_block)
+        changes_preamble = preamble(
+            current.changes(told_so_far),
+            recipe_changes(self.recipe_listing, told_so_far, scrub),
+            memory_changes(self.memory_block, told_so_far),
         )
 
         # Channels named in the enabled recipes the agent has read, at the
@@ -446,8 +467,8 @@ class GuildRuntime:
             if recipe is None:
                 return (
                     f'No recipe named "{name}" is available. Only this server\'s '
-                    "enabled recipes can be opened; RECIPES in your brief lists "
-                    "them."
+                    "enabled recipes can be opened; the RECIPES list in your brief "
+                    "names them."
                 )
             recipe_channels.update(
                 await self._postable(
@@ -470,9 +491,9 @@ class GuildRuntime:
         # Posts locked this wake, closed once its messages are sent.
         closing: dict[str, str] = {}
 
-        async def close_post(channel_id: str, reason: str) -> str:
+        async def close_post(channel_id: str, reason: str) -> tuple[bool, str]:
             if self.forum_parents.get(channel_id) not in forums:
-                return (
+                return False, (
                     f"Channel {channel_id} is not a post in a forum you are "
                     "enabled in; only those can be closed."
                 )
@@ -483,17 +504,17 @@ class GuildRuntime:
                 )
             except DiscordRESTError as error:
                 if error.status_code == 403:
-                    return (
+                    return False, (
                         f"Discord refused to lock post {channel_id}: the bot lacks "
                         "permission there (it needs Manage Threads). The post is "
                         "unchanged; tell a moderator instead."
                     )
-                return (
+                return False, (
                     f"Discord refused to lock post {channel_id} ({error}). The post "
                     "is unchanged."
                 )
             closing[channel_id] = reason
-            return (
+            return True, (
                 "Post locked: only moderators can post in it now. It closes once "
                 "this wake's messages are sent, so explain why in the post now if "
                 "you have not."
@@ -534,6 +555,18 @@ class GuildRuntime:
             await admit_posts([envelope.channel_id for envelope in arrived])
             return render_notifications(arrived, dropped)
 
+        async def admit_channel(channel_id: str) -> None:
+            await admit_posts([str(channel_id)])
+
+        def channel_list() -> str:
+            lines = Channels(row_channels, forums, posts, instruction_stores).lines()
+            return scrub_blocked_ids(
+                "\n".join(
+                    ["Your channels (channel_id at the end of each line):", *lines]
+                ),
+                self.blocked_users,
+            )
+
         def deps_factory(**kwargs):
             return ProactiveDeps(
                 guild_id=self.guild_id,
@@ -551,6 +584,8 @@ class GuildRuntime:
                 channel_details=channel_details,
                 recipe_channels=recipe_channels,
                 close_post=close_post,
+                admit_channel=admit_channel,
+                channel_list=channel_list,
                 **kwargs,
             )
 
@@ -563,7 +598,8 @@ class GuildRuntime:
                 enabled_channels=enabled_channels,
                 instruction_stores=instruction_stores,
                 channel_envs=channel_envs,
-                brief_preamble=preamble,
+                brief_preamble=changes_preamble,
+                full_brief_preamble=whole_preamble,
             )
         except BaseException:
             await self._record_failed_usage(batch)
@@ -1000,8 +1036,8 @@ class GuildRuntime:
         know about."""
         refusal = (
             f"Channel {channel_id} is not one you can read: only the channels "
-            "you are enabled in, their threads and posts, their parents, and "
-            "channels your recipes name."
+            "you are enabled in, their public threads and posts, their "
+            f"parents, and channels your recipes name. {RECIPE_CHANNEL_HINT}"
         )
         enabled = (
             channel_id in enabled_channels
@@ -1017,8 +1053,12 @@ class GuildRuntime:
         parent_id = str(channel.get("parent_id") or "")
         is_thread = channel.get("type") in THREAD_CHANNEL_TYPES and parent_id
         if not enabled:
-            if not is_thread or not (
-                parent_id in enabled_channels or parent_id in forums
+            # A private thread under a watched channel is not the agent's to
+            # see; the bot sees them only through Manage Threads.
+            if (
+                not is_thread
+                or channel.get("type") == PRIVATE_THREAD_TYPE
+                or not (parent_id in enabled_channels or parent_id in forums)
             ):
                 return refusal
             own = await self.api.get_channel_settings(self.guild_id, channel_id)

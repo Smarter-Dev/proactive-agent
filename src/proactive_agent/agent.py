@@ -167,8 +167,14 @@ class AgentDeps:
     # there and read their details, but never watches them.
     recipe_channels: set[str] = field(default_factory=set)
     # Locks a forum post now and closes it after this wake's messages are
-    # sent (#278); a refusal for anything else. None means unavailable.
-    close_post: Callable[[str, str], Awaitable[str]] | None = None
+    # sent (#278): (locked, what to tell the agent). None means unavailable.
+    close_post: Callable[[str, str], Awaitable[tuple[bool, str]]] | None = None
+    # Adds a post of an enabled forum to enabled_channels when the agent
+    # names one no notification brought this wake (#278); None adds nothing.
+    admit_channel: Callable[[str], Awaitable[object]] | None = None
+    # The current channel list for list_channels, with forums and watch
+    # instructions (#278); None lists enabled_channels only.
+    channel_list: Callable[[], str] | None = None
     # Environments already resolved from a callable provider this wake; in
     # production the provider hits Discord REST, so each channel is fetched
     # at most once no matter how many tools read it.
@@ -229,7 +235,16 @@ async def fetch_channel_env(
     return resolved_channel_envs[channel_id]
 
 
-def disabled_channel_error(deps: AgentDeps, channel_id: str) -> str | None:
+# A recipe's channels count while its open_recipe result is in the history;
+# after a compaction folds it into the note, opening it again restores them.
+RECIPE_CHANNEL_HINT = (
+    "If an enabled recipe names this channel, open_recipe it again (free), then retry."
+)
+
+
+async def disabled_channel_error(deps: AgentDeps, channel_id: str) -> str | None:
+    if channel_id not in deps.enabled_channels and deps.admit_channel is not None:
+        await deps.admit_channel(channel_id)
     if channel_id not in deps.enabled_channels:
         return f"Channel {channel_id} is not enabled for the proactive bot."
     return None
@@ -374,12 +389,27 @@ messages. One guild-wide watcher system wakes you for activity across the
 channels where the proactive feature is enabled. Your history persists across
 channels and earlier wakes.
 
-Every tool that reads from or acts in a channel requires a `channel_id`. Your
-wake brief's WATCH INSTRUCTIONS BY CHANNEL section lists every enabled
-channel with its channel_id — that is the complete set of channels you may
-inspect or act in; the budget-free list_channels tool lists it on demand, and the budget-free channel_details tool reads one's description (a forum's guidelines) when you need it. A channel that an enabled recipe names by its id, once you have opened that recipe, is one you may also post to with send_channel_message and read with channel_details; you never watch it or read its messages. Never guess another id or attempt to access a channel
-outside that set. Notifications and watch instructions are labeled by channel;
-keep each conversation and watch instruction routed to its named channel.
+Each wake brief brings only what is new since your last wake. Your first wake,
+and the first after each compaction, also brings the whole picture: YOUR
+CHANNELS, the RECIPES list and YOUR MEMORY. In between, CHANNEL CHANGES,
+RECIPE LIST CHANGES and an updated YOUR MEMORY say what changed, and only when
+something did.
+
+Every tool that reads from or acts in a channel requires a `channel_id`. YOUR
+CHANNELS names every channel you may inspect or act in, with its channel_id
+and your watch instructions; CHANNEL CHANGES introduces a channel or forum
+post that is new to you and says when one is switched off. A forum's posts
+are each a channel of yours, and they share the forum's watch instructions; a
+post you were told about stays yours while its forum is on. The budget-free
+list_channels tool shows the current list on demand, and the budget-free
+channel_details tool reads one's description (a forum's guidelines) when you
+need it. A channel that an enabled recipe names by its id, once you have
+opened that recipe, is one you may also post to with send_channel_message and
+read with channel_details; you never watch it or read its messages. If such a
+post is refused, open_recipe that recipe again (free) and retry. Never guess
+another id or attempt to access a channel outside that set. Notifications and
+watch instructions are labeled by channel; keep each conversation and watch
+instruction routed to its named channel.
 
 Choosing not to respond is a first-class outcome: when nothing clears the bar,
 do nothing and say so in your final note. At most {max_sends} messages per
@@ -396,6 +426,15 @@ reaction.
 its only memory; set one in the relevant channel when you need a follow-up.
 - Call read_notifications before your final send to catch activity queued
 while you worked. It drains the guild-wide queue and costs no tool budget.
+
+EACH WAKE:
+- Act on the notifications per your policy (or deliberately don't).
+- Before you finish: the watcher will not wake you again except for direct
+engagement or activity it independently judges interesting. If anything in
+this wake deserves a follow-up you would otherwise never hear about — someone
+said they'd report back, a thread you want to see resolved, a topic worth
+catching — call set_watch_instruction now with a TTL. Then finish with a
+one-sentence note on what you did and why.
 
 TOOLS:
 - Anything on a release cycle — versions, release dates, prices, latest
@@ -437,7 +476,7 @@ def build_kimi_agent(
         ctx: RunContext[AgentDeps], channel_id: str, message_id: str
     ) -> str:
         """Fetch one channel message verbatim by its message id."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -457,7 +496,7 @@ def build_kimi_agent(
     ) -> str:
         """Pull the last `limit` channel messages, optionally before a given
         message id."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -474,7 +513,7 @@ def build_kimi_agent(
     ) -> str:
         """Have the fast watcher model skim the messages around an id,
         returning a summary with verbatim snippets and message/user ids."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -492,9 +531,9 @@ def build_kimi_agent(
         """Send a standalone message to the channel: one you are enabled in,
         or one an enabled recipe you opened names by its id."""
         if channel_id not in ctx.deps.recipe_channels and (
-            error := disabled_channel_error(ctx.deps, channel_id)
+            error := await disabled_channel_error(ctx.deps, channel_id)
         ):
-            return error
+            return f"{error} {RECIPE_CHANNEL_HINT}"
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
         if len(ctx.deps.actions.sent) >= MAX_SENDS_PER_WAKE:
@@ -517,7 +556,7 @@ def build_kimi_agent(
         content: str,
     ) -> str:
         """Reply to a specific channel message by id."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -547,7 +586,7 @@ def build_kimi_agent(
         emoji: str,
     ) -> str:
         """Add an emoji reaction to a channel message."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -569,7 +608,7 @@ def build_kimi_agent(
         """Add a TTL'd wake criterion for the stateless watcher (e.g. "watch
         for tech news questions", 60 minutes). The only way a follow-up gets
         watched for."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -590,7 +629,7 @@ def build_kimi_agent(
         ctx: RunContext[AgentDeps], channel_id: str, instruction_id: str
     ) -> str:
         """Remove one of your watch instructions by its id (e.g. "w1")."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -605,7 +644,7 @@ def build_kimi_agent(
         ctx: RunContext[AgentDeps], channel_id: str
     ) -> str:
         """List your active watch instructions with their ids and expiries."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -638,7 +677,7 @@ def build_kimi_agent(
     ) -> str:
         """Switch one enabled channel between active (fast ingest) and
         passive (15-minute batch review) monitoring for the given duration."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -662,8 +701,10 @@ def build_kimi_agent(
     @agent.tool
     @tool_errors_returned
     async def list_channels(ctx: RunContext[AgentDeps]) -> str:
-        """List every channel you are enabled in, with its channel_id. Free —
-        never spends your tool budget."""
+        """List every channel you are enabled in, with its channel_id and your
+        watch instructions. Free — never spends your tool budget."""
+        if ctx.deps.channel_list is not None:
+            return ctx.deps.channel_list()
         return render_channel_list(ctx.deps.enabled_channels)
 
     @agent.tool
@@ -687,13 +728,17 @@ def build_kimi_agent(
         same wake: your messages are sent before the post closes, and no one
         can reply once it is locked. `reason` is a short note for the
         server's audit log."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if ctx.deps.close_post is None:
             return "Closing posts is not available here."
-        if not ctx.deps.budget.try_spend():
+        if ctx.deps.budget.used >= ctx.deps.budget.limit:
             return BUDGET_EXHAUSTED
-        return await ctx.deps.close_post(channel_id, reason)
+        # Only a post actually locked spends the action.
+        locked, result = await ctx.deps.close_post(channel_id, reason)
+        if locked:
+            ctx.deps.budget.try_spend()
+        return result
 
     # Parity tools (web search, code run, …) register here; in replay evals
     # the Discord/API-bound ones are stubbed by the caller.
@@ -734,7 +779,13 @@ still need it, copy it into this note verbatim, its `[RECIPE …]` line
 included; otherwise leave it out entirely and just mention its name, so you
 can open it again. Never summarise or paraphrase a recipe, and never copy only
 part of one. A recipe your brief said was edited, switched off or deleted
-since you opened it gets its name only."""
+since you opened it gets its name only.
+
+WHAT COMES BACK. Your next brief brings back, whole and as they are then, YOUR
+CHANNELS (every channel id, with your watch instructions), the RECIPES list
+(each enabled recipe's name and preview) and YOUR MEMORY. Do not copy those
+into this note. Do keep the ids of the channels and posts where something you
+care about is still going on."""
 
 
 async def self_compaction_summary(
@@ -1341,7 +1392,12 @@ class KimiAgentRunner:
     model_id: str | None = None
     unreported_usage: dict[str, dict] = field(default_factory=dict)
 
-    async def wake(self, brief: str, deps: AgentDeps) -> tuple[str, dict]:
+    async def wake(
+        self, brief: str | Callable[[list[ModelMessage]], str], deps: AgentDeps
+    ) -> tuple[str, dict]:
+        """One wake. ``brief`` may be a function of the history it is sent
+        with, after any compaction: the head of the brief goes whole only to
+        a history that no longer holds it (#278)."""
         usage = dict(ZERO_USAGE)
         model = getattr(self.agent, "model", None)
         model_id = self.model_id or getattr(model, "model_name", "unknown")
@@ -1355,7 +1411,11 @@ class KimiAgentRunner:
             raise
 
     async def _wake(
-        self, brief: str, deps: AgentDeps, usage: dict, model
+        self,
+        brief: str | Callable[[list[ModelMessage]], str],
+        deps: AgentDeps,
+        usage: dict,
+        model,
     ) -> tuple[str, dict]:
 
         async def summarize(messages: list[ModelMessage]) -> str:
@@ -1370,6 +1430,8 @@ class KimiAgentRunner:
             self.history = compacted
             if self.on_compacted is not None:
                 await self.on_compacted(compacted)
+        if callable(brief):
+            brief = brief(self.history)
         # The model is sent its own Claude thinking only; the stored history
         # keeps every block, so a model the agent moves back to finds its own.
         sent = drop_other_models_claude_thinking(

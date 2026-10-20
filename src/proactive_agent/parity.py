@@ -488,7 +488,7 @@ PARITY_TOOLS = [
 def _routed(tool):
     @functools.wraps(tool)
     async def wrapper(ctx, channel_id: str, *args, **kwargs):
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        if error := await disabled_channel_error(ctx.deps, channel_id):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED

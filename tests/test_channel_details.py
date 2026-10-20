@@ -19,6 +19,7 @@ from urllib.parse import unquote
 import fakeredis.aioredis
 import httpx
 from purge_fakes import CHANNEL, TARGET, batch
+from test_brief_head import list_runtime
 from test_forum_posts import (
     FakeEngine,
     addendum,
@@ -36,10 +37,14 @@ from test_recipes import (
     welcome,
 )
 
-from proactive_agent.agent import GUILD_AGENT_SYSTEM_PROMPT
+from proactive_agent.agent import (
+    GUILD_AGENT_SYSTEM_PROMPT,
+    RECIPE_CHANNEL_HINT,
+    memory_note_pair,
+)
 from proactive_agent.contracts import EnabledChannel
 from proactive_agent.discord import DiscordREST, DiscordRESTError
-from proactive_agent.recipes import recipe_channel_ids
+from proactive_agent.recipes import format_opened_recipe, recipe_channel_ids
 from proactive_agent.runtime import CHANNEL_TEXT_MAX_CHARS
 
 GUILD = "333333333333333333"
@@ -49,6 +54,7 @@ FORUM = "555555555555555555"
 POST = "666666666666666666"
 POST_OFF = "666666666666666668"
 THREAD = "777777777777777777"
+HIDDEN_THREAD = "777777777777777778"
 PRIVATE = "123123123123123123"
 PRIVATE_THREAD = "123123123123123124"
 MOD_CHAT = "720663441966366850"
@@ -84,6 +90,12 @@ CHANNELS = {
     },
     POST_OFF: {"id": POST_OFF, "name": "Leave me be", "type": 11, "parent_id": FORUM},
     THREAD: {"id": THREAD, "name": "side chat", "type": 11, "parent_id": TEXT},
+    HIDDEN_THREAD: {
+        "id": HIDDEN_THREAD,
+        "name": "mods only",
+        "type": 12,
+        "parent_id": TEXT,
+    },
     PRIVATE: {
         "id": PRIVATE,
         "name": "mods",
@@ -113,7 +125,9 @@ class ActingEngine(FakeEngine):
 
     async def wake(self, **kwargs):
         result = await super().wake(**kwargs)
-        self.outcomes.append(await self.act(self.last_deps))
+        outcome = await self.act(self.last_deps)
+        # close_post answers (locked, text).
+        self.outcomes.extend(outcome if isinstance(outcome, tuple) else [outcome])
         return result
 
 
@@ -219,6 +233,23 @@ async def test_a_thread_in_a_text_channel_shows_its_parents_details():
     )
 
 
+async def test_a_private_thread_under_a_watched_channel_is_refused():
+    details, _, _ = await details_for([text_row()])
+
+    result = await details(HIDDEN_THREAD)
+
+    assert result.startswith(f"Channel {HIDDEN_THREAD} is not one you can read")
+    assert "mods only" not in result
+
+
+async def test_a_watched_private_thread_can_be_read():
+    details, _, _ = await details_for([text_row(), text_row(HIDDEN_THREAD)])
+
+    assert (await details(HIDDEN_THREAD)).startswith(
+        f"#mods only (channel_id {HIDDEN_THREAD}): private thread"
+    )
+
+
 async def test_a_channel_that_is_not_enabled_is_refused():
     details, _, _ = await details_for([text_row()])
 
@@ -226,8 +257,8 @@ async def test_a_channel_that_is_not_enabled_is_refused():
         result = await details(channel_id)
         assert result == (
             f"Channel {channel_id} is not one you can read: only the channels "
-            "you are enabled in, their threads and posts, their parents, and "
-            "channels your recipes name."
+            "you are enabled in, their public threads and posts, their "
+            f"parents, and channels your recipes name. {RECIPE_CHANNEL_HINT}"
         )
         assert "Secret plans" not in result
         assert "mod" not in result
@@ -300,8 +331,9 @@ async def test_a_post_is_locked_now_and_closed_after_its_messages():
     await wake_for([forum_row()], engine=engine, calls=calls)
 
     assert engine.outcomes == [
+        True,
         "Post locked: only moderators can post in it now. It closes once this "
-        "wake's messages are sent, so explain why in the post now if you have not."
+        "wake's messages are sent, so explain why in the post now if you have not.",
     ]
     reason = "Off-topic: selling accounts."
     assert calls == [
@@ -321,8 +353,9 @@ async def test_only_a_post_of_an_enabled_forum_can_be_closed():
     await wake_for([text_row(), forum_row()], engine=engine, calls=calls)
 
     assert engine.outcomes == [
+        False,
         f"Channel {TEXT} is not a post in a forum you are enabled in; only those "
-        "can be closed."
+        "can be closed.",
     ]
     assert calls == []
 
@@ -339,8 +372,9 @@ async def test_a_lock_discord_refuses_says_why_and_closes_nothing():
     )
 
     assert engine.outcomes == [
+        False,
         f"Discord refused to lock post {POST}: the bot lacks permission there (it "
-        "needs Manage Threads). The post is unchanged; tell a moderator instead."
+        "needs Manage Threads). The post is unchanged; tell a moderator instead.",
     ]
     assert calls == [
         ("edit", POST, {"locked": True}, "Off-topic: selling accounts."),
@@ -426,7 +460,7 @@ async def test_the_tool_is_free_and_reaches_the_model():
     await writer.close()
 
 
-async def test_closing_spends_budget_and_a_text_channel_is_refused():
+async def test_a_refused_close_spends_no_budget():
     redis_client = fakeredis.aioredis.FakeRedis(decode_responses=False)
     seen: list = []
     runtime, writer = real_runtime(
@@ -445,7 +479,7 @@ async def test_closing_spends_budget_and_a_text_channel_is_refused():
         "those can be closed."
     )
     runtime.discord.edit_channel.assert_not_awaited()
-    assert runtime.engine.last_deps.budget.used == 1
+    assert runtime.engine.last_deps.budget.used == 0
     await writer.close()
 
 
@@ -543,7 +577,9 @@ async def test_an_edit_withdraws_the_old_texts_channels_until_reopened():
     (refused,) = tool_results(
         runtime.engine.agent_runner.history, "send_channel_message"
     )
-    assert refused == f"Channel {MOD_CHAT} is not enabled for the proactive bot."
+    assert refused == (
+        f"Channel {MOD_CHAT} is not enabled for the proactive bot. {RECIPE_CHANNEL_HINT}"
+    )
     assert sent_to(runtime) == []
     await writer.close()
 
@@ -562,7 +598,8 @@ async def test_posting_to_a_channel_neither_watched_nor_named_is_refused():
 
     history = runtime.engine.agent_runner.history
     assert tool_results(history, "send_channel_message") == [
-        f"Channel {ELSEWHERE} is not enabled for the proactive bot."
+        f"Channel {ELSEWHERE} is not enabled for the proactive bot. "
+        f"{RECIPE_CHANNEL_HINT}"
     ]
     (details,) = tool_results(history, "channel_details")
     assert details.startswith(f"Channel {ELSEWHERE} is not one you can read")
@@ -597,7 +634,7 @@ async def test_a_recipe_naming_something_other_than_this_servers_text_channel():
 
     results = tool_results(runtime.engine.agent_runner.history, "send_channel_message")
     assert results == [
-        f"Channel {cid} is not enabled for the proactive bot."
+        f"Channel {cid} is not enabled for the proactive bot. {RECIPE_CHANNEL_HINT}"
         for cid in (MOD_CHAT, VOICE, ELSEWHERE)
     ]
     assert sent_to(runtime) == []
@@ -626,3 +663,54 @@ def test_the_system_prompt_names_the_tools():
     prompt = " ".join(GUILD_AGENT_SYSTEM_PROMPT.split())
     assert "channel_details tool reads one's description" in prompt
     assert "A channel that an enabled recipe names by its id" in prompt
+    assert (
+        "If such a post is refused, open_recipe that recipe again (free) and retry."
+    ) in prompt
+
+
+async def test_after_a_fold_a_refused_recipe_channel_says_to_reopen_and_that_works():
+    runtime, writer, _ = recipe_runtime(
+        [
+            ("open_recipe", {"name": "Welcome"}),
+            None,
+            ("send_channel_message", {"channel_id": MOD_CHAT, "content": "FYI"}),
+            ("open_recipe", {"name": "Welcome"}),
+            ("send_channel_message", {"channel_id": MOD_CHAT, "content": "FYI"}),
+            None,
+        ]
+    )
+    await runtime.process(batch())
+    # A compaction kept the recipe in the note, word for word: no longer an
+    # open_recipe result, so its channels no longer count.
+    runtime.engine.agent_runner.history = memory_note_pair(
+        format_opened_recipe(welcome(text=ESCALATE_TEXT))
+    )
+
+    await runtime.process(batch())
+
+    history = runtime.engine.agent_runner.history
+    assert tool_results(history, "send_channel_message") == [
+        f"Channel {MOD_CHAT} is not enabled for the proactive bot. "
+        f"{RECIPE_CHANNEL_HINT}",
+        "Message sent.",
+    ]
+    assert sent_to(runtime) == [MOD_CHAT]
+    await writer.close()
+
+
+async def test_only_a_post_actually_locked_spends_budget():
+    refused = DiscordRESTError(403, "PATCH -> 403 (code 50013)")
+    for errors, spent in (([], 1), ([refused], 0)):
+        runtime, writer, _ = list_runtime(
+            [forum_row()],
+            script=[
+                ("close_and_lock_post", {"channel_id": POST, "reason": "spam"}),
+                None,
+            ],
+        )
+        runtime.discord.edit_channel = AsyncMock(side_effect=errors or None)
+
+        await runtime.process(wake_batch(POST))
+
+        assert runtime.engine.last_deps.budget.used == spent
+        await writer.close()

@@ -57,32 +57,38 @@ def format_opened_recipe(recipe: dict) -> str:
     )
 
 
-def render_recipe_block(listing: dict | None) -> str:
-    """The brief's list of enabled recipes; empty when there are none."""
+RECIPES_HEADING = "RECIPES ("
+
+
+def listed_recipes(listing: dict | None) -> tuple[list[tuple[str, str]], int]:
+    """The recipes the brief lists, as (name, "name: preview"), within its
+    limits, and how many more there are."""
     recipes = list((listing or {}).get("recipes") or ())
-    if not recipes:
-        return ""
-    lines: list[str] = []
+    listed: list[tuple[str, str]] = []
     used = 0
     for recipe in recipes[:LISTED_RECIPES_MAX]:
-        line = (
-            f"- {' '.join(str(recipe.get('name') or '').split())}: "
-            f"{recipe.get('preview') or ''}"
-        )
-        if lines and used + len(line) + 1 > LISTED_CHARS_MAX:
+        name = " ".join(str(recipe.get("name") or "").split())
+        item = f"{name}: {recipe.get('preview') or ''}"
+        if listed and used + len(item) + 3 > LISTED_CHARS_MAX:
             break
-        lines.append(line)
-        used += len(line) + 1
-    if len(lines) < len(recipes):
-        lines.append(
-            f"- …and {len(recipes) - len(lines)} more; ask by name with open_recipe."
-        )
-    listed = "\n".join(lines)
+        listed.append((name, item))
+        used += len(item) + 3
+    return listed, len(recipes) - len(listed)
+
+
+def render_recipe_block(listing: dict | None) -> str:
+    """The brief's list of enabled recipes; empty when there are none."""
+    listed, more = listed_recipes(listing)
+    if not listed:
+        return ""
+    lines = [f"- {item}" for _name, item in listed]
+    if more:
+        lines.append(f"- …and {more} more; ask by name with open_recipe.")
     return (
         "RECIPES (instructions this server's admins wrote for you; "
         'open_recipe("<name>") reads one whole and is free):\n'
-        f"{listed}\n"
-        "A preview only says when a recipe applies. Open the recipe before "
+        + "\n".join(lines)
+        + "\nA preview only says when a recipe applies. Open the recipe before "
         "you follow it."
     )
 
