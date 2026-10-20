@@ -40,17 +40,28 @@ from proactive_agent.keys import (
 )
 from proactive_agent.optout_gate import (
     SNOWFLAKE_PATTERN,
+    scrub_blocked_ids,
     scrub_history,
     scrub_memory,
 )
 from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
+from proactive_agent.recipes import (
+    format_opened_recipe,
+    opened_recipes,
+    recipe_notices,
+    render_recipe_block,
+)
 from proactive_agent.response_fitting import split_for_discord
 from proactive_agent.types import ActivationResult
 
 logger = logging.getLogger(__name__)
 
 MEMORY_REFRESH_SECONDS = 3600
+# The recipe list (#267) refreshes on the memory's cadence, and on every wake
+# while a recipe is open in the history, so an admin's edit is noticed at the
+# next wake.
+RECIPE_REFRESH_SECONDS = MEMORY_REFRESH_SECONDS
 # One round trip at wake start: the guild's purge epoch and the revision of
 # the v1 history snapshot (matched as text, never decoding the history).
 _STORE_STATE_LUA = """
@@ -228,6 +239,11 @@ class GuildRuntime:
     history_revision: int = 0
     memory_block: str = ""
     memory_refreshed_at: float = 0
+    # The guild's enabled recipes as last listed; None until a list call
+    # succeeds (an application without recipes lists none).
+    recipe_listing: dict | None = None
+    recipe_block: str = ""
+    recipes_refreshed_at: float = 0
     # The guild's purge-epoch value the in-RAM history was loaded under.
     purge_epoch: str | None = None
     store_synced: bool = False
@@ -310,6 +326,33 @@ class GuildRuntime:
                 await self.api.get_memory(self.guild_id), self.blocked_users
             )
             self.memory_refreshed_at = time.monotonic()
+        opened = opened_recipes(self.engine.agent_runner.history)
+        if (
+            opened
+            or not self.recipes_refreshed_at
+            or time.monotonic() - self.recipes_refreshed_at >= RECIPE_REFRESH_SECONDS
+        ):
+            await self._refresh_recipes()
+        preamble = "\n\n".join(
+            block
+            for block in (
+                self.memory_block,
+                scrub_blocked_ids(self.recipe_block, self.blocked_users),
+                recipe_notices(opened, self.recipe_listing),
+            )
+            if block
+        )
+
+        async def open_recipe(name: str) -> str:
+            recipe = await self.api.open_recipe(self.guild_id, name)
+            if recipe is None:
+                return (
+                    f'No recipe named "{name}" is available. Only the recipes '
+                    "listed under RECIPES in your brief can be opened."
+                )
+            # An admin's recipe can name a member who has since opted out;
+            # like the memory block, it reaches the model without their id.
+            return scrub_blocked_ids(format_opened_recipe(recipe), self.blocked_users)
 
         async def channel_envs(channel_id: str) -> ChannelEnvironment:
             messages = await self.discord.channel_history(
@@ -359,6 +402,7 @@ class GuildRuntime:
                 blocked_users=self.blocked_users,
                 request_mode=request_mode,
                 drain_notifications=drain_notifications,
+                open_recipe=open_recipe,
                 **kwargs,
             )
 
@@ -371,7 +415,7 @@ class GuildRuntime:
                 enabled_channels=enabled_channels,
                 instruction_stores=instruction_stores,
                 channel_envs=channel_envs,
-                brief_preamble=self.memory_block,
+                brief_preamble=preamble,
             )
         except BaseException:
             await self._record_failed_usage(batch)
@@ -390,6 +434,25 @@ class GuildRuntime:
         self.history_revision = snapshot.revision
         await self._record_usage(batch, result, responses)
         return result
+
+    async def _refresh_recipes(self) -> None:
+        """Fetch the recipe list; on failure keep the last one and carry on.
+
+        Recipes are an aid, never a reason to drop a wake. A 404 is an
+        application from before recipes: no recipes.
+        """
+        try:
+            listing = await self.api.list_recipes(self.guild_id)
+        except Exception as error:  # noqa: BLE001 — the wake goes on without
+            logger.warning(
+                "proactive recipe list failed guild=%s: %s",
+                self.guild_id,
+                type(error).__name__,
+            )
+            return
+        self.recipe_listing = listing if listing is not None else {"recipes": []}
+        self.recipe_block = render_recipe_block(self.recipe_listing)
+        self.recipes_refreshed_at = time.monotonic()
 
     async def report_failure(self, batch: WakeBatch, error_type: str) -> str | None:
         """Say in Discord that a wake was dropped, at most once per window.

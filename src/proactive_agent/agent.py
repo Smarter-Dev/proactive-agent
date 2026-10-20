@@ -39,6 +39,7 @@ from proactive_agent.environment import (
     WakeActions,
 )
 from proactive_agent.errors import exception_trace
+from proactive_agent.recipes import apply_recipe_keeps
 from proactive_agent.types import ProposedReaction, ProposedResponse
 from proactive_agent.usage_meter import UsageMeter, current_meter, metered, request_dict
 
@@ -155,6 +156,10 @@ class AgentDeps:
     # Drains the channel's notification queue mid-run (rendered text, marks
     # the covered messages consumed); None means nothing queues mid-run.
     drain_notifications: Callable[[], str | Awaitable[str]] | None = None
+    # Opens one of the guild's recipes by name (#267): the recipe whole, or
+    # a refusal for one that is unknown or switched off. None means there
+    # are no recipes here (replay evals).
+    open_recipe: Callable[[str], Awaitable[str]] | None = None
     # Environments already resolved from a callable provider this wake; in
     # production the provider hits Discord REST, so each channel is fetched
     # at most once no matter how many tools read it.
@@ -634,6 +639,16 @@ def build_kimi_agent(
 
     @agent.tool
     @tool_errors_returned
+    async def open_recipe(ctx: RunContext[AgentDeps], name: str) -> str:
+        """Open one of this server's recipes by its name (listed under RECIPES
+        in your brief) and read its full instructions. Free — never spends
+        your tool budget."""
+        if ctx.deps.open_recipe is None:
+            return "There are no recipes here."
+        return await ctx.deps.open_recipe(name)
+
+    @agent.tool
+    @tool_errors_returned
     async def list_channels(ctx: RunContext[AgentDeps]) -> str:
         """List every channel you are enabled in, with its channel_id. Free —
         never spends your tool budget."""
@@ -669,7 +684,19 @@ promised <456…:kyra> you would …") — never quote
 anyone in a way that could later be misread as a different user speaking, and
 never leave a fact floating without its person and channel. Be specific:
 names, channel ids and message ids you may need again. This note is for you
-alone."""
+alone.
+
+RECIPES. A recipe is a set of instructions this server's admins wrote, which
+you read with open_recipe; its result starts with a `[RECIPE id=… revision=…]`
+line. Every recipe opened above, or kept whole in an earlier note, is all or
+nothing. For each one, do exactly one of these:
+- if you will still need its instructions, write the line
+  `KEEP RECIPE: <the recipe's exact name>` and nothing else about its
+  content: its full text is attached to your note word for word for you;
+- otherwise leave its instructions out entirely and write only its name, so
+  you can open it again.
+Never copy, paraphrase, summarize or partly quote a recipe's instructions,
+and never write a `[RECIPE …]` line yourself."""
 
 
 async def self_compaction_summary(
@@ -702,7 +729,9 @@ async def self_compaction_summary(
         if owner is not None:
             owner.merge(meter)
         raise
-    return result.output, usage_dict(result.usage, result.new_messages())
+    # Each recipe it opened is all or nothing: attached whole, or named only.
+    note = apply_recipe_keeps(str(result.output), messages)
+    return note, usage_dict(result.usage, result.new_messages())
 
 
 def _is_claude_thinking(part: ModelResponsePart) -> bool:
@@ -919,6 +948,9 @@ what the other person said or decided without attributing anything to the
 person being forgotten.
 - Do not say that anyone was removed, that a purge happened, or that anything
 is missing.
+- Recipes: write no KEEP RECIPE line in this note. Name each recipe you
+opened and nothing more; you can open it again. A recipe's text may mention
+this person, and a copy with them cut out would be a partial copy.
 
 Normal compaction rules:
 {compaction_rules}"""
@@ -1125,7 +1157,8 @@ async def privacy_compaction_summary(
         attempts += 1
         result = await _run_with_timeout(compaction_agent, prompt, history)
         add_usage(usage, usage_dict(result.usage, result.new_messages()))
-        note = str(result.output)
+        # No recipe text survives a purge: its names only (see the prompt).
+        note = apply_recipe_keeps(str(result.output), messages, allow_keep=False)
         if not note.strip():
             raise PrivacyCompactionError("empty_output")
         if user_id in note:
