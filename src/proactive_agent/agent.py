@@ -39,7 +39,6 @@ from proactive_agent.environment import (
     WakeActions,
 )
 from proactive_agent.errors import exception_trace
-from proactive_agent.recipes import MEMORY_NOTE_PREFIX, apply_recipe_keeps
 from proactive_agent.types import ProposedReaction, ProposedResponse
 from proactive_agent.usage_meter import UsageMeter, current_meter, metered, request_dict
 
@@ -687,18 +686,13 @@ names, channel ids and message ids you may need again. This note is for you
 alone.
 
 RECIPES. A recipe is a set of instructions this server's admins wrote, which
-you read with open_recipe; its result starts with a `[RECIPE id=… revision=…]`
-line. Every recipe opened above, or kept whole in an earlier note, is all or
-nothing. For each one, do exactly one of these:
-- if you will still need its instructions, write the line
-  `KEEP RECIPE: <the recipe's exact name>` and nothing else about its
-  content: its full text is attached to your note word for word for you;
-- otherwise leave its instructions out entirely and write only its name, so
-  you can open it again.
-A recipe your brief said was edited, switched off or deleted since you opened
-it is kept by name only, whatever you write; open it again for the new text.
-Never copy, paraphrase, summarize or partly quote a recipe's instructions,
-and never write a `[RECIPE …]` line yourself."""
+you read with open_recipe; its text starts with a `[RECIPE id=… revision=…]`
+line. For each recipe you opened above, or that an earlier note kept: if you
+still need it, copy it into this note verbatim, its `[RECIPE …]` line
+included; otherwise leave it out entirely and just mention its name, so you
+can open it again. Never summarise or paraphrase a recipe, and never copy only
+part of one. A recipe your brief said was edited, switched off or deleted
+since you opened it gets its name only."""
 
 
 async def self_compaction_summary(
@@ -731,9 +725,7 @@ async def self_compaction_summary(
         if owner is not None:
             owner.merge(meter)
         raise
-    # Each recipe it opened is all or nothing: attached whole, or named only.
-    note = apply_recipe_keeps(str(result.output), messages)
-    return note, usage_dict(result.usage, result.new_messages())
+    return result.output, usage_dict(result.usage, result.new_messages())
 
 
 def _is_claude_thinking(part: ModelResponsePart) -> bool:
@@ -882,6 +874,9 @@ def memory_note_pair(summary: str) -> list[ModelMessage]:
     ]
 
 
+MEMORY_NOTE_PREFIX = "[COMPACTION MEMORY NOTE"
+
+
 def leading_note_pair(history: list[ModelMessage]) -> list[ModelMessage] | None:
     """The memory-note pair a compaction put at the head of the history."""
     if len(history) < 2:
@@ -947,9 +942,9 @@ what the other person said or decided without attributing anything to the
 person being forgotten.
 - Do not say that anyone was removed, that a purge happened, or that anything
 is missing.
-- Recipes: write no KEEP RECIPE line in this note. Name each recipe you
-opened and nothing more; you can open it again. A recipe's text may mention
-this person, and a copy with them cut out would be a partial copy.
+- Recipes: keep them as names only. Copy no recipe's text into this note,
+not even part of it; you can open it again. A recipe's text may mention this
+person, and a copy with them cut out would be a partial copy.
 
 Normal compaction rules:
 {compaction_rules}"""
@@ -1156,8 +1151,7 @@ async def privacy_compaction_summary(
         attempts += 1
         result = await _run_with_timeout(compaction_agent, prompt, history)
         add_usage(usage, usage_dict(result.usage, result.new_messages()))
-        # No recipe text survives a purge: its names only (see the prompt).
-        note = apply_recipe_keeps(str(result.output), messages, allow_keep=False)
+        note = str(result.output)
         if not note.strip():
             raise PrivacyCompactionError("empty_output")
         if user_id in note:
