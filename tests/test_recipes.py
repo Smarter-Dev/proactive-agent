@@ -371,9 +371,9 @@ async def test_open_recipe_refuses_a_switched_off_or_unknown_recipe():
     results = tool_results(runtime.engine.agent_runner.history, "open_recipe")
     assert results == [
         'No recipe named "Welcome" is available. Only this server\'s enabled '
-        "recipes can be opened; RECIPES in your brief lists them.",
+        "recipes can be opened; the RECIPES list in your brief names them.",
         'No recipe named "Nope" is available. Only this server\'s enabled '
-        "recipes can be opened; RECIPES in your brief lists them.",
+        "recipes can be opened; the RECIPES list in your brief names them.",
     ]
     await writer.close()
 
@@ -405,7 +405,9 @@ async def test_a_failed_list_keeps_the_last_one_and_the_wake_goes_on():
 
     await runtime.process(batch())
 
-    assert "- Welcome:" in brief_of(seen[1][0])
+    # The list it had stands: nothing is said gone.
+    assert "- Welcome:" in brief_of(seen[0][0])
+    assert "RECIPE LIST CHANGES" not in brief_of(seen[1][0])
     await writer.close()
 
 

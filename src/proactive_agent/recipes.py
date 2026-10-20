@@ -38,6 +38,8 @@ NOTICES_HEADING = "RECIPE CHANGES SINCE YOU OPENED THEM:"
 NOTICE_LINE = re.compile(
     rf"^- .* \[RECIPE (?:EDITED id=({_UUID}) revision=(\d+)|GONE id=({_UUID}))\]$"
 )
+# A Discord id, as a recipe names a channel (#278).
+CHANNEL_ID = re.compile(r"(?<!\d)\d{17,20}(?!\d)")
 # The brief's list, which every stored brief repeats.
 LISTED_RECIPES_MAX = 50
 LISTED_CHARS_MAX = 15_000
@@ -55,32 +57,38 @@ def format_opened_recipe(recipe: dict) -> str:
     )
 
 
-def render_recipe_block(listing: dict | None) -> str:
-    """The brief's list of enabled recipes; empty when there are none."""
+RECIPES_HEADING = "RECIPES ("
+
+
+def listed_recipes(listing: dict | None) -> tuple[list[tuple[str, str]], int]:
+    """The recipes the brief lists, as (name, "name: preview"), within its
+    limits, and how many more there are."""
     recipes = list((listing or {}).get("recipes") or ())
-    if not recipes:
-        return ""
-    lines: list[str] = []
+    listed: list[tuple[str, str]] = []
     used = 0
     for recipe in recipes[:LISTED_RECIPES_MAX]:
-        line = (
-            f"- {' '.join(str(recipe.get('name') or '').split())}: "
-            f"{recipe.get('preview') or ''}"
-        )
-        if lines and used + len(line) + 1 > LISTED_CHARS_MAX:
+        name = " ".join(str(recipe.get("name") or "").split())
+        item = f"{name}: {recipe.get('preview') or ''}"
+        if listed and used + len(item) + 3 > LISTED_CHARS_MAX:
             break
-        lines.append(line)
-        used += len(line) + 1
-    if len(lines) < len(recipes):
-        lines.append(
-            f"- …and {len(recipes) - len(lines)} more; ask by name with open_recipe."
-        )
-    listed = "\n".join(lines)
+        listed.append((name, item))
+        used += len(item) + 3
+    return listed, len(recipes) - len(listed)
+
+
+def render_recipe_block(listing: dict | None) -> str:
+    """The brief's list of enabled recipes; empty when there are none."""
+    listed, more = listed_recipes(listing)
+    if not listed:
+        return ""
+    lines = [f"- {item}" for _name, item in listed]
+    if more:
+        lines.append(f"- …and {more} more; ask by name with open_recipe.")
     return (
         "RECIPES (instructions this server's admins wrote for you; "
         'open_recipe("<name>") reads one whole and is free):\n'
-        f"{listed}\n"
-        "A preview only says when a recipe applies. Open the recipe before "
+        + "\n".join(lines)
+        + "\nA preview only says when a recipe applies. Open the recipe before "
         "you follow it."
     )
 
@@ -160,3 +168,42 @@ def recipe_notices(opened: dict[str, tuple[int, str]], listing: dict | None) -> 
     if not lines:
         return ""
     return f"{NOTICES_HEADING}\n" + "\n".join(lines)
+
+
+def channel_ids_in(text: str) -> list[str]:
+    """The Discord ids a recipe's text names, in order, once each."""
+    return list(dict.fromkeys(CHANNEL_ID.findall(text)))
+
+
+def recipe_channel_ids(
+    messages: Iterable[ModelMessage], listing: dict | None
+) -> list[str]:
+    """The ids named in the enabled recipes the agent has read (#278).
+
+    Each listed preview, and each open_recipe result in the history whose
+    revision is still the listed one: an edit or a switch-off withdraws the
+    ids of the old text until the recipe is opened again.
+    """
+    if listing is None:
+        return []
+    current = {
+        str(recipe.get("id")).lower(): recipe for recipe in listing.get("recipes") or ()
+    }
+    ids: list[str] = []
+    for recipe in current.values():
+        ids += channel_ids_in(str(recipe.get("preview") or ""))
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if not (
+                isinstance(part, ToolReturnPart)
+                and part.tool_name == OPEN_RECIPE_TOOL
+                and isinstance(part.content, str)
+            ):
+                continue
+            match = HEADER.match(part.content)
+            recipe = current.get(match[1].lower()) if match else None
+            if recipe is not None and int(recipe.get("revision") or 0) == int(match[2]):
+                ids += channel_ids_in(part.content[match.end() :])
+    return list(dict.fromkeys(ids))

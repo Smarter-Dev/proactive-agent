@@ -17,6 +17,7 @@ from proactive_agent.agent import (
     add_usage,
     usage_dict,
 )
+from proactive_agent.brief import whole_head_sent
 from proactive_agent.contracts import NotificationEnvelope
 from proactive_agent.environment import (
     ChannelEnvironment,
@@ -86,6 +87,10 @@ def render_notifications(
     for notification in notifications:
         stamp = notification.created_at.astimezone(UTC).strftime("%H:%M")
         channel = notification.channel_name or notification.channel_id
+        if notification.channel_name and notification.channel_id:
+            # The brief lists the channels only now and then (#278); each
+            # notification says which id to act on.
+            channel = f"{channel}, channel_id={notification.channel_id}"
         channel_prefix = f"[#{channel}] " if channel else ""
         lines.append(
             f"{channel_prefix}[{stamp} UTC, {notification.kind}] {notification.body}"
@@ -93,18 +98,7 @@ def render_notifications(
     return "\n".join(lines)
 
 
-def build_wake_brief(
-    notifications: tuple[NotificationEnvelope, ...],
-    dropped: int,
-    *,
-    instruction_stores: dict[str, InstructionStore],
-    enabled_channels: dict[str, str],
-) -> str:
-    return f"""\
-{render_notifications(notifications, dropped)}
-
-{render_channel_instructions(instruction_stores, enabled_channels)}
-
+WAKE_GUIDANCE = """\
 A notification is a lead, not the full story — pull context with your tools
 when it isn't enough. Act per your policy (or deliberately don't).
 
@@ -114,6 +108,28 @@ deserves a follow-up you would otherwise never hear about — someone said
 they'd report back, a thread you want to see resolved, a topic worth
 catching — call set_watch_instruction now with a TTL. Then finish with a
 one-sentence note on what you did and why."""
+
+
+def build_wake_brief(
+    notifications: tuple[NotificationEnvelope, ...],
+    dropped: int,
+    *,
+    instruction_stores: dict[str, InstructionStore],
+    enabled_channels: dict[str, str],
+    notifications_only: bool = False,
+) -> str:
+    """The brief's notifications, then, unless ``notifications_only``, the
+    watch instructions and the closing guidance; the guild runtime has the
+    guidance in its system prompt and sends the instructions as they
+    change (#278)."""
+    if notifications_only:
+        return render_notifications(notifications, dropped)
+    return f"""\
+{render_notifications(notifications, dropped)}
+
+{render_channel_instructions(instruction_stores, enabled_channels)}
+
+{WAKE_GUIDANCE}"""
 
 
 @dataclass
@@ -134,7 +150,13 @@ class AgentEngine:
         instruction_stores: dict[str, InstructionStore],
         channel_envs: object | dict[str, ChannelEnvironment],
         brief_preamble: str = "",
+        full_brief_preamble: str | None = None,
     ) -> ActivationResult:
+        """``full_brief_preamble``, when given, is the whole head of the
+        brief (channels, recipes, memory) and ``brief_preamble`` only its
+        changes; the runner sends the whole head to a history that no longer
+        holds one (#278). Without it the brief lists every channel's watch
+        instructions and the closing guidance each wake."""
         usage_by_model: dict[str, dict] = {}
         actions = WakeActions()
 
@@ -162,14 +184,23 @@ class AgentEngine:
         if not isinstance(deps, AgentDeps):
             raise TypeError("deps_factory must return AgentDeps")
         self.last_deps = deps
-        brief = build_wake_brief(
+        rest = build_wake_brief(
             notifications,
             dropped,
             instruction_stores=instruction_stores,
             enabled_channels=enabled_channels,
+            notifications_only=full_brief_preamble is not None,
         )
-        if brief_preamble:
-            brief = f"{brief_preamble}\n\n{brief}"
+        brief: str | Callable = "\n\n".join(
+            block for block in (brief_preamble, rest) if block
+        )
+        if full_brief_preamble is not None:
+            short, full = brief, f"{full_brief_preamble}\n\n{rest}"
+
+            def brief_for(history) -> str:
+                return short if whole_head_sent(history) else full
+
+            brief = brief_for
         # The capabilities the agent's tools call bill to the wake's meter. A
         # wake that raises leaves their spend and its skims' with the runner,
         # whose own spend is already there, for the runtime to report.

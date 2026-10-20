@@ -13,6 +13,8 @@ from proactive_agent.optout_gate import scrub_blocked_ids
 from proactive_agent.types import BlockedMessage, ChannelMessage
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+# Discord's limit on an audit-log reason.
+AUDIT_LOG_REASON_MAX = 512
 
 
 class DiscordRESTError(Exception):
@@ -64,6 +66,21 @@ class DiscordREST:
 
     async def channel(self, channel_id: str) -> dict[str, Any]:
         return (await self._request("GET", f"/channels/{channel_id}")).json()
+
+    async def edit_channel(
+        self, channel_id: str, fields: dict[str, Any], *, reason: str | None = None
+    ) -> dict[str, Any]:
+        """PATCH a channel; ``reason`` goes to the server's audit log."""
+        headers = (
+            {"X-Audit-Log-Reason": quote(reason[:AUDIT_LOG_REASON_MAX], safe="")}
+            if reason
+            else {}
+        )
+        return (
+            await self._request(
+                "PATCH", f"/channels/{channel_id}", json=fields, headers=headers
+            )
+        ).json()
 
     async def fetch_message(
         self, channel_id: str, message_id: str, *, guild_id: str | None = None

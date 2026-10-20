@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -19,7 +20,12 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from proactive_agent.agent import OPERATING_POLICY_BRIEF, strip_claude_thinking
+from proactive_agent.agent import (
+    OPERATING_POLICY_BRIEF,
+    RECIPE_CHANNEL_HINT,
+    strip_claude_thinking,
+)
+from proactive_agent.brief import Channels, memory_changes, recipe_changes, told
 from proactive_agent.contracts import ControlCommand, NotificationEnvelope
 from proactive_agent.discord import DiscordRESTError
 from proactive_agent.engine import AgentEngine, render_notifications
@@ -47,8 +53,10 @@ from proactive_agent.optout_gate import (
 from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
 from proactive_agent.recipes import (
+    channel_ids_in,
     format_opened_recipe,
     opened_recipes,
+    recipe_channel_ids,
     recipe_notices,
     render_recipe_block,
 )
@@ -83,6 +91,7 @@ FAILURE_NOTICE_ERROR_LIMIT = 1500
 # types a forum's posts are. A post never moves, so its forum is remembered.
 FORUM_CHANNEL_TYPES = frozenset({15, 16})
 THREAD_CHANNEL_TYPES = frozenset({10, 11, 12})
+PRIVATE_THREAD_TYPE = 12
 FORUM_PARENT_CACHE_MAX_ENTRIES = 10_000
 
 
@@ -114,6 +123,85 @@ def forum_post_label(post: dict, forum: dict, blocked_users=None) -> str:
         title = HIDDEN_POST_TITLE
     forum_name = forum.get("name") or forum.get("id") or "forum"
     return f"{title} (post in forum #{forum_name}{tag_text})"
+
+
+# channel_details (#278): a channel's own text, read on demand. Discord
+# allows a 4,096-character forum guideline; past this it is cut, and says so.
+CHANNEL_TEXT_MAX_CHARS = 4_000
+CHANNEL_KINDS = {
+    0: "text channel",
+    2: "voice channel",
+    5: "announcement channel",
+    10: "announcement thread",
+    11: "thread",
+    12: "private thread",
+    13: "stage channel",
+    15: "forum",
+    16: "media channel",
+}
+
+
+def _capped(text: str | None) -> str:
+    text = (text or "").strip()
+    if len(text) <= CHANNEL_TEXT_MAX_CHARS:
+        return text
+    cut = len(text) - CHANNEL_TEXT_MAX_CHARS
+    return f"{text[:CHANNEL_TEXT_MAX_CHARS]}\n[cut here: {cut} more characters]"
+
+
+def _tag_names(forum: dict, tag_ids=None) -> list[str]:
+    names = {
+        str(tag.get("id")): tag.get("name") for tag in forum.get("available_tags") or ()
+    }
+    ids = names if tag_ids is None else [str(tag_id) for tag_id in tag_ids]
+    return [names[tag_id] for tag_id in ids if names.get(tag_id)]
+
+
+def _channel_detail_lines(channel: dict, parent: dict | None, blocked_users) -> str:
+    kind = channel.get("type")
+    in_forum = parent is not None and parent.get("type") in FORUM_CHANNEL_TYPES
+    name = channel.get("name") or channel.get("id")
+    owner_id = channel.get("owner_id")
+    if (
+        kind in THREAD_CHANNEL_TYPES
+        and owner_id is not None
+        and blocked_users is not None
+        and blocked_users.is_blocked(owner_id, channel.get("id"))
+    ):
+        name = HIDDEN_POST_TITLE
+    label = "forum post" if in_forum else CHANNEL_KINDS.get(kind, "channel")
+    lines = [f"#{name} (channel_id {channel.get('id')}): {label}"]
+    if kind in FORUM_CHANNEL_TYPES:
+        guidelines = _capped(channel.get("topic"))
+        lines.append(f"Guidelines:\n{guidelines}" if guidelines else "Guidelines: none")
+        lines.append(f"Tags: {', '.join(_tag_names(channel)) or 'none'}")
+    elif in_forum:
+        tags = _tag_names(parent, channel.get("applied_tags") or ())
+        lines.append(f"Tags: {', '.join(tags) or 'none'}")
+    elif kind not in THREAD_CHANNEL_TYPES:
+        description = _capped(channel.get("topic"))
+        lines.append(
+            f"Description:\n{description}" if description else "Description: none"
+        )
+    return "\n".join(lines)
+
+
+def channel_details_text(
+    channel: dict, parent: dict | None = None, blocked_users=None
+) -> str:
+    """What channel_details returns: the channel, then its parent if any,
+    without opted-out members' ids."""
+    text = _channel_detail_lines(channel, parent, blocked_users)
+    if parent is not None:
+        heading = "In forum" if parent.get("type") in FORUM_CHANNEL_TYPES else "In"
+        text += f"\n\n{heading}:\n" + _channel_detail_lines(parent, None, blocked_users)
+    return scrub_blocked_ids(text, blocked_users)
+
+
+# Channels an enabled recipe names (#278): the agent may post there and
+# read their details, never watch them. Text channels and threads only.
+POSTABLE_CHANNEL_TYPES = frozenset({0, 5, 10, 11, 12})
+RECIPE_CHANNEL_CACHE_MAX_ENTRIES = 1_000
 
 
 def failure_notice_text(error_type: str) -> str:
@@ -252,6 +340,9 @@ class GuildRuntime:
     blocked_users: object = None
     # Channel id -> its forum's id, or None when it is not a forum post.
     forum_parents: OrderedDict = field(default_factory=OrderedDict)
+    # Id -> whether it is a text channel of this guild, for ids found in
+    # recipes; a 404 is remembered, other refusals are asked again.
+    recipe_channel_checks: OrderedDict = field(default_factory=OrderedDict)
 
     async def process(self, batch: WakeBatch) -> ActivationResult:
         if batch.guild_id != self.guild_id:
@@ -264,9 +355,12 @@ class GuildRuntime:
         # An enabled forum's posts are the channels; the agent never acts in
         # the forum itself, and its watch instructions are every post's.
         forums: dict[str, dict] = {}
+        # Every enabled row's channel as fetched, for channel_details.
+        fetched_channels: dict[str, dict] = {}
         notifications = self._without_blocked(batch.notifications)
         for row in enabled_rows:
             channel = await self.discord.channel(row.channel_id)
+            fetched_channels[row.channel_id] = channel
             channel_name = channel.get("name") or row.channel_id
             if row.is_forum or channel.get("type") in FORUM_CHANNEL_TYPES:
                 forums[row.channel_id] = channel
@@ -291,6 +385,11 @@ class GuildRuntime:
                 )
             instruction_stores[row.channel_id] = store
 
+        # The enabled rows' text channels, before any post joins them.
+        row_channels = dict(enabled_channels)
+        # Forum posts admitted this wake: post id -> label.
+        posts: dict[str, str] = {}
+
         async def admit_posts(channel_ids) -> None:
             for channel_id in dict.fromkeys(channel_ids):
                 if channel_id in enabled_channels or channel_id in forums:
@@ -300,6 +399,7 @@ class GuildRuntime:
                     continue
                 forum_id, label = admitted
                 enabled_channels[channel_id] = label
+                posts[channel_id] = label
                 instruction_stores[channel_id] = instruction_stores[forum_id]
 
         await admit_posts(
@@ -338,14 +438,35 @@ class GuildRuntime:
         # The notices start the brief, the only place their markers are read
         # back; a list that failed to refresh is no evidence of a change.
         notices = recipe_notices(opened, self.recipe_listing) if listed else ""
-        preamble = "\n\n".join(
-            block
-            for block in (
-                scrub_blocked_ids(notices, self.blocked_users),
-                self.memory_block,
-                scrub_blocked_ids(self.recipe_block, self.blocked_users),
-            )
-            if block
+        # The head of the brief goes whole to a history without one, and as
+        # changes otherwise (#278); the recipe notices start both, where
+        # they are read back, and the memory ends them.
+        told_so_far = told(self.engine.agent_runner.history)
+        current = Channels(
+            row_channels,
+            forums,
+            dict(posts),
+            instruction_stores,
+            await self._posts_switched_off(told_so_far.posts.keys() - posts, forums),
+        )
+
+        def scrub(text: str) -> str:
+            return scrub_blocked_ids(text, self.blocked_users)
+
+        def preamble(*blocks: str) -> str:
+            return "\n\n".join(scrub(block) for block in (notices, *blocks) if block)
+
+        whole_preamble = preamble(current.whole(), self.recipe_block, self.memory_block)
+        changes_preamble = preamble(
+            current.changes(told_so_far),
+            recipe_changes(self.recipe_listing, told_so_far, scrub),
+            memory_changes(self.memory_block, told_so_far),
+        )
+
+        # Channels named in the enabled recipes the agent has read, at the
+        # revision still listed; a recipe opened this wake adds its own.
+        recipe_channels = await self._postable(
+            recipe_channel_ids(self.engine.agent_runner.history, self.recipe_listing)
         )
 
         async def open_recipe(name: str) -> str:
@@ -353,12 +474,58 @@ class GuildRuntime:
             if recipe is None:
                 return (
                     f'No recipe named "{name}" is available. Only this server\'s '
-                    "enabled recipes can be opened; RECIPES in your brief lists "
-                    "them."
+                    "enabled recipes can be opened; the RECIPES list in your brief "
+                    "names them."
                 )
+            recipe_channels.update(
+                await self._postable(
+                    channel_ids_in(str(recipe.get("instructions") or ""))
+                )
+            )
             # An admin's recipe can name a member who has since opted out;
             # like the memory block, it reaches the model without their id.
             return scrub_blocked_ids(format_opened_recipe(recipe), self.blocked_users)
+
+        async def channel_details(channel_id: str) -> str:
+            return await self._channel_details(
+                str(channel_id).strip(),
+                enabled_channels,
+                forums,
+                fetched_channels,
+                recipe_channels,
+            )
+
+        # Posts locked this wake, closed once its messages are sent.
+        closing: dict[str, str] = {}
+
+        async def close_post(channel_id: str, reason: str) -> tuple[bool, str]:
+            if self.forum_parents.get(channel_id) not in forums:
+                return False, (
+                    f"Channel {channel_id} is not a post in a forum you are "
+                    "enabled in; only those can be closed."
+                )
+            reason = " ".join(str(reason).split())
+            try:
+                await self.discord.edit_channel(
+                    channel_id, {"locked": True}, reason=reason
+                )
+            except DiscordRESTError as error:
+                if error.status_code == 403:
+                    return False, (
+                        f"Discord refused to lock post {channel_id}: the bot lacks "
+                        "permission there (it needs Manage Threads). The post is "
+                        "unchanged; tell a moderator instead."
+                    )
+                return False, (
+                    f"Discord refused to lock post {channel_id} ({error}). The post "
+                    "is unchanged."
+                )
+            closing[channel_id] = reason
+            return True, (
+                "Post locked: only moderators can post in it now. It closes once "
+                "this wake's messages are sent, so explain why in the post now if "
+                "you have not."
+            )
 
         async def channel_envs(channel_id: str) -> ChannelEnvironment:
             messages = await self.discord.channel_history(
@@ -395,6 +562,18 @@ class GuildRuntime:
             await admit_posts([envelope.channel_id for envelope in arrived])
             return render_notifications(arrived, dropped)
 
+        async def admit_channel(channel_id: str) -> None:
+            await admit_posts([str(channel_id)])
+
+        def channel_list() -> str:
+            lines = Channels(row_channels, forums, posts, instruction_stores).lines()
+            return scrub_blocked_ids(
+                "\n".join(
+                    ["Your channels (channel_id at the end of each line):", *lines]
+                ),
+                self.blocked_users,
+            )
+
         def deps_factory(**kwargs):
             return ProactiveDeps(
                 guild_id=self.guild_id,
@@ -409,6 +588,11 @@ class GuildRuntime:
                 request_mode=request_mode,
                 drain_notifications=drain_notifications,
                 open_recipe=open_recipe,
+                channel_details=channel_details,
+                recipe_channels=recipe_channels,
+                close_post=close_post,
+                admit_channel=admit_channel,
+                channel_list=channel_list,
                 **kwargs,
             )
 
@@ -421,13 +605,16 @@ class GuildRuntime:
                 enabled_channels=enabled_channels,
                 instruction_stores=instruction_stores,
                 channel_envs=channel_envs,
-                brief_preamble=preamble,
+                brief_preamble=changes_preamble,
+                full_brief_preamble=whole_preamble,
             )
         except BaseException:
             await self._record_failed_usage(batch)
             raise
         try:
-            responses = await self._dispatch(batch, result, enabled_channels)
+            responses = await self._dispatch(
+                batch, result, enabled_channels, closing, recipe_channels
+            )
             await self._persist_instructions(instruction_stores, persisted_addenda)
             serialized_history = json.loads(
                 ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
@@ -695,10 +882,15 @@ class GuildRuntime:
         batch: WakeBatch,
         result: ActivationResult,
         enabled_channels: dict[str, str],
+        closing: dict[str, str] | None = None,
+        recipe_channels: set[str] = frozenset(),
     ) -> int:
         dispatched = 0
         for response_index, response in enumerate(result.responses):
-            if response.channel_id not in enabled_channels:
+            if (
+                response.channel_id not in enabled_channels
+                and response.channel_id not in recipe_channels
+            ):
                 continue
             sent_any = False
             for part_index, part in enumerate(split_for_discord(response.content)):
@@ -768,6 +960,26 @@ class GuildRuntime:
                     action_id,
                     str(sent.get("id", "sent")),
                 )
+        # Last, after every message: a post locked this wake is closed, so
+        # its explanation is already in it. The lock already holds; a close
+        # that fails is logged, not retried with the wake.
+        for channel_id, reason in (closing or {}).items():
+            action_id = f"close:{channel_id}"
+            if await self.journal.completed(self.guild_id, batch.wake_id, action_id):
+                continue
+            try:
+                await self.discord.edit_channel(
+                    channel_id, {"archived": True, "locked": True}, reason=reason
+                )
+            except DiscordRESTError as error:
+                logger.warning(
+                    "proactive post close failed guild=%s channel=%s: %s",
+                    self.guild_id,
+                    channel_id,
+                    error,
+                )
+                continue
+            await self.journal.record(self.guild_id, batch.wake_id, action_id, "closed")
         return dispatched
 
     async def _persist_instructions(
@@ -816,6 +1028,84 @@ class GuildRuntime:
             self._remember_forum_parent(channel_id, forum_id)
         return self.forum_parents[channel_id], post
 
+    async def _channel_details(
+        self,
+        channel_id: str,
+        enabled_channels: dict[str, str],
+        forums: dict[str, dict],
+        fetched: dict[str, dict],
+        recipe_channels: set[str],
+    ) -> str:
+        """channel_details for one id: an enabled channel or forum, a channel
+        an enabled recipe names, or a thread or post under an enabled one
+        that is not switched off on its own, with its parent. Anything else
+        is refused, so the bot's token reads no channel the agent does not
+        know about."""
+        refusal = (
+            f"Channel {channel_id} is not one you can read: only the channels "
+            "you are enabled in, their public threads and posts, their "
+            f"parents, and channels your recipes name. {RECIPE_CHANNEL_HINT}"
+        )
+        enabled = (
+            channel_id in enabled_channels
+            or channel_id in forums
+            or channel_id in recipe_channels
+        )
+        try:
+            channel = fetched.get(channel_id) or forums.get(channel_id)
+            if channel is None:
+                channel = await self.discord.channel(channel_id)
+        except DiscordRESTError:
+            return refusal
+        parent_id = str(channel.get("parent_id") or "")
+        is_thread = channel.get("type") in THREAD_CHANNEL_TYPES and parent_id
+        if not enabled:
+            # A private thread under a watched channel is not the agent's to
+            # see; the bot sees them only through Manage Threads.
+            if (
+                not is_thread
+                or channel.get("type") == PRIVATE_THREAD_TYPE
+                or not (parent_id in enabled_channels or parent_id in forums)
+            ):
+                return refusal
+            own = await self.api.get_channel_settings(self.guild_id, channel_id)
+            if own is not None and not own.get("enabled"):
+                return refusal
+        parent = None
+        if is_thread:
+            parent = fetched.get(parent_id) or forums.get(parent_id)
+            if parent is None:
+                try:
+                    parent = await self.discord.channel(parent_id)
+                except DiscordRESTError:
+                    parent = None
+        return channel_details_text(channel, parent, self.blocked_users)
+
+    async def _postable(self, channel_ids) -> set[str]:
+        """The ids among these that are text channels of this guild. A
+        recipe can name anything (a member, a role, another server's
+        channel); only this server's text channels can be posted to."""
+        postable: set[str] = set()
+        for channel_id in channel_ids:
+            if channel_id not in self.recipe_channel_checks:
+                try:
+                    channel = await self.discord.channel(channel_id)
+                except DiscordRESTError as error:
+                    if error.status_code != 404:
+                        continue
+                    channel = {}
+                self.recipe_channel_checks[channel_id] = (
+                    str(channel.get("guild_id")) == self.guild_id
+                    and channel.get("type") in POSTABLE_CHANNEL_TYPES
+                )
+                while (
+                    len(self.recipe_channel_checks) > RECIPE_CHANNEL_CACHE_MAX_ENTRIES
+                ):
+                    self.recipe_channel_checks.popitem(last=False)
+            if self.recipe_channel_checks[channel_id]:
+                postable.add(channel_id)
+        return postable
+
     def _remember_forum_parent(self, channel_id: str, forum_id: str | None) -> None:
         self.forum_parents[channel_id] = forum_id
         while len(self.forum_parents) > FORUM_PARENT_CACHE_MAX_ENTRIES:
@@ -833,6 +1123,26 @@ class GuildRuntime:
         if own is not None and not own.get("enabled"):
             return None  # /proactive off in the post: just this post is off
         return forum_id, forum_post_label(post, forums[forum_id], self.blocked_users)
+
+    async def _posts_switched_off(
+        self, post_ids: Iterable[str], forums: dict[str, dict]
+    ) -> set[str]:
+        """Those of these posts, told to the agent and not admitted this
+        wake, that are switched off on their own while their forum is on. A
+        post whose forum is off goes with the forum's own notice."""
+        switched_off: set[str] = set()
+        for post_id in sorted(post_ids):
+            if post_id in self.forum_parents:
+                self.forum_parents.move_to_end(post_id)
+                forum_id = self.forum_parents[post_id]
+            else:
+                forum_id, _post = await self._forum_parent(post_id)
+            if forum_id not in forums:
+                continue
+            own = await self.api.get_channel_settings(self.guild_id, post_id)
+            if own is not None and not own.get("enabled"):
+                switched_off.add(post_id)
+        return switched_off
 
     async def _record_usage(
         self, batch: WakeBatch, result: ActivationResult, responses: int
