@@ -332,13 +332,18 @@ class GuildRuntime:
             or not self.recipes_refreshed_at
             or time.monotonic() - self.recipes_refreshed_at >= RECIPE_REFRESH_SECONDS
         ):
-            await self._refresh_recipes()
+            listed = await self._refresh_recipes()
+        else:
+            listed = False
+        # The notices start the brief, the only place their markers are read
+        # back; a list that failed to refresh is no evidence of a change.
+        notices = recipe_notices(opened, self.recipe_listing) if listed else ""
         preamble = "\n\n".join(
             block
             for block in (
+                scrub_blocked_ids(notices, self.blocked_users),
                 self.memory_block,
                 scrub_blocked_ids(self.recipe_block, self.blocked_users),
-                recipe_notices(opened, self.recipe_listing),
             )
             if block
         )
@@ -347,8 +352,9 @@ class GuildRuntime:
             recipe = await self.api.open_recipe(self.guild_id, name)
             if recipe is None:
                 return (
-                    f'No recipe named "{name}" is available. Only the recipes '
-                    "listed under RECIPES in your brief can be opened."
+                    f'No recipe named "{name}" is available. Only this server\'s '
+                    "enabled recipes can be opened; RECIPES in your brief lists "
+                    "them."
                 )
             # An admin's recipe can name a member who has since opted out;
             # like the memory block, it reaches the model without their id.
@@ -435,11 +441,12 @@ class GuildRuntime:
         await self._record_usage(batch, result, responses)
         return result
 
-    async def _refresh_recipes(self) -> None:
+    async def _refresh_recipes(self) -> bool:
         """Fetch the recipe list; on failure keep the last one and carry on.
 
         Recipes are an aid, never a reason to drop a wake. A 404 is an
-        application from before recipes: no recipes.
+        application from before recipes: no recipes. Returns whether the
+        list was fetched.
         """
         try:
             listing = await self.api.list_recipes(self.guild_id)
@@ -449,10 +456,11 @@ class GuildRuntime:
                 self.guild_id,
                 type(error).__name__,
             )
-            return
+            return False
         self.recipe_listing = listing if listing is not None else {"recipes": []}
         self.recipe_block = render_recipe_block(self.recipe_listing)
         self.recipes_refreshed_at = time.monotonic()
+        return True
 
     async def report_failure(self, batch: WakeBatch, error_type: str) -> str | None:
         """Say in Discord that a wake was dropped, at most once per window.

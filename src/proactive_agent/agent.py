@@ -39,7 +39,7 @@ from proactive_agent.environment import (
     WakeActions,
 )
 from proactive_agent.errors import exception_trace
-from proactive_agent.recipes import apply_recipe_keeps
+from proactive_agent.recipes import MEMORY_NOTE_PREFIX, apply_recipe_keeps
 from proactive_agent.types import ProposedReaction, ProposedResponse
 from proactive_agent.usage_meter import UsageMeter, current_meter, metered, request_dict
 
@@ -695,6 +695,8 @@ nothing. For each one, do exactly one of these:
   content: its full text is attached to your note word for word for you;
 - otherwise leave its instructions out entirely and write only its name, so
   you can open it again.
+A recipe your brief said was edited, switched off or deleted since you opened
+it is kept by name only, whatever you write; open it again for the new text.
 Never copy, paraphrase, summarize or partly quote a recipe's instructions,
 and never write a `[RECIPE …]` line yourself."""
 
@@ -878,9 +880,6 @@ def memory_note_pair(summary: str) -> list[ModelMessage]:
             ]
         ),
     ]
-
-
-MEMORY_NOTE_PREFIX = "[COMPACTION MEMORY NOTE"
 
 
 def leading_note_pair(history: list[ModelMessage]) -> list[ModelMessage] | None:
