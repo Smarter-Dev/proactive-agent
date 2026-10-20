@@ -60,15 +60,6 @@ def batch_dropped_key(guild_id: str, wake_id: str) -> str:
     return f"{batch_key(guild_id, wake_id)}:dropped"
 
 
-def forum_batch_key(guild_id: str, wake_id: str) -> str:
-    """The forum-post pending list a wake claimed, beside its batch."""
-    return f"{batch_key(guild_id, wake_id)}:forum"
-
-
-def forum_batch_dropped_key(guild_id: str, wake_id: str) -> str:
-    return f"{forum_batch_key(guild_id, wake_id)}:dropped"
-
-
 def lease_key(guild_id: str) -> str:
     return f"{KEY_PREFIX}:{guild_tag(guild_id)}:lease"
 

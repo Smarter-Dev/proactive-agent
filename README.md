@@ -72,9 +72,12 @@ marked that guild `external` in Redis.
   routes a forum post's messages to the worker only while that key is set.
   Those messages travel on keys of their own: `proactive:v1:forum-ready`,
   and per guild `forum-wake`, `forum-pending` and `forum-pending-dropped`.
-  This worker reads them beside the shared keys, under the same guild lease;
-  an older replica still running mid-rollout never reads them, so it cannot
-  take a post's wake and drop it.
+  A forum-post wake is a wake of its own (its id, claimed context, retry
+  counter and checkpoints come from those keys alone); this worker runs it
+  after the shared keys' wake, under the same guild lease. An older replica
+  still running mid-rollout never reads them, so it cannot take a post's wake
+  and drop it, nor strand one's state by finishing the shared wake. A post
+  with its own enabled row stays on the shared keys, as before.
 - Waking envelopes go to `proactive:v1:{guild:<id>}:wake`; non-waking context
   waits in the guild's bounded pending list until the next wake.
 - Workers use consumer groups and a guild lease, so replicas process different

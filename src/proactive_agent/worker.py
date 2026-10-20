@@ -10,7 +10,7 @@ from pydantic_ai.exceptions import ModelHTTPError
 
 from proactive_agent.errors import exception_trace, exception_type_name
 from proactive_agent.history import HistoryUnavailableError
-from proactive_agent.queue import ReadyRecord
+from proactive_agent.queue import LANES, ReadyRecord
 
 logger = logging.getLogger(__name__)
 UNAVAILABLE_RETRY_DELAYS = (30, 60, 120)
@@ -169,84 +169,98 @@ class ProactiveWorker:
         self, guild_id: str, ready: tuple[ReadyRecord, ...], lease
     ) -> None:
         async with lease:
-            batch = await self._queue.build_batch(guild_id, ready)
-            if batch is None:
-                await self._queue.acknowledge_ready(ready)
-                return
-            renew_task = asyncio.create_task(self._renew_lease(lease))
-            process_task = None
-            runtime = None
-            started = time.monotonic()
-            try:
-                runtime = await self._runtimes.get(guild_id)
-                process_task = asyncio.create_task(
-                    self._process_with_unavailable_retries(runtime, batch)
+            # The shared lane's wake, then the forum-post lane's (#248): two
+            # wakes with identities of their own, never one spanning both.
+            for forum in LANES:
+                if forum and not await lease.renew():
+                    # Lost while the first wake ran: the next owner runs it.
+                    return
+                lane_ready = tuple(
+                    record
+                    for record in ready
+                    if getattr(record, "forum", False) == forum
                 )
-                done, _pending = await asyncio.wait(
-                    {process_task, renew_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if renew_task in done:
-                    # Propagates GuildLeaseLostError and cancels in-flight
-                    # Discord/API work before another replica takes over.
-                    await renew_task
-                await process_task
-                await self._queue.acknowledge(batch)
-                # The only line a healthy wake writes. Without it an idle
-                # agent and a dead one leave identical logs.
-                logger.info(
-                    "proactive guild wake completed guild=%s wake=%s notifications=%d dropped=%d duration=%.2fs",
-                    guild_id,
-                    batch.wake_id,
-                    len(batch.notifications),
-                    batch.dropped,
-                    time.monotonic() - started,
-                )
-            except HistoryUnavailableError:
-                # A purge left the guild's v1 history tombstoned and will be
-                # retried. Defer like a cold start: no attempt counted, no
-                # dead letter; the records stay pending and are reclaimed.
-                logger.warning(
-                    "proactive guild wake deferred, history unavailable "
-                    "guild=%s wake=%s",
-                    guild_id,
-                    batch.wake_id,
-                )
-            except Exception as error:
-                # Types and frames only: a provider error can quote the
-                # prompt, and so members' messages from other channels.
-                logger.error(
-                    "proactive guild wake failed guild=%s wake=%s\n%s",
-                    guild_id,
-                    batch.wake_id,
-                    exception_trace(error),
-                )
-                detail = exception_type_name(error)
-                unavailable = isinstance(error, UnavailableRetriesExhausted)
-                dead_lettered = await self._queue.record_failure(
-                    batch,
-                    error=detail,
-                    max_attempts=1 if unavailable else self._max_attempts,
-                )
-                if dead_lettered:
-                    if unavailable and runtime is not None:
-                        await self._record_unavailable_note(
-                            runtime, batch, retries=error.retries, recovered=False
-                        )
-                    logger.error(
-                        "proactive guild wake dead-lettered guild=%s wake=%s",
-                        guild_id,
-                        batch.wake_id,
+                batch = await self._queue.build_batch(guild_id, ready, forum=forum)
+                if batch is None:
+                    await self._queue.acknowledge_ready(lane_ready)
+                    continue
+                await self._run_batch(guild_id, batch, lease)
+
+    async def _run_batch(self, guild_id: str, batch, lease) -> None:
+        """Run one wake under the guild lease, acknowledging it when done."""
+        renew_task = asyncio.create_task(self._renew_lease(lease))
+        process_task = None
+        runtime = None
+        started = time.monotonic()
+        try:
+            runtime = await self._runtimes.get(guild_id)
+            process_task = asyncio.create_task(
+                self._process_with_unavailable_retries(runtime, batch)
+            )
+            done, _pending = await asyncio.wait(
+                {process_task, renew_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if renew_task in done:
+                # Propagates GuildLeaseLostError and cancels in-flight
+                # Discord/API work before another replica takes over.
+                await renew_task
+            await process_task
+            await self._queue.acknowledge(batch)
+            # The only line a healthy wake writes. Without it an idle
+            # agent and a dead one leave identical logs.
+            logger.info(
+                "proactive guild wake completed guild=%s wake=%s notifications=%d dropped=%d duration=%.2fs",
+                guild_id,
+                batch.wake_id,
+                len(batch.notifications),
+                batch.dropped,
+                time.monotonic() - started,
+            )
+        except HistoryUnavailableError:
+            # A purge left the guild's v1 history tombstoned and will be
+            # retried. Defer like a cold start: no attempt counted, no
+            # dead letter; the records stay pending and are reclaimed.
+            logger.warning(
+                "proactive guild wake deferred, history unavailable guild=%s wake=%s",
+                guild_id,
+                batch.wake_id,
+            )
+        except Exception as error:
+            # Types and frames only: a provider error can quote the
+            # prompt, and so members' messages from other channels.
+            logger.error(
+                "proactive guild wake failed guild=%s wake=%s\n%s",
+                guild_id,
+                batch.wake_id,
+                exception_trace(error),
+            )
+            detail = exception_type_name(error)
+            unavailable = isinstance(error, UnavailableRetriesExhausted)
+            dead_lettered = await self._queue.record_failure(
+                batch,
+                error=detail,
+                max_attempts=1 if unavailable else self._max_attempts,
+            )
+            if dead_lettered:
+                if unavailable and runtime is not None:
+                    await self._record_unavailable_note(
+                        runtime, batch, retries=error.retries, recovered=False
                     )
-                    await self._announce_failure(runtime, batch, detail)
-                # Below the ceiling records remain pending for reclaim.
-            finally:
-                renew_task.cancel()
-                cleanup_tasks = [renew_task]
-                if process_task is not None:
-                    process_task.cancel()
-                    cleanup_tasks.append(process_task)
-                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+                logger.error(
+                    "proactive guild wake dead-lettered guild=%s wake=%s",
+                    guild_id,
+                    batch.wake_id,
+                )
+                await self._announce_failure(runtime, batch, detail)
+            # Below the ceiling records remain pending for reclaim.
+        finally:
+            renew_task.cancel()
+            cleanup_tasks = [renew_task]
+            if process_task is not None:
+                process_task.cancel()
+                cleanup_tasks.append(process_task)
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
     async def _process_with_unavailable_retries(self, runtime, batch) -> None:
         for retries in range(len(UNAVAILABLE_RETRY_DELAYS) + 1):
