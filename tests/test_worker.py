@@ -36,7 +36,13 @@ def queue_and_batch():
         externally_owned=AsyncMock(return_value=True),
         discard_embedded_ready=AsyncMock(),
         acquire_lease=AsyncMock(return_value=FakeLease()),
-        build_batch=AsyncMock(return_value=batch),
+        # The batch is the shared lane's; the forum-post lane has none.
+        build_batch=AsyncMock(
+            side_effect=lambda _guild, _ready, *, forum=False: (
+                None if forum else queue.build_batch.return_value
+            ),
+            return_value=batch,
+        ),
         acknowledge=AsyncMock(),
         acknowledge_ready=AsyncMock(),
         record_failure=AsyncMock(return_value=False),

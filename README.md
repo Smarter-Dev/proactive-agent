@@ -62,6 +62,22 @@ marked that guild `external` in Redis.
 ## Runtime contract
 
 - The Discord bot is the sole Gateway consumer and owns watcher cadence.
+- A forum switched on as a whole has one settings row, the forum's. The bot
+  gates its posts (a post inherits the forum's row unless it has its own);
+  the worker admits each post a wake names as a channel of its own, never
+  the forum itself, and every post shares the forum's watch instructions.
+  The worker asks the application for forum rows (`?forums=true`); one that
+  does not is never shown them. While running it keeps
+  `proactive:v1:capability:forum-posts` set (3-minute expiry), and the bot
+  routes a forum post's messages to the worker only while that key is set.
+  Those messages travel on keys of their own: `proactive:v1:forum-ready`,
+  and per guild `forum-wake`, `forum-pending` and `forum-pending-dropped`.
+  A forum-post wake is a wake of its own (its id, claimed context, retry
+  counter and checkpoints come from those keys alone); this worker runs it
+  after the shared keys' wake, under the same guild lease. An older replica
+  still running mid-rollout never reads them, so it cannot take a post's wake
+  and drop it, nor strand one's state by finishing the shared wake. A post
+  with its own enabled row stays on the shared keys, as before.
 - Waking envelopes go to `proactive:v1:{guild:<id>}:wake`; non-waking context
   waits in the guild's bounded pending list until the next wake.
 - Workers use consumer groups and a guild lease, so replicas process different

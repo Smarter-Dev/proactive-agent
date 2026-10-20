@@ -49,8 +49,25 @@ class ApplicationAPI:
         return bool(response.json().get("valid"))
 
     async def list_enabled_channels(self, guild_id: str) -> tuple[EnabledChannel, ...]:
-        response = await self._request("GET", f"/guilds/{guild_id}/proactive-settings")
+        # ``forums`` says this worker runs a whole forum's posts (#248); a
+        # worker that does not ask is never shown a forum's row.
+        response = await self._request(
+            "GET",
+            f"/guilds/{guild_id}/proactive-settings",
+            params={"forums": "true"},
+        )
         return tuple(EnabledChannel.model_validate(item) for item in response.json())
+
+    async def get_channel_settings(
+        self, guild_id: str, channel_id: str
+    ) -> dict[str, Any] | None:
+        """One channel's own settings row, on or off; None when it has none."""
+        response = await self._request(
+            "GET",
+            f"/guilds/{guild_id}/channels/{channel_id}/proactive-settings",
+            allow_not_found=True,
+        )
+        return None if response is None else response.json()
 
     async def get_history(self, guild_id: str) -> HistorySnapshot | None:
         response = await self._request(

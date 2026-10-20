@@ -16,6 +16,7 @@ from proactive_agent.agent import (
     self_compaction_summary,
 )
 from proactive_agent.api import ApplicationAPI
+from proactive_agent.beacon import CapabilityBeacon
 from proactive_agent.blocked_users import BlockedUsers
 from proactive_agent.capabilities import (
     HandlerAuthor,
@@ -167,7 +168,12 @@ async def run() -> None:
         runtimes,
         concurrency=settings.proactive_worker_concurrency,
         max_attempts=settings.proactive_max_attempts,
-        services=(blocked_users, privacy_purges, idle_compactor),
+        services=(
+            blocked_users,
+            privacy_purges,
+            idle_compactor,
+            CapabilityBeacon(redis_client),
+        ),
         blocked_users=blocked_users,
     )
     health = HealthServer(redis_client, api, port=settings.proactive_health_port)

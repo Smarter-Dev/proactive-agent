@@ -22,11 +22,15 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from proactive_agent.contracts import NotificationEnvelope
 from proactive_agent.keys import (
     DEAD_LETTER_STREAM_KEY,
+    FORUM_READY_STREAM_KEY,
     READY_STREAM_KEY,
     attempts_key,
     batch_dropped_key,
     batch_key,
     failure_notice_key,
+    forum_pending_dropped_key,
+    forum_pending_key,
+    forum_wake_stream_key,
     lease_key,
     ownership_key,
     pending_dropped_key,
@@ -117,16 +121,59 @@ def _decode(value) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def _stream_notification(stream_id, fields, forum: bool) -> StreamNotification:
+    payload = fields.get(b"payload", fields.get("payload"))
+    return StreamNotification(
+        stream_id=_decode(stream_id),
+        envelope=NotificationEnvelope.model_validate_json(_decode(payload)),
+        forum=forum,
+    )
+
+
+# A guild's notifications travel in two lanes: the shared one, and its forum
+# posts' (#248), which a worker from before forum support never reads. Each
+# lane's wakes are wakes of their own: a batch, its wake id, retry counter,
+# checkpoint and claimed context all come from one lane's entries, so an old
+# worker finishing the shared lane's part can never strand a forum wake's
+# state. This worker runs both lanes, one batch after the other, under the
+# one guild lease.
+LANES = (False, True)
+
+
+def _ready_stream(forum: bool) -> str:
+    return FORUM_READY_STREAM_KEY if forum else READY_STREAM_KEY
+
+
+def _wake_stream(guild_id: str, forum: bool) -> str:
+    return forum_wake_stream_key(guild_id) if forum else wake_stream_key(guild_id)
+
+
+def _pending_keys(guild_id: str, wake_id: str, forum: bool) -> tuple[str, ...]:
+    """The claim script's keys: the lane's pending list, the wake's batch,
+    and their counters. Wake ids are notification ids, unique across lanes,
+    so each wake's batch key is its own."""
+    return (
+        forum_pending_key(guild_id) if forum else pending_key(guild_id),
+        batch_key(guild_id, wake_id),
+        forum_pending_dropped_key(guild_id) if forum else pending_dropped_key(guild_id),
+        batch_dropped_key(guild_id, wake_id),
+    )
+
+
 @dataclass(frozen=True)
 class ReadyRecord:
     stream_id: str
     guild_id: str
+    # Read from the forum-post ready stream.
+    forum: bool = False
 
 
 @dataclass(frozen=True)
 class StreamNotification:
     stream_id: str
     envelope: NotificationEnvelope
+    # Read from the guild's forum-post wake stream.
+    forum: bool = False
 
 
 @dataclass
@@ -137,6 +184,8 @@ class WakeBatch:
     waking: list[StreamNotification]
     pending: list[NotificationEnvelope]
     dropped: int
+    # A wake of the forum-post lane.
+    forum: bool = False
 
     @property
     def notifications(self) -> tuple[NotificationEnvelope, ...]:
@@ -207,48 +256,55 @@ class RedisWakeQueue:
         self._known_guild_groups: set[str] = set()
 
     async def initialize(self) -> None:
-        await self._ensure_group(READY_STREAM_KEY, READY_GROUP)
+        for forum in LANES:
+            await self._ensure_group(_ready_stream(forum), READY_GROUP)
 
     async def read_ready(self, *, block_ms: int = 30_000) -> tuple[ReadyRecord, ...]:
         try:
             records = await self._redis.xreadgroup(
                 READY_GROUP,
                 self.consumer_name,
-                {READY_STREAM_KEY: ">"},
+                {_ready_stream(forum): ">" for forum in LANES},
                 count=self.max_batch_size,
                 block=block_ms,
             )
         except RedisTimeoutError:
             return ()
         ready = []
-        for _stream, entries in records or ():
+        for stream, entries in records or ():
+            forum = _decode(stream) == FORUM_READY_STREAM_KEY
             for stream_id, fields in entries:
                 guild_id = fields.get(b"guild_id", fields.get("guild_id"))
                 ready.append(
                     ReadyRecord(
                         stream_id=_decode(stream_id),
                         guild_id=_decode(guild_id),
+                        forum=forum,
                     )
                 )
         return tuple(ready)
 
     async def reclaim_ready(self) -> tuple[ReadyRecord, ...]:
-        result = await self._redis.xautoclaim(
-            READY_STREAM_KEY,
-            READY_GROUP,
-            self.consumer_name,
-            self.reclaim_idle_seconds * 1000,
-            "0-0",
-            count=self.max_batch_size,
-        )
-        entries = result[1] if result else ()
-        return tuple(
-            ReadyRecord(
-                stream_id=_decode(stream_id),
-                guild_id=_decode(fields.get(b"guild_id", fields.get("guild_id"))),
+        ready = []
+        for forum in LANES:
+            result = await self._redis.xautoclaim(
+                _ready_stream(forum),
+                READY_GROUP,
+                self.consumer_name,
+                self.reclaim_idle_seconds * 1000,
+                "0-0",
+                count=self.max_batch_size,
             )
-            for stream_id, fields in entries
-        )
+            entries = result[1] if result else ()
+            ready.extend(
+                ReadyRecord(
+                    stream_id=_decode(stream_id),
+                    guild_id=_decode(fields.get(b"guild_id", fields.get("guild_id"))),
+                    forum=forum,
+                )
+                for stream_id, fields in entries
+            )
+        return tuple(ready)
 
     async def acquire_lease(self, guild_id: str) -> GuildLease | None:
         token = uuid4().hex
@@ -280,121 +336,94 @@ class RedisWakeQueue:
         self, guild_id: str, ready_records: tuple[ReadyRecord, ...]
     ) -> None:
         """Drain stale external work after ownership returns to the bot."""
-        batch = await self.build_batch(guild_id, ready_records)
-        if batch is None:
-            await self.acknowledge_ready(ready_records)
-            return
-        if await self.externally_owned(guild_id):
-            return
-        await self.acknowledge(batch)
+        for forum in LANES:
+            batch = await self.build_batch(guild_id, ready_records, forum=forum)
+            if batch is None:
+                await self.acknowledge_ready(
+                    tuple(r for r in ready_records if r.forum == forum)
+                )
+                continue
+            if await self.externally_owned(guild_id):
+                return
+            await self.acknowledge(batch)
 
     async def build_batch(
         self,
         guild_id: str,
         ready_records: tuple[ReadyRecord, ...],
+        *,
+        forum: bool = False,
     ) -> WakeBatch | None:
+        """The guild's next wake of one lane, from that lane's entries only:
+        reclaimed ones first, so a retry names the same wake."""
         await self._ensure_guild_group(guild_id)
-        reclaimed = await self._redis.xautoclaim(
-            wake_stream_key(guild_id),
+        stream = _wake_stream(guild_id, forum)
+        claimed = await self._redis.xautoclaim(
+            stream,
             WAKE_GROUP,
             self.consumer_name,
             self.reclaim_idle_seconds * 1000,
             "0-0",
             count=self.max_batch_size,
         )
-        records = await self._redis.xreadgroup(
-            WAKE_GROUP,
-            self.consumer_name,
-            {wake_stream_key(guild_id): ">"},
-            count=self.max_batch_size,
-        )
-        waking = []
-        for stream_id, fields in reclaimed[1] if reclaimed else ():
-            payload = fields.get(b"payload", fields.get("payload"))
-            waking.append(
-                StreamNotification(
-                    stream_id=_decode(stream_id),
-                    envelope=NotificationEnvelope.model_validate_json(_decode(payload)),
-                )
-            )
-        for _stream, entries in records or ():
-            for stream_id, fields in entries:
-                payload = fields.get(b"payload", fields.get("payload"))
-                waking.append(
-                    StreamNotification(
-                        stream_id=_decode(stream_id),
-                        envelope=NotificationEnvelope.model_validate_json(
-                            _decode(payload)
-                        ),
-                    )
-                )
+        waking = [
+            _stream_notification(stream_id, fields, forum)
+            for stream_id, fields in (claimed[1] if claimed else ())
+        ]
+        waking.extend(await self._read_new(guild_id, forum))
         if not waking:
             return None
 
         wake_id = str(waking[0].envelope.notification_id)
+        keys = _pending_keys(guild_id, wake_id, forum)
         raw_pending = await self._redis.eval(
-            _CLAIM_PENDING_LUA,
-            4,
-            pending_key(guild_id),
-            batch_key(guild_id, wake_id),
-            pending_dropped_key(guild_id),
-            batch_dropped_key(guild_id, wake_id),
-            IN_FLIGHT_MAX_MILLISECONDS,
+            _CLAIM_PENDING_LUA, 4, *keys, IN_FLIGHT_MAX_MILLISECONDS
         )
         dropped = int(_decode(raw_pending[0]))
-        pending = tuple(
+        pending = [
             NotificationEnvelope.model_validate_json(_decode(item))
             for item in raw_pending[1:]
-        )
-        await self._expire_with_oldest(batch_key(guild_id, wake_id), pending)
+        ]
+        await self._expire_with_oldest(keys[1], pending)
         return WakeBatch(
             guild_id=guild_id,
             wake_id=wake_id,
-            ready_ids=[record.stream_id for record in ready_records],
-            waking=list(waking),
-            pending=list(pending),
+            ready_ids=[r.stream_id for r in ready_records if r.forum == forum],
+            waking=waking,
+            pending=pending,
             dropped=dropped,
+            forum=forum,
         )
+
+    async def _read_new(self, guild_id: str, forum: bool) -> list[StreamNotification]:
+        records = await self._redis.xreadgroup(
+            WAKE_GROUP,
+            self.consumer_name,
+            {_wake_stream(guild_id, forum): ">"},
+            count=self.max_batch_size,
+        )
+        return [
+            _stream_notification(stream_id, fields, forum)
+            for _stream, entries in records or ()
+            for stream_id, fields in entries
+        ]
 
     async def drain_midrun(
         self, batch: WakeBatch
     ) -> tuple[tuple[NotificationEnvelope, ...], int]:
-        """Attach notifications that arrived while this guild was running."""
-        records = await self._redis.xreadgroup(
-            WAKE_GROUP,
-            self.consumer_name,
-            {wake_stream_key(batch.guild_id): ">"},
-            count=self.max_batch_size,
-        )
-        newly_waking = []
-        for _stream, entries in records or ():
-            for stream_id, fields in entries:
-                payload = fields.get(b"payload", fields.get("payload"))
-                newly_waking.append(
-                    StreamNotification(
-                        stream_id=_decode(stream_id),
-                        envelope=NotificationEnvelope.model_validate_json(
-                            _decode(payload)
-                        ),
-                    )
-                )
+        """Attach notifications that arrived in the batch's lane while this
+        guild was running; the other lane's wait for their own wake."""
+        newly_waking = await self._read_new(batch.guild_id, batch.forum)
+        keys = _pending_keys(batch.guild_id, batch.wake_id, batch.forum)
         raw_pending = await self._redis.eval(
-            _APPEND_PENDING_LUA,
-            4,
-            pending_key(batch.guild_id),
-            batch_key(batch.guild_id, batch.wake_id),
-            pending_dropped_key(batch.guild_id),
-            batch_dropped_key(batch.guild_id, batch.wake_id),
-            IN_FLIGHT_MAX_MILLISECONDS,
+            _APPEND_PENDING_LUA, 4, *keys, IN_FLIGHT_MAX_MILLISECONDS
         )
         dropped = int(_decode(raw_pending[0]))
         newly_pending = [
             NotificationEnvelope.model_validate_json(_decode(item))
             for item in raw_pending[1:]
         ]
-        await self._expire_with_oldest(
-            batch_key(batch.guild_id, batch.wake_id), newly_pending
-        )
+        await self._expire_with_oldest(keys[1], newly_pending)
         batch.waking.extend(newly_waking)
         batch.pending.extend(newly_pending)
         batch.dropped += dropped
@@ -419,19 +448,13 @@ class RedisWakeQueue:
         async with self._redis.pipeline(transaction=True) as pipeline:
             if batch.waking:
                 waking_ids = tuple(item.stream_id for item in batch.waking)
-                pipeline.xack(
-                    wake_stream_key(batch.guild_id),
-                    WAKE_GROUP,
-                    *waking_ids,
-                )
-                pipeline.xdel(wake_stream_key(batch.guild_id), *waking_ids)
+                stream = _wake_stream(batch.guild_id, batch.forum)
+                pipeline.xack(stream, WAKE_GROUP, *waking_ids)
+                pipeline.xdel(stream, *waking_ids)
             if batch.ready_ids:
-                pipeline.xack(
-                    READY_STREAM_KEY,
-                    READY_GROUP,
-                    *batch.ready_ids,
-                )
-                pipeline.xdel(READY_STREAM_KEY, *batch.ready_ids)
+                ready_stream = _ready_stream(batch.forum)
+                pipeline.xack(ready_stream, READY_GROUP, *batch.ready_ids)
+                pipeline.xdel(ready_stream, *batch.ready_ids)
             pipeline.delete(
                 batch_key(batch.guild_id, batch.wake_id),
                 batch_dropped_key(batch.guild_id, batch.wake_id),
@@ -492,14 +515,12 @@ class RedisWakeQueue:
         return bool(claimed)
 
     async def acknowledge_ready(self, records: tuple[ReadyRecord, ...]) -> None:
-        if records:
-            stream_ids = tuple(record.stream_id for record in records)
-            await self._redis.xack(
-                READY_STREAM_KEY,
-                READY_GROUP,
-                *stream_ids,
-            )
-            await self._redis.xdel(READY_STREAM_KEY, *stream_ids)
+        for forum in LANES:
+            stream_ids = tuple(r.stream_id for r in records if r.forum == forum)
+            if stream_ids:
+                stream = _ready_stream(forum)
+                await self._redis.xack(stream, READY_GROUP, *stream_ids)
+                await self._redis.xdel(stream, *stream_ids)
 
     async def dead_letter(
         self,
@@ -543,7 +564,8 @@ class RedisWakeQueue:
     async def _ensure_guild_group(self, guild_id: str) -> None:
         if guild_id in self._known_guild_groups:
             return
-        await self._ensure_group(wake_stream_key(guild_id), WAKE_GROUP)
+        for forum in LANES:
+            await self._ensure_group(_wake_stream(guild_id, forum), WAKE_GROUP)
         self._known_guild_groups.add(guild_id)
 
     async def _ensure_group(self, stream: str, group: str) -> None:

@@ -5,6 +5,10 @@ from __future__ import annotations
 KEY_PREFIX = "proactive:v1"
 READY_GUILDS_KEY = f"{KEY_PREFIX}:guilds-with-wakes"
 READY_STREAM_KEY = f"{KEY_PREFIX}:ready"
+# A forum post's notifications (#248) travel on keys of their own, which a
+# worker from before forum support never reads, so it cannot take a post's
+# wake and drop it.
+FORUM_READY_STREAM_KEY = f"{KEY_PREFIX}:forum-ready"
 DEAD_LETTER_STREAM_KEY = f"{KEY_PREFIX}:dead-letter"
 LEGACY_HISTORY_PREFIX = "proactive:guild-history"
 # Sorted set guild_id -> epoch seconds of the guild's last history write; the
@@ -30,6 +34,18 @@ def pending_key(guild_id: str) -> str:
 
 def pending_dropped_key(guild_id: str) -> str:
     return f"{KEY_PREFIX}:{guild_tag(guild_id)}:pending-dropped"
+
+
+def forum_wake_stream_key(guild_id: str) -> str:
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:forum-wake"
+
+
+def forum_pending_key(guild_id: str) -> str:
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:forum-pending"
+
+
+def forum_pending_dropped_key(guild_id: str) -> str:
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:forum-pending-dropped"
 
 
 def ownership_key(guild_id: str) -> str:
@@ -146,3 +162,10 @@ def privacy_consumer_key(component: str, replica_id: str) -> str:
 def tombstone_cleared_key(run_id: str) -> str:
     """Hash guild_id -> how the tombstone left by this run was cleared."""
     return f"privacy:v1:tombstone-cleared:{run_id}"
+
+
+# Set, with a short expiry, by every worker that runs a whole forum's posts as
+# channels of their own (#248). The bot routes a forum post's messages here
+# only while it is set, so a worker without forum support (an older one, or a
+# rollback) never gets them.
+FORUM_POSTS_CAPABILITY_KEY = f"{KEY_PREFIX}:capability:forum-posts"
