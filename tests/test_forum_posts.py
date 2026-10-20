@@ -10,16 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
-import sys
-import types
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import httpx
-import pytest
+import pre_forum
 
 from proactive_agent.agent import ToolBudget
 from proactive_agent.api import ApplicationAPI
@@ -501,22 +498,8 @@ async def test_the_beacon_keeps_the_forum_posts_capability_set_while_running():
 
 
 def _main_runtime_module():
-    """The worker as it was before forum support, from git main."""
-    try:
-        source = subprocess.check_output(
-            ["git", "show", "main:src/proactive_agent/runtime.py"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        pytest.skip("git main is not available")
-    if "FORUM_CHANNEL_TYPES" in source:
-        pytest.skip("main already supports forums")
-    module = types.ModuleType("proactive_agent._main_runtime")
-    module.__dict__["__builtins__"] = __builtins__
-    sys.modules[module.__name__] = module
-    exec(compile(source, "main:runtime.py", "exec"), module.__dict__)  # noqa: S102
-    return module
+    """The worker's runtime as it was before forum support."""
+    return pre_forum.load("runtime")
 
 
 async def test_an_old_worker_never_sees_a_forum_and_answers_no_post():

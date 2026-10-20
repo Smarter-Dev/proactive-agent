@@ -8,14 +8,14 @@ would acknowledge and delete it unanswered.
 
 from __future__ import annotations
 
-import subprocess
-import sys
 import types
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import fakeredis.aioredis
+import pre_forum
 import pytest
 
 from proactive_agent.contracts import NotificationEnvelope
@@ -46,12 +46,8 @@ def redis_client():
 
 
 def _main_module(path: str, name: str) -> types.ModuleType:
-    """The module as it is on main, before forum support."""
-    source = subprocess.check_output(["git", "show", f"main:{path}"], text=True)
-    module = types.ModuleType(name)
-    sys.modules[name] = module
-    exec(compile(source, f"main:{path}", "exec"), module.__dict__)
-    return module
+    """The module as it was before forum support (tests/pre_forum.py)."""
+    return pre_forum.load(Path(path).stem)
 
 
 def envelope(channel_id: str, body: str, *, wakes: bool = True) -> NotificationEnvelope:
@@ -98,6 +94,12 @@ class RecordingRuntimes:
 
     async def get(self, _guild_id):
         return self._runtime
+
+
+def test_the_pre_forum_copies_are_the_commit_they_name():
+    for name, blob in pre_forum.BLOB_IDS.items():
+        assert pre_forum.blob_id(pre_forum.source(name)) == blob, name
+        assert b"FORUM" not in pre_forum.source(name), name
 
 
 def test_the_forum_keys_are_the_bots():
