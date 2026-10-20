@@ -163,6 +163,12 @@ class AgentDeps:
     # guidelines and tags, and a thread's or post's parent too, or a refusal
     # for a channel out of reach. None means there are none (replay evals).
     channel_details: Callable[[str], Awaitable[str]] | None = None
+    # Channels an enabled recipe names by id (#278): the agent may post
+    # there and read their details, but never watches them.
+    recipe_channels: set[str] = field(default_factory=set)
+    # Locks a forum post now and closes it after this wake's messages are
+    # sent (#278); a refusal for anything else. None means unavailable.
+    close_post: Callable[[str, str], Awaitable[str]] | None = None
     # Environments already resolved from a callable provider this wake; in
     # production the provider hits Discord REST, so each channel is fetched
     # at most once no matter how many tools read it.
@@ -371,7 +377,7 @@ channels and earlier wakes.
 Every tool that reads from or acts in a channel requires a `channel_id`. Your
 wake brief's WATCH INSTRUCTIONS BY CHANNEL section lists every enabled
 channel with its channel_id — that is the complete set of channels you may
-inspect or act in; the budget-free list_channels tool lists it on demand, and the budget-free channel_details tool reads one's description (a forum's guidelines) when you need it. Never guess another id or attempt to access a channel
+inspect or act in; the budget-free list_channels tool lists it on demand, and the budget-free channel_details tool reads one's description (a forum's guidelines) when you need it. A channel that an enabled recipe names by its id, once you have opened that recipe, is one you may also post to with send_channel_message and read with channel_details; you never watch it or read its messages. Never guess another id or attempt to access a channel
 outside that set. Notifications and watch instructions are labeled by channel;
 keep each conversation and watch instruction routed to its named channel.
 
@@ -483,8 +489,11 @@ def build_kimi_agent(
     async def send_channel_message(
         ctx: RunContext[AgentDeps], channel_id: str, content: str
     ) -> str:
-        """Send a standalone message to the channel."""
-        if error := disabled_channel_error(ctx.deps, channel_id):
+        """Send a standalone message to the channel: one you are enabled in,
+        or one an enabled recipe you opened names by its id."""
+        if channel_id not in ctx.deps.recipe_channels and (
+            error := disabled_channel_error(ctx.deps, channel_id)
+        ):
             return error
         if not ctx.deps.budget.try_spend():
             return BUDGET_EXHAUSTED
@@ -667,6 +676,24 @@ def build_kimi_agent(
         if ctx.deps.channel_details is None:
             return "Channel details are not available here."
         return await ctx.deps.channel_details(channel_id)
+
+    @agent.tool
+    @tool_errors_returned
+    async def close_and_lock_post(
+        ctx: RunContext[AgentDeps], channel_id: str, reason: str
+    ) -> str:
+        """Close and lock a forum post you are in, only when it clearly breaks
+        its forum's guidelines. First explain why in the post itself, in this
+        same wake: your messages are sent before the post closes, and no one
+        can reply once it is locked. `reason` is a short note for the
+        server's audit log."""
+        if error := disabled_channel_error(ctx.deps, channel_id):
+            return error
+        if ctx.deps.close_post is None:
+            return "Closing posts is not available here."
+        if not ctx.deps.budget.try_spend():
+            return BUDGET_EXHAUSTED
+        return await ctx.deps.close_post(channel_id, reason)
 
     # Parity tools (web search, code run, …) register here; in replay evals
     # the Discord/API-bound ones are stubbed by the caller.

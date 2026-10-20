@@ -38,6 +38,8 @@ NOTICES_HEADING = "RECIPE CHANGES SINCE YOU OPENED THEM:"
 NOTICE_LINE = re.compile(
     rf"^- .* \[RECIPE (?:EDITED id=({_UUID}) revision=(\d+)|GONE id=({_UUID}))\]$"
 )
+# A Discord id, as a recipe names a channel (#278).
+CHANNEL_ID = re.compile(r"(?<!\d)\d{17,20}(?!\d)")
 # The brief's list, which every stored brief repeats.
 LISTED_RECIPES_MAX = 50
 LISTED_CHARS_MAX = 15_000
@@ -160,3 +162,42 @@ def recipe_notices(opened: dict[str, tuple[int, str]], listing: dict | None) -> 
     if not lines:
         return ""
     return f"{NOTICES_HEADING}\n" + "\n".join(lines)
+
+
+def channel_ids_in(text: str) -> list[str]:
+    """The Discord ids a recipe's text names, in order, once each."""
+    return list(dict.fromkeys(CHANNEL_ID.findall(text)))
+
+
+def recipe_channel_ids(
+    messages: Iterable[ModelMessage], listing: dict | None
+) -> list[str]:
+    """The ids named in the enabled recipes the agent has read (#278).
+
+    Each listed preview, and each open_recipe result in the history whose
+    revision is still the listed one: an edit or a switch-off withdraws the
+    ids of the old text until the recipe is opened again.
+    """
+    if listing is None:
+        return []
+    current = {
+        str(recipe.get("id")).lower(): recipe for recipe in listing.get("recipes") or ()
+    }
+    ids: list[str] = []
+    for recipe in current.values():
+        ids += channel_ids_in(str(recipe.get("preview") or ""))
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if not (
+                isinstance(part, ToolReturnPart)
+                and part.tool_name == OPEN_RECIPE_TOOL
+                and isinstance(part.content, str)
+            ):
+                continue
+            match = HEADER.match(part.content)
+            recipe = current.get(match[1].lower()) if match else None
+            if recipe is not None and int(recipe.get("revision") or 0) == int(match[2]):
+                ids += channel_ids_in(part.content[match.end() :])
+    return list(dict.fromkeys(ids))

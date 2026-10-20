@@ -47,8 +47,10 @@ from proactive_agent.optout_gate import (
 from proactive_agent.parity import ProactiveDeps
 from proactive_agent.queue import RedisWakeQueue, WakeBatch
 from proactive_agent.recipes import (
+    channel_ids_in,
     format_opened_recipe,
     opened_recipes,
+    recipe_channel_ids,
     recipe_notices,
     render_recipe_block,
 )
@@ -189,6 +191,12 @@ def channel_details_text(
     return scrub_blocked_ids(text, blocked_users)
 
 
+# Channels an enabled recipe names (#278): the agent may post there and
+# read their details, never watch them. Text channels and threads only.
+POSTABLE_CHANNEL_TYPES = frozenset({0, 5, 10, 11, 12})
+RECIPE_CHANNEL_CACHE_MAX_ENTRIES = 1_000
+
+
 def failure_notice_text(error_type: str) -> str:
     """The single message a guild sees when a wake is given up on.
 
@@ -325,6 +333,9 @@ class GuildRuntime:
     blocked_users: object = None
     # Channel id -> its forum's id, or None when it is not a forum post.
     forum_parents: OrderedDict = field(default_factory=OrderedDict)
+    # Id -> whether it is a text channel of this guild, for ids found in
+    # recipes; a 404 is remembered, other refusals are asked again.
+    recipe_channel_checks: OrderedDict = field(default_factory=OrderedDict)
 
     async def process(self, batch: WakeBatch) -> ActivationResult:
         if batch.guild_id != self.guild_id:
@@ -424,6 +435,12 @@ class GuildRuntime:
             if block
         )
 
+        # Channels named in the enabled recipes the agent has read, at the
+        # revision still listed; a recipe opened this wake adds its own.
+        recipe_channels = await self._postable(
+            recipe_channel_ids(self.engine.agent_runner.history, self.recipe_listing)
+        )
+
         async def open_recipe(name: str) -> str:
             recipe = await self.api.open_recipe(self.guild_id, name)
             if recipe is None:
@@ -432,13 +449,54 @@ class GuildRuntime:
                     "enabled recipes can be opened; RECIPES in your brief lists "
                     "them."
                 )
+            recipe_channels.update(
+                await self._postable(
+                    channel_ids_in(str(recipe.get("instructions") or ""))
+                )
+            )
             # An admin's recipe can name a member who has since opted out;
             # like the memory block, it reaches the model without their id.
             return scrub_blocked_ids(format_opened_recipe(recipe), self.blocked_users)
 
         async def channel_details(channel_id: str) -> str:
             return await self._channel_details(
-                str(channel_id).strip(), enabled_channels, forums, fetched_channels
+                str(channel_id).strip(),
+                enabled_channels,
+                forums,
+                fetched_channels,
+                recipe_channels,
+            )
+
+        # Posts locked this wake, closed once its messages are sent.
+        closing: dict[str, str] = {}
+
+        async def close_post(channel_id: str, reason: str) -> str:
+            if self.forum_parents.get(channel_id) not in forums:
+                return (
+                    f"Channel {channel_id} is not a post in a forum you are "
+                    "enabled in; only those can be closed."
+                )
+            reason = " ".join(str(reason).split())
+            try:
+                await self.discord.edit_channel(
+                    channel_id, {"locked": True}, reason=reason
+                )
+            except DiscordRESTError as error:
+                if error.status_code == 403:
+                    return (
+                        f"Discord refused to lock post {channel_id}: the bot lacks "
+                        "permission there (it needs Manage Threads). The post is "
+                        "unchanged; tell a moderator instead."
+                    )
+                return (
+                    f"Discord refused to lock post {channel_id} ({error}). The post "
+                    "is unchanged."
+                )
+            closing[channel_id] = reason
+            return (
+                "Post locked: only moderators can post in it now. It closes once "
+                "this wake's messages are sent, so explain why in the post now if "
+                "you have not."
             )
 
         async def channel_envs(channel_id: str) -> ChannelEnvironment:
@@ -491,6 +549,8 @@ class GuildRuntime:
                 drain_notifications=drain_notifications,
                 open_recipe=open_recipe,
                 channel_details=channel_details,
+                recipe_channels=recipe_channels,
+                close_post=close_post,
                 **kwargs,
             )
 
@@ -509,7 +569,9 @@ class GuildRuntime:
             await self._record_failed_usage(batch)
             raise
         try:
-            responses = await self._dispatch(batch, result, enabled_channels)
+            responses = await self._dispatch(
+                batch, result, enabled_channels, closing, recipe_channels
+            )
             await self._persist_instructions(instruction_stores, persisted_addenda)
             serialized_history = json.loads(
                 ModelMessagesTypeAdapter.dump_json(self.engine.agent_runner.history)
@@ -777,10 +839,15 @@ class GuildRuntime:
         batch: WakeBatch,
         result: ActivationResult,
         enabled_channels: dict[str, str],
+        closing: dict[str, str] | None = None,
+        recipe_channels: set[str] = frozenset(),
     ) -> int:
         dispatched = 0
         for response_index, response in enumerate(result.responses):
-            if response.channel_id not in enabled_channels:
+            if (
+                response.channel_id not in enabled_channels
+                and response.channel_id not in recipe_channels
+            ):
                 continue
             sent_any = False
             for part_index, part in enumerate(split_for_discord(response.content)):
@@ -850,6 +917,26 @@ class GuildRuntime:
                     action_id,
                     str(sent.get("id", "sent")),
                 )
+        # Last, after every message: a post locked this wake is closed, so
+        # its explanation is already in it. The lock already holds; a close
+        # that fails is logged, not retried with the wake.
+        for channel_id, reason in (closing or {}).items():
+            action_id = f"close:{channel_id}"
+            if await self.journal.completed(self.guild_id, batch.wake_id, action_id):
+                continue
+            try:
+                await self.discord.edit_channel(
+                    channel_id, {"archived": True, "locked": True}, reason=reason
+                )
+            except DiscordRESTError as error:
+                logger.warning(
+                    "proactive post close failed guild=%s channel=%s: %s",
+                    self.guild_id,
+                    channel_id,
+                    error,
+                )
+                continue
+            await self.journal.record(self.guild_id, batch.wake_id, action_id, "closed")
         return dispatched
 
     async def _persist_instructions(
@@ -904,16 +991,23 @@ class GuildRuntime:
         enabled_channels: dict[str, str],
         forums: dict[str, dict],
         fetched: dict[str, dict],
+        recipe_channels: set[str],
     ) -> str:
-        """channel_details for one id: an enabled channel or forum, or a
-        thread or post under one that is not switched off on its own, with
-        its parent. Anything else is refused, so the bot's token reads no
-        channel the agent is not watching."""
+        """channel_details for one id: an enabled channel or forum, a channel
+        an enabled recipe names, or a thread or post under an enabled one
+        that is not switched off on its own, with its parent. Anything else
+        is refused, so the bot's token reads no channel the agent does not
+        know about."""
         refusal = (
             f"Channel {channel_id} is not one you can read: only the channels "
-            "you are enabled in, their threads and posts, and their parents."
+            "you are enabled in, their threads and posts, their parents, and "
+            "channels your recipes name."
         )
-        enabled = channel_id in enabled_channels or channel_id in forums
+        enabled = (
+            channel_id in enabled_channels
+            or channel_id in forums
+            or channel_id in recipe_channels
+        )
         try:
             channel = fetched.get(channel_id) or forums.get(channel_id)
             if channel is None:
@@ -939,6 +1033,31 @@ class GuildRuntime:
                 except DiscordRESTError:
                     parent = None
         return channel_details_text(channel, parent, self.blocked_users)
+
+    async def _postable(self, channel_ids) -> set[str]:
+        """The ids among these that are text channels of this guild. A
+        recipe can name anything (a member, a role, another server's
+        channel); only this server's text channels can be posted to."""
+        postable: set[str] = set()
+        for channel_id in channel_ids:
+            if channel_id not in self.recipe_channel_checks:
+                try:
+                    channel = await self.discord.channel(channel_id)
+                except DiscordRESTError as error:
+                    if error.status_code != 404:
+                        continue
+                    channel = {}
+                self.recipe_channel_checks[channel_id] = (
+                    str(channel.get("guild_id")) == self.guild_id
+                    and channel.get("type") in POSTABLE_CHANNEL_TYPES
+                )
+                while (
+                    len(self.recipe_channel_checks) > RECIPE_CHANNEL_CACHE_MAX_ENTRIES
+                ):
+                    self.recipe_channel_checks.popitem(last=False)
+            if self.recipe_channel_checks[channel_id]:
+                postable.add(channel_id)
+        return postable
 
     def _remember_forum_parent(self, channel_id: str, forum_id: str | None) -> None:
         self.forum_parents[channel_id] = forum_id
