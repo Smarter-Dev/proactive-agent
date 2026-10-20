@@ -5,6 +5,10 @@ from __future__ import annotations
 KEY_PREFIX = "proactive:v1"
 READY_GUILDS_KEY = f"{KEY_PREFIX}:guilds-with-wakes"
 READY_STREAM_KEY = f"{KEY_PREFIX}:ready"
+# A forum post's notifications (#248) travel on keys of their own, which a
+# worker from before forum support never reads, so it cannot take a post's
+# wake and drop it.
+FORUM_READY_STREAM_KEY = f"{KEY_PREFIX}:forum-ready"
 DEAD_LETTER_STREAM_KEY = f"{KEY_PREFIX}:dead-letter"
 LEGACY_HISTORY_PREFIX = "proactive:guild-history"
 # Sorted set guild_id -> epoch seconds of the guild's last history write; the
@@ -32,6 +36,18 @@ def pending_dropped_key(guild_id: str) -> str:
     return f"{KEY_PREFIX}:{guild_tag(guild_id)}:pending-dropped"
 
 
+def forum_wake_stream_key(guild_id: str) -> str:
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:forum-wake"
+
+
+def forum_pending_key(guild_id: str) -> str:
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:forum-pending"
+
+
+def forum_pending_dropped_key(guild_id: str) -> str:
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:forum-pending-dropped"
+
+
 def ownership_key(guild_id: str) -> str:
     return f"{KEY_PREFIX}:{guild_tag(guild_id)}:owner"
 
@@ -42,6 +58,15 @@ def batch_key(guild_id: str, wake_id: str) -> str:
 
 def batch_dropped_key(guild_id: str, wake_id: str) -> str:
     return f"{batch_key(guild_id, wake_id)}:dropped"
+
+
+def forum_batch_key(guild_id: str, wake_id: str) -> str:
+    """The forum-post pending list a wake claimed, beside its batch."""
+    return f"{batch_key(guild_id, wake_id)}:forum"
+
+
+def forum_batch_dropped_key(guild_id: str, wake_id: str) -> str:
+    return f"{forum_batch_key(guild_id, wake_id)}:dropped"
 
 
 def lease_key(guild_id: str) -> str:

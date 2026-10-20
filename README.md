@@ -70,6 +70,11 @@ marked that guild `external` in Redis.
   does not is never shown them. While running it keeps
   `proactive:v1:capability:forum-posts` set (3-minute expiry), and the bot
   routes a forum post's messages to the worker only while that key is set.
+  Those messages travel on keys of their own: `proactive:v1:forum-ready`,
+  and per guild `forum-wake`, `forum-pending` and `forum-pending-dropped`.
+  This worker reads them beside the shared keys, under the same guild lease;
+  an older replica still running mid-rollout never reads them, so it cannot
+  take a post's wake and drop it.
 - Waking envelopes go to `proactive:v1:{guild:<id>}:wake`; non-waking context
   waits in the guild's bounded pending list until the next wake.
 - Workers use consumer groups and a guild lease, so replicas process different

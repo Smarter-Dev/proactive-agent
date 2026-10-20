@@ -50,6 +50,9 @@ from proactive_agent.keys import (
     DEAD_LETTER_STREAM_KEY,
     PRIVACY_PURGE_STREAM_KEY,
     batch_key_pattern,
+    forum_pending_dropped_key,
+    forum_pending_key,
+    forum_wake_stream_key,
     lease_key,
     pending_dropped_key,
     pending_key,
@@ -1005,18 +1008,25 @@ class PrivacyPurgeConsumer:
         the first attempt too. Dead letters: _discard_dead_letters.
         """
         dropped = 0
-        stream = wake_stream_key(guild_id)
-        entry_ids = [
-            _decode(entry_id) for entry_id, _fields in await self._redis.xrange(stream)
+        # A forum post's notifications have a stream and list of their own.
+        for stream in (wake_stream_key(guild_id), forum_wake_stream_key(guild_id)):
+            entry_ids = [
+                _decode(entry_id)
+                for entry_id, _fields in await self._redis.xrange(stream)
+            ]
+            if entry_ids:
+                try:
+                    await self._redis.xack(stream, WAKE_GROUP, *entry_ids)
+                except ResponseError:
+                    pass  # no consumer group yet: nothing was delivered
+                await self._redis.xdel(stream, *entry_ids)
+                dropped += len(entry_ids)
+        keys = [
+            pending_key(guild_id),
+            pending_dropped_key(guild_id),
+            forum_pending_key(guild_id),
+            forum_pending_dropped_key(guild_id),
         ]
-        if entry_ids:
-            try:
-                await self._redis.xack(stream, WAKE_GROUP, *entry_ids)
-            except ResponseError:
-                pass  # no consumer group yet: nothing was delivered
-            await self._redis.xdel(stream, *entry_ids)
-            dropped += len(entry_ids)
-        keys = [pending_key(guild_id), pending_dropped_key(guild_id)]
         async for key in self._redis.scan_iter(match=batch_key_pattern(guild_id)):
             keys.append(_decode(key))
         for key in keys:
