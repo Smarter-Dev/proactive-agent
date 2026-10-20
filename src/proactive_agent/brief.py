@@ -6,7 +6,7 @@ first after each compaction, get the whole head: YOUR CHANNELS (every
 channel, forum and post with its id and the watch instructions), the
 RECIPES list and YOUR MEMORY, as they are at that wake. Every other wake
 gets only the changes: CHANNEL CHANGES (a channel, forum or post the agent
-was not told about, a channel or forum switched off), RECIPE LIST CHANGES
+was not told about, a channel, forum or post switched off), RECIPE LIST CHANGES
 (a recipe added, edited or gone), and YOUR MEMORY again only when it
 changed. The runner picks the whole head when the history it is about to
 send, after any compaction, holds no YOUR CHANNELS block.
@@ -50,6 +50,7 @@ CHANNEL_LINE = re.compile(
     r".*\(channel_id=(\d+)\)$"
 )
 POST_KINDS = frozenset({"post:", "new post:"})
+POST_NAME = re.compile(r"^- (?:new )?post: (.*) \(channel_id=\d+\)$")
 ROW_NAME = re.compile(
     r"^- (?:new )?(channel|forum) (#.*?)(?:, whose posts| \(channel_id=)"
 )
@@ -72,7 +73,8 @@ class Told:
     whole: bool = False
     # Channel and forum id -> (kind, "#name").
     rows: dict[str, tuple[str, str]] = field(default_factory=dict)
-    posts: set[str] = field(default_factory=set)
+    # Post id -> its label.
+    posts: dict[str, str] = field(default_factory=dict)
     # Each listed recipe as "name: preview".
     recipes: set[str] = field(default_factory=set)
     # YOUR MEMORY's text below its heading.
@@ -117,12 +119,15 @@ def channel_entry(
 @dataclass
 class Channels:
     """The channels of this wake: the enabled rows' text channels, the
-    enabled forums, the posts admitted so far, and the watch instructions."""
+    enabled forums, the posts admitted so far, and the watch instructions;
+    and the posts the agent was told about that are switched off on their
+    own while their forum is on."""
 
     channels: dict[str, str]
     forums: dict[str, dict]
     posts: dict[str, str]
     stores: dict[str, InstructionStore]
+    posts_off: set[str] = field(default_factory=set)
 
     def lines(self) -> list[str]:
         lines: list[str] = []
@@ -168,6 +173,12 @@ class Channels:
                 f"- switched off: the {kind} {name}; you no longer watch it"
                 f"{its_posts} or act there (channel_id={channel_id})"
             )
+        for post_id, label in told.posts.items():
+            if post_id in self.posts_off:
+                lines.append(
+                    f"- switched off: the post {label}; you no longer watch it "
+                    f"or act there (channel_id={post_id})"
+                )
         if not lines:
             return ""
         return "\n".join([CHANNEL_CHANGES_INTRO, *lines])
@@ -278,8 +289,10 @@ def _tell_channel(state: Told, line: str) -> None:
     kind, channel_id = match[1], match[2]
     if kind == "switched off:":
         state.rows.pop(channel_id, None)
+        state.posts.pop(channel_id, None)
     elif kind in POST_KINDS:
-        state.posts.add(channel_id)
+        named = POST_NAME.match(line)
+        state.posts[channel_id] = named[1] if named else ""
     elif named := ROW_NAME.match(line):
         state.rows[channel_id] = (named[1], named[2])
 

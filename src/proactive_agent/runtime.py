@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -441,7 +442,13 @@ class GuildRuntime:
         # changes otherwise (#278); the recipe notices start both, where
         # they are read back, and the memory ends them.
         told_so_far = told(self.engine.agent_runner.history)
-        current = Channels(row_channels, forums, dict(posts), instruction_stores)
+        current = Channels(
+            row_channels,
+            forums,
+            dict(posts),
+            instruction_stores,
+            await self._posts_switched_off(told_so_far.posts.keys() - posts, forums),
+        )
 
         def scrub(text: str) -> str:
             return scrub_blocked_ids(text, self.blocked_users)
@@ -1116,6 +1123,26 @@ class GuildRuntime:
         if own is not None and not own.get("enabled"):
             return None  # /proactive off in the post: just this post is off
         return forum_id, forum_post_label(post, forums[forum_id], self.blocked_users)
+
+    async def _posts_switched_off(
+        self, post_ids: Iterable[str], forums: dict[str, dict]
+    ) -> set[str]:
+        """Those of these posts, told to the agent and not admitted this
+        wake, that are switched off on their own while their forum is on. A
+        post whose forum is off goes with the forum's own notice."""
+        switched_off: set[str] = set()
+        for post_id in sorted(post_ids):
+            if post_id in self.forum_parents:
+                self.forum_parents.move_to_end(post_id)
+                forum_id = self.forum_parents[post_id]
+            else:
+                forum_id, _post = await self._forum_parent(post_id)
+            if forum_id not in forums:
+                continue
+            own = await self.api.get_channel_settings(self.guild_id, post_id)
+            if own is not None and not own.get("enabled"):
+                switched_off.add(post_id)
+        return switched_off
 
     async def _record_usage(
         self, batch: WakeBatch, result: ActivationResult, responses: int

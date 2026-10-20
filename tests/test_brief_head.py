@@ -303,6 +303,53 @@ async def test_a_post_told_about_earlier_stays_usable_while_its_forum_is_on():
     await writer.close()
 
 
+async def test_a_post_switched_off_on_its_own_is_noticed_once():
+    runtime, writer, api = list_runtime(
+        [text_row(), forum_row()],
+        script=[
+            None,
+            None,
+            ("send_channel_message", {"channel_id": POST, "content": "Any luck?"}),
+            None,
+            None,
+            None,
+        ],
+    )
+    await runtime.process(wake_batch(POST))
+
+    # /proactive off in the post alone; its forum stays on.
+    api.get_channel_settings.return_value = {"enabled": False}
+    await runtime.process(wake_batch(TEXT))
+    await runtime.process(wake_batch(TEXT))
+    assert POST not in told(runtime.engine.agent_runner.history).posts
+    # Back on: the next wake about it introduces it again.
+    api.get_channel_settings.return_value = {"enabled": True}
+    await runtime.process(wake_batch(POST))
+    # Its forum off too: the forum's notice covers the post.
+    api.rows = [text_row()]
+    api.get_channel_settings.return_value = {"enabled": False}
+    await runtime.process(wake_batch(TEXT))
+
+    _, second, third, fourth, fifth = briefs(runtime)
+    assert block(second, CHANNEL_CHANGES_INTRO).split("\n")[1:] == [
+        f"- switched off: the post {POST_LABEL}; you no longer watch it or act "
+        f"there (channel_id={POST})"
+    ]
+    assert "CHANNEL CHANGES" not in third
+    assert block(fourth, CHANNEL_CHANGES_INTRO).split("\n")[1] == (
+        f"- new post: {POST_LABEL} (channel_id={POST})"
+    )
+    assert [
+        line.split(";")[0] for line in block(fifth, CHANNEL_CHANGES_INTRO).split("\n")
+    ][1:] == ["- switched off: the forum #help-forum"]
+    history = runtime.engine.agent_runner.history
+    assert tool_results(history, "send_channel_message") == [
+        f"Channel {POST} is not enabled for the proactive bot. {RECIPE_CHANNEL_HINT}"
+    ]
+    runtime.discord.send_message.assert_not_awaited()
+    await writer.close()
+
+
 async def test_list_channels_shows_forums_posts_and_instructions_for_free():
     runtime, writer, _ = list_runtime(
         [text_row(), forum_row()], script=[("list_channels", {}), None]
@@ -364,13 +411,13 @@ def test_changes_after_recipe_notices_are_read_and_a_full_list_starts_over():
         TEXT: ("channel", "#general"),
         RANDOM: ("channel", "#random"),
     }
-    assert state.posts == {POST}
+    assert state.posts == {POST: POST_LABEL}
     history += wake_with(
         f"{CHANNEL_LIST_INTRO}\n- channel #random (channel_id={RANDOM})\n"
         "  - no watch instructions"
     )
     state = told(history)
-    assert (state.rows, state.posts) == ({RANDOM: ("channel", "#random")}, set())
+    assert (state.rows, state.posts) == ({RANDOM: ("channel", "#random")}, {})
 
 
 def test_every_notification_names_its_channel_id():
@@ -386,7 +433,10 @@ def test_the_prompts_say_how_the_head_arrives():
         "picture: YOUR CHANNELS, the RECIPES list and YOUR MEMORY."
     ) in prompt
     assert "CHANNEL CHANGES introduces a channel or forum post" in prompt
-    assert "a post you were told about stays yours while its forum is on" in prompt
+    assert (
+        "a post you were told about stays yours while its forum is on, until "
+        "CHANNEL CHANGES says that post is switched off."
+    ) in prompt
     compaction = " ".join(COMPACTION_PROMPT.split())
     assert (
         "Your next brief brings back, whole and as they are then, YOUR CHANNELS "
@@ -398,6 +448,10 @@ def test_the_prompts_say_how_the_head_arrives():
 
 def test_the_closing_guidance_is_in_the_system_prompt_not_each_brief():
     prompt = " ".join(GUILD_AGENT_SYSTEM_PROMPT.split())
+    assert (
+        "A notification is a lead, not the full story — pull context with your "
+        "tools when it isn't enough. Act per your policy (or deliberately don't)."
+    ) in prompt
     assert "If anything in this wake deserves a follow-up" in prompt
     assert (
         "call set_watch_instruction now with a TTL. Then finish with a "
