@@ -188,6 +188,25 @@ class ApplicationAPI:
         )
         return response.json()
 
+    async def list_recipes(self, guild_id: str) -> dict[str, Any] | None:
+        """The guild's enabled recipes, previews only (#267); None when the
+        application predates recipes."""
+        response = await self._request(
+            "GET", f"/guilds/{guild_id}/proactive-recipes", allow_not_found=True
+        )
+        return None if response is None else response.json()
+
+    async def open_recipe(self, guild_id: str, name: str) -> dict[str, Any] | None:
+        """One enabled recipe whole; None when it is unknown or switched off
+        (or the application predates recipes)."""
+        response = await self._request(
+            "GET",
+            f"/guilds/{guild_id}/proactive-recipes/by-name",
+            params={"name": name},
+            allow_not_found=True,
+        )
+        return None if response is None else response.json()
+
     async def reserve_search_preview(self, query: str) -> dict[str, Any]:
         return (
             await self._request("POST", "/search-previews", json={"query": query})

@@ -155,6 +155,10 @@ class AgentDeps:
     # Drains the channel's notification queue mid-run (rendered text, marks
     # the covered messages consumed); None means nothing queues mid-run.
     drain_notifications: Callable[[], str | Awaitable[str]] | None = None
+    # Opens one of the guild's recipes by name (#267): the recipe whole, or
+    # a refusal for one that is unknown or switched off. None means there
+    # are no recipes here (replay evals).
+    open_recipe: Callable[[str], Awaitable[str]] | None = None
     # Environments already resolved from a callable provider this wake; in
     # production the provider hits Discord REST, so each channel is fetched
     # at most once no matter how many tools read it.
@@ -634,6 +638,16 @@ def build_kimi_agent(
 
     @agent.tool
     @tool_errors_returned
+    async def open_recipe(ctx: RunContext[AgentDeps], name: str) -> str:
+        """Open one of this server's recipes by its name (listed under RECIPES
+        in your brief) and read its full instructions. Free — never spends
+        your tool budget."""
+        if ctx.deps.open_recipe is None:
+            return "There are no recipes here."
+        return await ctx.deps.open_recipe(name)
+
+    @agent.tool
+    @tool_errors_returned
     async def list_channels(ctx: RunContext[AgentDeps]) -> str:
         """List every channel you are enabled in, with its channel_id. Free —
         never spends your tool budget."""
@@ -669,7 +683,16 @@ promised <456…:kyra> you would …") — never quote
 anyone in a way that could later be misread as a different user speaking, and
 never leave a fact floating without its person and channel. Be specific:
 names, channel ids and message ids you may need again. This note is for you
-alone."""
+alone.
+
+RECIPES. A recipe is a set of instructions this server's admins wrote, which
+you read with open_recipe; its text starts with a `[RECIPE id=… revision=…]`
+line. For each recipe you opened above, or that an earlier note kept: if you
+still need it, copy it into this note verbatim, its `[RECIPE …]` line
+included; otherwise leave it out entirely and just mention its name, so you
+can open it again. Never summarise or paraphrase a recipe, and never copy only
+part of one. A recipe your brief said was edited, switched off or deleted
+since you opened it gets its name only."""
 
 
 async def self_compaction_summary(
@@ -919,6 +942,9 @@ what the other person said or decided without attributing anything to the
 person being forgotten.
 - Do not say that anyone was removed, that a purge happened, or that anything
 is missing.
+- Recipes: keep them as names only. Copy no recipe's text into this note,
+not even part of it; you can open it again. A recipe's text may mention this
+person, and a copy with them cut out would be a partial copy.
 
 Normal compaction rules:
 {compaction_rules}"""
