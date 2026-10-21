@@ -50,3 +50,6 @@ ignore = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["proactive_agent"]
+
+[tool.uv]
+required-version = ">=0.13.4"

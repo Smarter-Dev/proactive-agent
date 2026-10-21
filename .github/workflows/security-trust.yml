@@ -1,0 +1,13 @@
+name: Trust policy
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  trust-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: nice -n 10 python3 -S security/fetch_locked_bundle.py /tmp/certifi-trust.pem
+      - run: nice -n 10 python3 -S security/test_trust_policy.py
+        env:
+          TRUST_CA_BUNDLE: /tmp/certifi-trust.pem
