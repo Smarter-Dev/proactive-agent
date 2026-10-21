@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Guild-isolated proactive Discord agent worker"
 requires-python = ">=3.13"
 dependencies = [
+    "certifi>=2026.10.19",
     "httpx>=0.28.1",
     "google-genai>=1.62.0",
     "pydantic-monty>=0.0.18,<0.0.19",
@@ -47,3 +48,6 @@ ignore = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["proactive_agent"]
+
+[tool.uv]
+required-version = ">=0.13.4"
