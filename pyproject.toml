@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Guild-isolated proactive Discord agent worker"
 requires-python = ">=3.13"
 dependencies = [
-    "certifi>=2026.10.19",
     "httpx>=0.28.1",
     "google-genai>=1.62.0",
     "pydantic-monty>=0.0.18,<0.0.19",
@@ -13,6 +12,9 @@ dependencies = [
     "redis>=6.2.0",
     "pydantic-ai-slim[anthropic,google,openai]>=2.57.0,<3.0.0",
     "pdfplumber>=0.11.0",
+    # Floor from the eMudhra/emSign CA key incident (GHSA-6q48-6c7w-9gw2,
+    # Oct 2026): older bundles trust roots with compromised intermediates.
+    "certifi>=2026.10.19",
 ]
 
 [dependency-groups]

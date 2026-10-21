@@ -14,6 +14,8 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 
+# Keep the merged pip floor; use patched uv to download its replacement safely.
+RUN uv pip install --system --upgrade "pip>=26.2.2"
 RUN uv sync --frozen --no-dev
 RUN .venv/bin/python -I -c 'import ssl, certifi, hashlib; ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(certifi.where()); certs = ctx.get_ca_certs(binary_form=True); assert len(certs) > 50; assert "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b" not in {hashlib.sha256(c).hexdigest() for c in certs}'
 
