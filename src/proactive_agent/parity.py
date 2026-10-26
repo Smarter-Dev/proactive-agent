@@ -385,10 +385,11 @@ def _format_remaining(status: dict) -> str:
 
 
 async def remember(ctx, text: str) -> str:
-    """Keep a short first-person memory attributed to this channel. Name every
-    person as a tag, `<userid:username>` like `<123456789012345678:kai>`, with
-    the uid from the transcript (`<:username>` only for someone you have no id
-    for)."""
+    """Keep a short first-person memory attributed to this channel. A note is
+    at most 500 characters, so write one short lesson per note; a longer one
+    is refused, not cut. Name every person as a tag, `<userid:username>` like
+    `<123456789012345678:kai>`, with the uid from the transcript (`<:username>`
+    only for someone you have no id for)."""
     note = (text or "").strip()
     if not note:
         return "there was nothing in that one to keep."
@@ -404,8 +405,11 @@ async def remember(ctx, text: str) -> str:
         for value in ctx.deps.saved_memory_texts
     ):
         return "you already noted that one."
-    trimmed = len(note) > MAX_MEMORY_NOTE_CHARS
-    note = note[:MAX_MEMORY_NOTE_CHARS]
+    if len(note) > MAX_MEMORY_NOTE_CHARS:
+        return (
+            f"that's {len(note)} characters; the limit is {MAX_MEMORY_NOTE_CHARS}."
+            " Shorten it and call remember again."
+        )
     try:
         result = await ctx.deps.api.save_memory_note(
             ctx.deps.guild_id,
@@ -426,9 +430,7 @@ async def remember(ctx, text: str) -> str:
         }.get(result.get("reason"), "couldn't save that note right now.")
     ctx.deps.memories_saved_this_turn += 1
     ctx.deps.saved_memory_texts.append(note)
-    return (
-        "kept it, trimmed a bit." if trimmed else "got it — that one's staying with me."
-    )
+    return "got it — that one's staying with me."
 
 
 async def register_handler(
