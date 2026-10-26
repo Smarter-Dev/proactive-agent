@@ -44,7 +44,12 @@ from proactive_agent.optout_gate import (
     scrub_history,
     scrub_memory,
 )
-from proactive_agent.parity import REMEMBER_OPTED_OUT, ProactiveDeps, remember
+from proactive_agent.parity import (
+    MAX_MEMORY_NOTE_CHARS,
+    REMEMBER_OPTED_OUT,
+    ProactiveDeps,
+    remember,
+)
 from proactive_agent.runtime import render_memory_block
 from proactive_agent.transcript import BLOCKED_LINE
 
@@ -157,6 +162,39 @@ async def test_server_opted_out_reason_maps_to_the_sentence(redis_client, monkey
 
     assert answer == REMEMBER_OPTED_OUT
     assert len(api.notes) == 1
+
+
+async def test_remember_refuses_an_over_long_note_and_saves_nothing(
+    redis_client, monkeypatch
+):
+    monkeypatch.delenv("CHAT_MEMORY_ENABLED", raising=False)
+    api = GateAPI()
+    blocked = await blocked_list(redis_client, api, [])
+    ctx = remember_ctx(api, blocked)
+
+    answer = await remember(ctx, "x" * 640)
+
+    assert answer == (
+        "that's 640 characters; the limit is 500. Shorten it and call remember again."
+    )
+    assert api.notes == []
+    assert ctx.deps.memories_saved_this_turn == 0
+    assert ctx.deps.saved_memory_texts == []
+
+
+async def test_remember_saves_a_note_of_exactly_the_limit(redis_client, monkeypatch):
+    monkeypatch.delenv("CHAT_MEMORY_ENABLED", raising=False)
+    api = GateAPI()
+    blocked = await blocked_list(redis_client, api, [])
+    ctx = remember_ctx(api, blocked)
+    note = "y" * MAX_MEMORY_NOTE_CHARS
+
+    answer = await remember(ctx, note)
+
+    assert answer == "got it — that one's staying with me."
+    assert [posted["content"] for posted in api.notes] == [note]
+    assert ctx.deps.memories_saved_this_turn == 1
+    assert ctx.deps.saved_memory_texts == [note]
 
 
 async def test_runtime_deps_carry_the_blocked_list(redis_client, monkeypatch):
@@ -419,6 +457,11 @@ async def test_a_blocked_members_tag_goes_whole_and_its_line_is_dropped(
     assert names_blocked_user(f"hi <{TARGET}:{TARGET_NAME}>", blocked)
     assert not names_blocked_user(f"hi <{BYSTANDER}:{BYSTANDER_NAME}> <:sam>", blocked)
     assert scrub_memory(bundle, blocked)["content"] == kept
+
+
+def test_remember_tells_the_model_the_note_limit():
+    assert MAX_MEMORY_NOTE_CHARS == 500
+    assert f"at most {MAX_MEMORY_NOTE_CHARS} characters" in remember.__doc__
 
 
 def test_remember_tells_the_model_to_tag_people():
