@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC
+from pathlib import Path
 
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
@@ -27,11 +28,9 @@ from proactive_agent.environment import (
 from proactive_agent.types import ActivationResult
 from proactive_agent.usage_meter import UsageMeter, wake_meter
 
-SKIM_SYSTEM_PROMPT = """\
-You skim Discord transcripts for a chat agent. Summarize what is happening
-in a short paragraph, then list the load-bearing messages VERBATIM as
-`[id=<message id>] <display name> (user id <author id>): <content>` lines.
-Keep it brief; the agent can look up anything by id."""
+_PROMPTS = Path(__file__).parent / "prompts"
+
+SKIM_SYSTEM_PROMPT = (_PROMPTS / "skim_system_prompt.md").read_text(encoding="utf-8")
 
 
 def _merge_usage(usage_by_model: dict, model_id: str, usage: dict) -> None:
@@ -98,16 +97,7 @@ def render_notifications(
     return "\n".join(lines)
 
 
-WAKE_GUIDANCE = """\
-A notification is a lead, not the full story — pull context with your tools
-when it isn't enough. Act per your policy (or deliberately don't).
-
-Before you finish: the watcher will not wake you again except for direct
-engagement or activity it independently judges interesting. If anything here
-deserves a follow-up you would otherwise never hear about — someone said
-they'd report back, a thread you want to see resolved, a topic worth
-catching — call set_watch_instruction now with a TTL. Then finish with a
-one-sentence note on what you did and why."""
+WAKE_GUIDANCE = (_PROMPTS / "wake_guidance.md").read_text(encoding="utf-8")
 
 
 def build_wake_brief(

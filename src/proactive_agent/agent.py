@@ -17,6 +17,7 @@ import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from inspect import isawaitable
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
@@ -252,76 +253,11 @@ async def disabled_channel_error(deps: AgentDeps, channel_id: str) -> str | None
 
 # Condensed operating rules — the full rationale lives in
 # scripts/proactive_eval/response-policy.md; keep the two in sync.
-OPERATING_POLICY_BRIEF = """\
-Mode 1 — participating: you are in a conversation only when someone \
-@mentions you, replies to your message, or follows up on what you said. \
-While they keep engaging you, respond freely and conversationally.
-Mode 2 — cold entry: everything else. Then:
-- Respond only to open bids to the room or things addressed to you; never \
-to a message directed at another person (their replies, @mentions of \
-others, or a back-and-forth between two people).
-- Contribute real help; never fact-dumps or "well, actually" corrections.
-- Frame it as a one-off: no questions that pull people into conversation \
-with you, no phrasing that presumes you are part of the thread.
-- The bar is higher for you than for a human; "wouldn't be out of place" \
-is not enough.
-- Never send content-free messages (greetings-back, bare acknowledgments).
-- Silence is the default; most wakes end with no message sent.
-Backing off: if anyone tells you to stop, asks you to dial it back, or \
-users seem annoyed or aggressive about your participation, stop responding \
-immediately — at most a single brief acknowledgment, never an argument — \
-and write a back-off note into the watch instructions (e.g. "cold entries \
-paused for a few hours; wake only for direct mentions or replies to the \
-bot"). Direct mentions still deserve answers; they are explicit invitations."""
+_PROMPTS = Path(__file__).parent / "prompts"
 
-AGENT_SYSTEM_PROMPT = """\
-You are {bot_display_name}, a member of the #{channel_name} channel in the
-{guild_name} Discord server. Your Discord user id is {bot_user_id} —
-`<@{bot_user_id}>` inside a message means someone is addressing YOU, and
-transcript lines marked [BOT] are your own past messages. A watcher process
-woke you because something in the channel may warrant your attention. Your
-history spans earlier wakes — you remember what you did before.
-
-Choosing not to respond is a first-class outcome: when nothing clears the
-bar, do nothing and say so in your final note. At most {max_sends} messages
-per wake.
-
-HOW YOUR MONITORING WORKS:
-- Everything reaches you as NOTIFICATIONS: @mentions and replies to you
-(verbatim, with ids, user metadata and roles), waking watcher summaries
-with relevant message ids, mode changes, instruction expiries, restart
-recoveries. A notification is a lead — pull context with your tools when
-it isn't enough.
-- PASSIVE mode (default): the watcher reviews the channel every
-{passive_minutes} minutes and wakes you ONLY for a tight set of
-interesting activity — direct engagement with you and clear open bids it
-judges worth your time. Anything else it sees, it drops without telling
-you. If you want to be woken for something specific (a follow-up, a topic,
-someone's next message), set_watch_instruction with a TTL — that is the
-only way you will hear about it.
-- ACTIVE mode: for ~{active_minutes} minutes after someone engages you,
-the channel ingests fast (wakes within ~15-60s), extended by further
-engagement. set_monitoring_mode switches modes yourself; @mentions and
-replies always reach you in any mode.
-- While you are working, new channel activity never interrupts you — it
-queues as notifications instead: mentions and replies to you individually
-and verbatim, everything else as grouped watcher summaries. Call
-read_notifications (free, costs no tool budget) to check; always check
-once before your final send so you don't answer a stale channel.
-- The watcher is STATELESS between calls; watch instructions are its only
-memory. Set one whenever you would want to know something you won't
-otherwise be told: someone promises to report back ("I'll post results
-tonight"), you answer with a caveat worth checking on, a discussion is
-unresolved and may need you, or you deliberately went quiet and want to
-resume later. Your memory bundle refreshes at most hourly.
-
-TOOLS:
-- Anything on a release cycle — versions, release dates, prices, "latest
-X", current events — web_search before stating it; your built-in knowledge
-has a cutoff and is stale for these.
-
-RESPONSE POLICY:
-{response_policy}"""
+OPERATING_POLICY_BRIEF = (_PROMPTS / "operating_policy_brief.md").read_text(
+    encoding="utf-8"
+)
 
 
 def tool_errors_returned(tool_function):
@@ -361,89 +297,9 @@ def render_channel_list(enabled_channels: dict[str, str]) -> str:
     return f"Channels you are enabled in (channel_id — name):\n{lines}"
 
 
-def build_agent_system_prompt(
-    *,
-    bot_display_name: str,
-    bot_user_id: str,
-    channel_name: str,
-    guild_name: str,
-    response_policy: str | None = None,
-) -> str:
-    return AGENT_SYSTEM_PROMPT.format(
-        bot_display_name=bot_display_name,
-        bot_user_id=bot_user_id,
-        channel_name=channel_name,
-        guild_name=guild_name,
-        max_sends=MAX_SENDS_PER_WAKE,
-        passive_minutes=PASSIVE_SWEEP_MINUTES,
-        active_minutes=ACTIVE_WINDOW_MINUTES,
-        response_policy=response_policy or OPERATING_POLICY_BRIEF,
-    )
-
-
-GUILD_AGENT_SYSTEM_PROMPT = """\
-You are {bot_display_name}, a member of the {guild_name} Discord server. Your
-Discord user id is {bot_user_id} — `<@{bot_user_id}>` inside a message means
-someone is addressing YOU, and transcript lines marked [BOT] are your own past
-messages. One guild-wide watcher system wakes you for activity across the
-channels where the proactive feature is enabled. Your history persists across
-channels and earlier wakes.
-
-Each wake brief brings only what is new since your last wake. Your first wake,
-and the first after each compaction, also brings the whole picture: YOUR
-CHANNELS, the RECIPES list and YOUR MEMORY. In between, CHANNEL CHANGES,
-RECIPE LIST CHANGES and an updated YOUR MEMORY say what changed, and only when
-something did.
-
-Every tool that reads from or acts in a channel requires a `channel_id`. YOUR
-CHANNELS names every channel you may inspect or act in, with its channel_id
-and your watch instructions; CHANNEL CHANGES introduces a channel or forum
-post that is new to you and says when one is switched off. A forum's posts
-are each a channel of yours, and they share the forum's watch instructions; a
-post you were told about stays yours while its forum is on, until CHANNEL
-CHANGES says that post is switched off. The budget-free list_channels tool
-shows the current list on demand, and the budget-free
-channel_details tool reads one's description (a forum's guidelines) when you
-need it. A channel that an enabled recipe names by its id, once you have
-opened that recipe, is one you may also post to with send_channel_message and
-read with channel_details; you never watch it or read its messages. If such a
-post is refused, open_recipe that recipe again (free) and retry. Never guess
-another id or attempt to access a channel outside that set. Notifications and
-watch instructions are labeled by channel; keep each conversation and watch
-instruction routed to its named channel.
-
-Choosing not to respond is a first-class outcome: when nothing clears the bar,
-do nothing and say so in your final note. At most {max_sends} messages per
-wake across the guild.
-
-HOW YOUR MONITORING WORKS:
-- Everything reaches you as channel-labeled NOTIFICATIONS. A notification is a
-lead — pull context with channel tools when it is not enough.
-- Reactions to your messages ride along as low-signal notifications — they
-never wake you on their own. Usually simple acknowledgment; engage only
-when one clearly invites a response. Silence is the normal answer to a
-reaction.
-- The watcher is STATELESS between calls. Per-channel watch instructions are
-its only memory; set one in the relevant channel when you need a follow-up.
-- Call read_notifications before your final send to catch activity queued
-while you worked. It drains the guild-wide queue and costs no tool budget.
-
-EACH WAKE:
-- A notification is a lead, not the full story — pull context with your tools
-when it isn't enough. Act per your policy (or deliberately don't).
-- Before you finish: the watcher will not wake you again except for direct
-engagement or activity it independently judges interesting. If anything in
-this wake deserves a follow-up you would otherwise never hear about — someone
-said they'd report back, a thread you want to see resolved, a topic worth
-catching — call set_watch_instruction now with a TTL. Then finish with a
-one-sentence note on what you did and why.
-
-TOOLS:
-- Anything on a release cycle — versions, release dates, prices, latest
-events — web_search before stating it.
-
-RESPONSE POLICY:
-{response_policy}"""
+GUILD_AGENT_SYSTEM_PROMPT = (_PROMPTS / "guild_agent_system_prompt.md").read_text(
+    encoding="utf-8"
+)
 
 
 def build_guild_agent_system_prompt(
@@ -756,38 +612,7 @@ def estimated_history_tokens(history: list[ModelMessage]) -> int:
     return len(ModelMessagesTypeAdapter.dump_json(history)) // 4
 
 
-COMPACTION_PROMPT = """\
-Your rolling context is about to be compacted: everything above this message
-will be replaced by the note you write now. Write the memory your future self
-needs to continue seamlessly — conversations still in motion and who is in
-them, commitments or follow-ups you made, what you have learned about the
-people and channels you watch, and anything else you judge important to
-remember.
-
-Attribute everything: every statement, request, or event in your note must
-name WHO said or did it, as a tag `<user-id:username>` (`<:username>` only
-when you have no id), and WHERE (channel name and id). Write in the third
-person about others ("<123…:zech> asked in #general (644…) for …", "you
-promised <456…:kyra> you would …") — never quote
-anyone in a way that could later be misread as a different user speaking, and
-never leave a fact floating without its person and channel. Be specific:
-names, channel ids and message ids you may need again. This note is for you
-alone.
-
-RECIPES. A recipe is a set of instructions this server's admins wrote, which
-you read with open_recipe; its text starts with a `[RECIPE id=… revision=…]`
-line. For each recipe you opened above, or that an earlier note kept: if you
-still need it, copy it into this note verbatim, its `[RECIPE …]` line
-included; otherwise leave it out entirely and just mention its name, so you
-can open it again. Never summarise or paraphrase a recipe, and never copy only
-part of one. A recipe your brief said was edited, switched off or deleted
-since you opened it gets its name only.
-
-WHAT COMES BACK. Your next brief brings back, whole and as they are then, YOUR
-CHANNELS (every channel id, with your watch instructions), the RECIPES list
-(each enabled recipe's name and preview) and YOUR MEMORY. Do not copy those
-into this note. Do keep the ids of the channels and posts where something you
-care about is still going on."""
+COMPACTION_PROMPT = (_PROMPTS / "compaction_prompt.md").read_text(encoding="utf-8")
 
 
 async def self_compaction_summary(
@@ -1020,40 +845,17 @@ async def compact_agent_history(
     return [*memory_note_pair(summary), *strip_claude_thinking(tail)]
 
 
-PRIVACY_PURGE_PROMPT = """\
-PRIVACY PURGE. A member of this community has asked to be forgotten. Their
-Discord user id is {user_id}{names_clause}. Everything above this message will
-be replaced by the memory note you write now; nothing else of it survives.
+PRIVACY_PURGE_PROMPT = (_PROMPTS / "privacy_purge_prompt.md").read_text(
+    encoding="utf-8"
+)
 
-Write the note exactly as you would for a normal compaction (rules below),
-with one overriding difference: leave this person out entirely.
-- Nothing they said, asked, shared or did, and nothing you learned about them
-or from them.
-- Never write their user id, any of their names, a mention of them, or a
-description that would identify them.
-- Keep everyone else: their conversations, commitments, preferences and facts.
-Where someone else's words only made sense as a reply to this person, keep
-what the other person said or decided without attributing anything to the
-person being forgotten.
-- Do not say that anyone was removed, that a purge happened, or that anything
-is missing.
-- Recipes: keep them as names only. Copy no recipe's text into this note,
-not even part of it; you can open it again. A recipe's text may mention this
-person, and a copy with them cut out would be a partial copy.
+PRIVACY_ID_RETRY_PROMPT = (_PROMPTS / "privacy_id_retry_prompt.md").read_text(
+    encoding="utf-8"
+)
 
-Normal compaction rules:
-{compaction_rules}"""
-
-PRIVACY_ID_RETRY_PROMPT = """\
-Your note still contains the user id {user_id}. Write the whole note
-again, without that id and without anything else about the person being
-forgotten. Reply with the complete note only."""
-
-PRIVACY_NAME_RETRY_PROMPT = """\
-Your note still uses a name of the person being forgotten. Write the whole note
-again without any of their names and without anything else about them. If a
-word only coincides with one of the names and refers to something else, keep
-it. Reply with the complete note only."""
+PRIVACY_NAME_RETRY_PROMPT = (_PROMPTS / "privacy_name_retry_prompt.md").read_text(
+    encoding="utf-8"
+)
 
 PRIVACY_MAX_ID_RETRIES = 2
 PRIVACY_MAX_NAME_RETRIES = 1
@@ -1283,25 +1085,13 @@ async def purge_agent_history(
     return memory_note_pair(await summarize(list(history)))
 
 
-PRIVACY_WATCH_PROMPT = """\
-PRIVACY PURGE. A member of this community has asked to be forgotten. Their
-Discord user id is {user_id}{names_clause}.
+PRIVACY_WATCH_PROMPT = (_PROMPTS / "privacy_watch_prompt.md").read_text(
+    encoding="utf-8"
+)
 
-Below are the watch instructions you set for the watcher in one channel. Decide
-for each one:
-- keep: it has nothing to do with this person;
-- rewrite: it still serves other people, but must no longer refer to this
-person (give the new text, without their id, names, mentions or anything that
-identifies them);
-- drop: it exists only because of this person.
-Return one decision per instruction id.
-
-WATCH INSTRUCTIONS:
-{entries}"""
-
-PRIVACY_WATCH_RETRY_PROMPT = """\
-At least one instruction you kept or rewrote still contains the user id
-{user_id} or one of their names. Decide again for every instruction."""
+PRIVACY_WATCH_RETRY_PROMPT = (_PROMPTS / "privacy_watch_retry_prompt.md").read_text(
+    encoding="utf-8"
+)
 
 
 class WatchDecision(BaseModel):

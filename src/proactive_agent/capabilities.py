@@ -24,113 +24,16 @@ from proactive_agent.image_generator import apply_palette
 from proactive_agent.models import reasoning_settings
 from proactive_agent.usage_meter import metered
 
-WEB_SUMMARY_PROMPT = """\
-You summarize fetched web content to satisfy a specific INSTRUCTION from \
-another assistant. You are given the page's URL and title, the INSTRUCTION \
-describing what the requester wants, and the page CONTENT as readable text \
-(markdown), which may be long.
-
-Follow these rules:
-- Obey the INSTRUCTION precisely: focus on exactly what it asks for, leave out \
-what it says to ignore, and match the requested level of detail.
-- When the INSTRUCTION asks you to find, extract, identify, or report specific \
-details, default to brief verbatim excerpts enclosed in quotation marks. Do not \
-silently paraphrase those details: the answer MUST contain at least one relevant \
-verbatim excerpt in quotation marks, and merely restating source wording without \
-quotation marks does not satisfy this rule. Paraphrase when the INSTRUCTION \
-explicitly asks for a summary, explanation, or paraphrase. If it explicitly \
-requests quotations, quote exactly.
-- Read every fact in the context of the whole document — its structure, \
-purpose, and surrounding text — not as an isolated snippet. Note when a detail \
-is qualified, dated, conditional, or contradicted elsewhere on the page, since \
-that context can change its meaning.
-- Stay grounded in the CONTENT. Do not add outside knowledge, infer beyond what \
-the text supports, or speculate.
-- Be concise: at most about 5 paragraphs, and fewer when the instruction asks \
-for less (e.g. a couple of sentences or a single paragraph). Do not pad.
-- If the CONTENT cannot be meaningfully summarized — it is empty, an error or \
-login/paywall page, pure boilerplate/navigation, or garbled — OR it does not \
-contain what the INSTRUCTION is asking for, then say plainly that you cannot \
-provide a meaningful summary and briefly state why. Never invent a summary to \
-fill the gap."""
-
 _PROMPTS = Path(__file__).parent / "prompts"
+
+WEB_SUMMARY_PROMPT = (_PROMPTS / "web_summary_prompt.md").read_text(encoding="utf-8")
+
 HANDLER_AUTHOR_PROMPT = (_PROMPTS / "handler_author.md").read_text(encoding="utf-8")
 HANDLER_JUDGE_PROMPT = (_PROMPTS / "handler_judge.md").read_text(encoding="utf-8")
 
-IMAGE_REVIEW_PROMPT = """\
-You are a strict gate on image-generation prompts for a developer-community \
-Discord bot. Approve an image ONLY when its SUBJECT is software, computer \
-science, or mathematics — the topics this community actually discusses — and \
-the image is a diagram, illustration, or figure that exists to explain or \
-illustrate one of those concepts. "Technical-sounding" is NOT enough; the \
-subject itself must be software/CS/math.
+IMAGE_REVIEW_PROMPT = (_PROMPTS / "image_review_prompt.md").read_text(encoding="utf-8")
 
-ALLOWED subjects (approve when the prompt is clearly one of these):
-- Software & CS: data structures, algorithms, control/data flow, state \
-machines, system/service architecture, network and protocol flows, database \
-schemas / ER diagrams, class/UML and OO design, memory layouts, concurrency, \
-compilers/parsers, regex or syntax (railroad) diagrams, version-control graphs, \
-container/deployment/devops topology, and machine-learning model architectures.
-- Mathematics (as used in programming and CS): geometry and trigonometry \
-figures, function graphs, complexity/growth curves, discrete math and graph \
-theory, linear algebra (vectors, matrices), calculus figures, logic and truth \
-tables, and mathematical proofs.
-- Digital logic / low-level computing: logic gates, boolean circuits, and \
-CPU/pipeline or memory diagrams.
-
-A chart, plot, or graph qualifies ONLY when what it plots is code, CS, or \
-mathematical/algorithmic data (e.g. Big-O growth, a training loss curve, a \
-benchmark comparing algorithms). Being "a chart" does not by itself qualify a \
-prompt.
-
-REJECT everything else, including:
-- charts, graphs, or infographics of NON-CS/math data: finance, markets, \
-stocks, economics, business/marketing metrics, demographics, population, polls, \
-sports, or general statistics;
-- other sciences and their diagrams: biology, anatomy, medicine, chemistry, \
-physics, astronomy, geography/maps — loosely "technical" but OUT of scope;
-- politics, news, current events, activism, civics;
-- off-topic subjects (food, travel, sports, celebrities, everyday scenes);
-- art, aesthetics, or decoration for its own sake; memes, jokes, avatars, \
-logos, stickers, wallpapers, mascots;
-- real, identifiable people or public figures;
-- anything sexual, violent, hateful, or otherwise unsafe;
-- vague/empty prompts with no concrete software/CS/math subject to diagram.
-
-When in doubt, REJECT. A prompt that wraps an off-topic or artistic picture in \
-technical-sounding words (a data structure "as fantasy art", "a technical \
-illustration of" something off-topic) must be rejected.
-
-Set ``approved`` accordingly. In ``reason`` give one or two plain sentences \
-addressed to the assistant: if approved, briefly confirm the software/CS/math \
-subject; if rejected, state specifically why it doesn't qualify so the \
-assistant can explain to the user or drop the request. Do not restate these \
-rules verbatim."""
-
-MEDIA_READER_PROMPT = """\
-You examine a single attached media file — an image or an audio clip — to \
-satisfy a specific INSTRUCTION from another assistant. You are given the \
-source URL, the kind of media, the INSTRUCTION, and the file itself.
-
-Follow these rules:
-- Obey the INSTRUCTION precisely: report exactly what it asks for, at the \
-requested level of detail, and include verbatim text/quotations only when it \
-asks (otherwise paraphrase).
-- For an IMAGE: describe only what is actually visible — objects, people, UI, \
-diagrams, charts, and any readable text. Transcribe on-screen text accurately \
-when relevant. Read details in the context of the whole image, not in \
-isolation.
-- For AUDIO: transcribe or summarize what is actually said or heard per the \
-instruction, noting speakers or notable non-speech sounds when relevant.
-- Stay grounded in what is present. Do not guess at, infer, or invent details \
-that are not actually in the media.
-- Be concise: at most about 5 paragraphs, fewer when the instruction asks for \
-less. Do not pad.
-- If the media cannot be meaningfully read — it is blank, corrupt, silent, \
-unintelligible, or it simply does not contain what the INSTRUCTION asks for — \
-say plainly that you cannot provide a meaningful summary and briefly state \
-why. Never fabricate a description to fill the gap."""
+MEDIA_READER_PROMPT = (_PROMPTS / "media_reader_prompt.md").read_text(encoding="utf-8")
 
 
 class HandlerPlan(BaseModel):
