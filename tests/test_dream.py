@@ -20,6 +20,7 @@ INPUTS = {
     "cutoff": "2026-11-05T00:00:00Z",
     "needed": True,
     "base_revision": 3,
+    "inputs_digest": "d1",
     "notes": [{"id": "n1", "line": "00:10Z #dev — the shader shipped"}],
     "user_message": "# Today\n00:10Z #dev — the shader shipped",
 }
@@ -154,9 +155,18 @@ async def test_a_stale_answer_rereads_the_night(redis_client):
     ]
     service, api, writer = await build(redis_client, verdicts, brain)
     api.inputs = INPUTS | {"base_revision": 3}
+    original = api.dream_inputs
+
+    async def moving(guild_id):
+        inputs = await original(guild_id)
+        # The first read is the old night; the re-read carries a new digest.
+        return inputs if not api.submitted else inputs | {"inputs_digest": "d2"}
+
+    api.dream_inputs = moving
 
     assert await service.sweep_once() == {GUILD: "dreamed"}
     assert "has changed" in brain.prompts[1]
+    assert [sent["inputs_digest"] for sent in api.submitted] == ["d1", "d2"]
     await writer.close(timeout=1)
 
 
@@ -202,6 +212,7 @@ def test_submission_carries_the_inputs_not_the_models_claims():
     sent = submission(INPUTS, DreamAnswer(memory="m", facts=None))
     assert sent["facts"] is None and sent["note_ids"] == ["n1"]
     assert sent["base_revision"] == 3
+    assert sent["inputs_digest"] == "d1"
 
 
 def test_memory_block_renders_the_durable_blocks_ahead_of_the_blob():
@@ -213,7 +224,8 @@ def test_memory_block_renders_the_durable_blocks_ahead_of_the_blob():
             "behavior": "Wait to be asked.",
             "facts": "Server is Pine.",
             "content": "kai likes rust",
-        }
+        },
+        identity=True,
     )
 
     assert (
@@ -229,3 +241,19 @@ def test_facts_alone_make_a_memory_block():
     from proactive_agent.runtime import render_memory_block
 
     assert "Server is Pine." in render_memory_block({"facts": "Server is Pine."})
+
+
+def test_personality_and_behavior_stay_out_until_the_flag_is_on():
+    from proactive_agent.runtime import render_memory_block
+
+    memory = {
+        "personality": "Dry.",
+        "behavior": "Wait to be asked.",
+        "facts": "Server is Pine.",
+        "content": "kai likes rust",
+    }
+
+    off = render_memory_block(memory)
+
+    assert "Dry." not in off and "Wait to be asked." not in off
+    assert "Server is Pine." in off and "kai likes rust" in off

@@ -310,4 +310,5 @@ def submission(inputs: dict, answer: DreamAnswer) -> dict:
         "cutoff": inputs["cutoff"],
         "base_revision": inputs["base_revision"],
         "note_ids": [note["id"] for note in inputs["notes"]],
+        "inputs_digest": inputs["inputs_digest"],
     }

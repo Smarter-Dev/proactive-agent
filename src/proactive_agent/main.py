@@ -132,6 +132,7 @@ async def run() -> None:
             media_reader=media_reader,
             author_handler=author_handler,
             blocked_users=blocked_users,
+            render_identity=settings.proactive_dream_enabled,
         )
 
     runtimes = GuildRuntimeRegistry(build_runtime)
