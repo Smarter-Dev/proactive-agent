@@ -207,7 +207,7 @@ Plain markdown only, no HTML.
 
 # The limit
 
-Hard cap: 2000 characters, headings included. When you're over, do NOT compress
+Hard cap: [[memory_limit]] characters, headings included. When you're over, do NOT compress
 everything into a shorter, flatter version of itself — that's how you end up
 remembering everyone equally and nobody at all. Cut whole things: the quietest
 thread, the joke that's gone still, the person you haven't spoken to in weeks.

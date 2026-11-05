@@ -10,8 +10,8 @@ stored, and goes back to the agent in the same conversation, at most
 
 The guild is fenced like an idle fold: the guild lease when the worker owns the
 guild, else the privacy lock, so a dream never runs beside a wake or a purge on
-the same guild. A busy fence is retried on the next tick and costs no attempt; only the guilds
-the worker does not run (``externally_owned``) are dreamed. History is read
+the same guild. A busy fence is retried on the next tick and costs no attempt;
+only the guilds the worker runs (``externally_owned``) are dreamed. History is read
 through the opt-out scrub, and written through the history writer's.
 
 Off unless ``PROACTIVE_DREAM_ENABLED`` is set; the smarter-dev cron dreams
@@ -67,7 +67,7 @@ RUN_TIMEOUT_SECONDS = 8 * 60
 FREE_OUTCOMES = ("dreamed", "nothing to dream", "fence busy", "tombstoned")
 # Refusals no second answer can fix: there is nothing left to dream.
 NOTHING_TO_DREAM_REASONS = ("no_notes", "memory_disabled")
-DEFAULT_LIMITS = {"personality": 250, "behavior": 750, "facts": 1000}
+DEFAULT_LIMITS = {"personality": 250, "behavior": 750, "facts": 1000, "memory": 2000}
 ATTEMPT_TTL_SECONDS = 3 * 24 * 60 * 60
 
 
@@ -91,7 +91,10 @@ class DreamAnswer(BaseModel):
 
 def dream_instructions(limits: dict | None) -> str:
     """The dream prompt with the web's current block limits written in."""
-    limits = {**DEFAULT_LIMITS, **{k: v for k, v in (limits or {}).items() if v}}
+    limits = {
+        **DEFAULT_LIMITS,
+        **{k: v for k, v in (limits or {}).items() if v is not None},
+    }
     text = DREAM_PROMPT
     for name in DEFAULT_LIMITS:
         text = text.replace(f"[[{name}_limit]]", str(limits[name]))
@@ -229,6 +232,13 @@ class DreamService:
         if inputs is None or not inputs.get("needed"):
             return "nothing to dream"
         snapshot = await self._repository.load_canonical(guild_id)
+        # Read once, here: a live wake may write the guild's first history while
+        # the dream runs, and the save must be refused then, not overwrite it.
+        revision = (
+            snapshot.revision
+            if snapshot is not None
+            else await self._repository.stored_revision(guild_id)
+        )
         try:
             history: list[ModelMessage] = (
                 list(
@@ -272,8 +282,9 @@ class DreamService:
                             summarize=summarize,
                         )
                         for _ in range(MAX_RETRIES + 1):
-                            # No tools here, so no thinking block signed with
-                            # the live tool set would match; and nothing later
+                            # This request sends only the output tool, not the
+                            # live tool set, so no thinking block signed with
+                            # that set would match; and nothing later
                             # shares this request's prefix, so no cache write.
                             sent = without_thinking([*history, *new_messages])
                             result = await asyncio.wait_for(
@@ -318,7 +329,7 @@ class DreamService:
             await self._record_usage(guild_id, usage)
             if new_messages:
                 try:
-                    await self._keep_exchange(guild_id, snapshot, history, new_messages)
+                    await self._keep_exchange(guild_id, revision, history, new_messages)
                 except StaleHistoryError:
                     logger.warning(
                         "proactive dream history moved guild=%s; exchange not kept",
@@ -326,13 +337,8 @@ class DreamService:
                     )
         return outcome
 
-    async def _keep_exchange(self, guild_id, snapshot, history, new_messages) -> None:
+    async def _keep_exchange(self, guild_id, revision, history, new_messages) -> None:
         """The dream stays in the agent's history, refused turns included."""
-        revision = (
-            snapshot.revision
-            if snapshot is not None
-            else await self._repository.stored_revision(guild_id)
-        )
         await self._writer.save(
             guild_id=guild_id,
             history=json.loads(
