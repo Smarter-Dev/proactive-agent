@@ -1,7 +1,7 @@
 """The nightly dream, run by the agent itself (smarter-dev #454).
 
-Once the night is over, each guild with notes (or a memory row not yet dreamed
-tonight) gets one turn in the agent's own stored history: the web hands over
+Once the night is over, each guild with a memory row not yet dreamed tonight
+(or notes waiting) gets one turn in the agent's own stored history: the web hands over
 what the dream reads (``GET .../chat-memory/dream``), the agent answers with
 structured output, and the answer is submitted back. All validation lives in
 the web application; a refusal comes back with a reason that quotes nothing
@@ -16,7 +16,7 @@ through the opt-out scrub, and written through the history writer's.
 
 Off unless ``PROACTIVE_DREAM_ENABLED`` is set; the smarter-dev cron dreams
 meanwhile. A failed night is retried after ``COOLDOWN_SECONDS`` and given up on
-after ``MAX_NIGHT_ATTEMPTS`` tries, leaving the notes for tomorrow.
+after ``MAX_NIGHT_ATTEMPTS`` tries, leaving the guild for tomorrow.
 """
 
 from __future__ import annotations
