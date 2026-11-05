@@ -14,8 +14,7 @@ the same guild. A busy fence is retried on the next tick and costs no attempt;
 only the guilds the worker runs (``externally_owned``) are dreamed. History is read
 through the opt-out scrub, and written through the history writer's.
 
-Off unless ``PROACTIVE_DREAM_ENABLED`` is set; the smarter-dev cron dreams
-meanwhile. A failed night is retried after ``COOLDOWN_SECONDS`` and given up on
+Off unless ``PROACTIVE_DREAM_ENABLED`` is set. A failed night is retried after ``COOLDOWN_SECONDS`` and given up on
 after ``MAX_NIGHT_ATTEMPTS`` tries, leaving the guild for tomorrow.
 """
 
