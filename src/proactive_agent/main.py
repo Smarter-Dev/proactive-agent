@@ -165,6 +165,7 @@ async def run() -> None:
         model_id=settings.proactive_agent_model,
         blocked_users=blocked_users,
     )
+
     async def dream_system_prompt(guild_id: str) -> str:
         guild = await discord.guild(guild_id)
         return build_guild_agent_system_prompt(
