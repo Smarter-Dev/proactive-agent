@@ -354,19 +354,79 @@ def test_the_prompt_is_rendered_with_the_webs_limits():
     assert "at most 750 characters" in dream_instructions(None)
 
 
-async def test_a_slow_run_times_out_and_still_reports_usage(redis_client, monkeypatch):
-    monkeypatch.setattr(dream_module, "RUN_TIMEOUT_SECONDS", 0.05)
+async def test_a_slow_run_times_out_keeps_finished_turns_and_reports_usage(
+    redis_client, monkeypatch
+):
+    monkeypatch.setattr(dream_module, "RUN_TIMEOUT_SECONDS", 0.3)
+    calls = 0
 
-    async def slow(messages, info):
-        await asyncio.sleep(5)
+    async def respond(messages, info: AgentInfo):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            await asyncio.sleep(5)
+        tool = info.output_tools[0]
+        return ModelResponse(
+            parts=[ToolCallPart(tool.name, {"memory": "## Ongoing Context\nfirst"})]
+        )
 
+    verdicts = [{"accepted": False, "reason": "invalid", "message": "too long"}]
     brain = Brain()
-    service, api, writer = await build(redis_client, [], brain)
-    service._model = FunctionModel(slow)
+    service, api, writer = await build(redis_client, verdicts, brain)
+    service._model = FunctionModel(respond)
 
     assert await service.sweep_once() == {GUILD: "timed out"}
+
     assert await redis_client.exists(dream_cooldown_key(GUILD))
+    # The turn that finished before the timeout is billed and kept.
+    assert len(api.submitted) == 1
+    [report] = api.usage_reports
+    assert report["guild_id"] == GUILD and report["entries"]
+    await writer.flush(GUILD)
+    stored = json.loads(await redis_client.get(history_key(GUILD)))["history"]
+    assert "first" in json.dumps(stored)
     await writer.close(timeout=1)
+
+
+async def test_a_history_written_during_the_dream_is_not_overwritten(redis_client):
+    """No history at load time; a live wake writes the first one mid-dream."""
+    service_box = {}
+    live = dump(raw_history_with_target())
+
+    async def respond(messages, info: AgentInfo):
+        _, _, writer = service_box["parts"]
+        await writer.save(
+            guild_id=GUILD,
+            history=live,
+            previous_revision=0,
+        )
+        await writer.flush(GUILD)
+        tool = info.output_tools[0]
+        return ModelResponse(
+            parts=[ToolCallPart(tool.name, {"memory": "## Ongoing Context\nx"})]
+        )
+
+    brain = Brain()
+    service, api, writer = await build(redis_client, [{"accepted": True}], brain)
+    service_box["parts"] = (service, api, writer)
+    service._model = FunctionModel(respond)
+
+    assert await service.sweep_once() == {GUILD: "dreamed"}
+
+    await writer.flush(GUILD)
+    stored = json.loads(await redis_client.get(history_key(GUILD)))["history"]
+    assert "GUILD SYSTEM PROMPT" not in json.dumps(stored)  # the live write stands
+    assert stored == live
+    await writer.close(timeout=1)
+
+
+def test_a_zero_limit_is_kept_and_memory_and_facts_are_templated():
+    text = dream_instructions({"memory": 1500, "facts": 0})
+
+    assert "at most 0 characters" in text
+    assert "Hard cap: 1500 characters" in text
+    assert "[[" not in text
+    assert "Hard cap: 2000 characters" in dream_instructions(None)
 
 
 async def test_thinking_is_not_kept_in_the_history(redis_client):
