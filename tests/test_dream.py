@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import fakeredis.aioredis
 import pytest
 from purge_fakes import GUILD, FakeAPI, dump, raw_history_with_target
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelResponse, ThinkingPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from proactive_agent.dream import DreamAnswer, DreamService, submission
+from proactive_agent import dream as dream_module
+from proactive_agent.dream import (
+    DreamAnswer,
+    DreamService,
+    dream_instructions,
+    submission,
+)
 from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
-from proactive_agent.keys import history_key, ownership_key, privacy_lock_key
+from proactive_agent.keys import (
+    dream_attempts_key,
+    dream_cooldown_key,
+    history_key,
+    lease_key,
+    ownership_key,
+)
 from proactive_agent.queue import RedisWakeQueue
 
 INPUTS = {
@@ -80,6 +93,10 @@ async def build(redis_client, verdicts, brain, **kwargs):
     async def summarize(messages):
         return "earlier summary", {}
 
+    async def system_prompt_for(guild_id):
+        return "GUILD SYSTEM PROMPT"
+
+    kwargs.setdefault("clock", lambda: 2e9)  # long after INPUTS' cutoff
     service = DreamService(
         redis_client,
         queue,
@@ -89,6 +106,7 @@ async def build(redis_client, verdicts, brain, **kwargs):
         summarize=summarize,
         api=api,
         model_id="agent-model",
+        system_prompt_for=system_prompt_for,
         **kwargs,
     )
     return service, api, writer
@@ -173,13 +191,15 @@ async def test_a_stale_answer_rereads_the_night(redis_client):
 async def test_a_busy_fence_leaves_the_guild_alone(redis_client):
     brain = Brain()
     service, api, writer = await build(redis_client, [{"accepted": True}], brain)
-    await redis_client.delete(ownership_key(GUILD))
-    await redis_client.set(privacy_lock_key(GUILD), "someone-else", ex=60)
+    await redis_client.set(lease_key(GUILD), "someone-else", ex=60)
 
     outcomes = await service.sweep_once()
 
     assert outcomes == {GUILD: "fence busy"}
     assert api.submitted == [] and brain.prompts == []
+    # A busy fence is not a failed night: no attempt, no cooldown.
+    assert not await redis_client.exists(dream_cooldown_key(GUILD))
+    assert not await redis_client.exists(dream_attempts_key(GUILD, INPUTS["cutoff"]))
     await writer.close(timeout=1)
 
 
@@ -257,3 +277,115 @@ def test_personality_and_behavior_stay_out_until_the_flag_is_on():
 
     assert "Dry." not in off and "Wait to be asked." not in off
     assert "Server is Pine." in off and "kai likes rust" in off
+
+
+async def test_a_guild_the_worker_does_not_own_is_left_alone(redis_client):
+    brain = Brain()
+    service, api, writer = await build(redis_client, [{"accepted": True}], brain)
+    await redis_client.delete(ownership_key(GUILD))
+
+    assert await service.sweep_once() == {}
+    assert api.submitted == [] and brain.prompts == []
+    await writer.close(timeout=1)
+
+
+async def test_an_empty_history_keeps_the_guild_system_prompt(redis_client):
+    brain = Brain()
+    service, api, writer = await build(redis_client, [{"accepted": True}], brain)
+
+    assert await service.sweep_once() == {GUILD: "dreamed"}
+
+    await writer.flush(GUILD)
+    stored = json.loads(await redis_client.get(history_key(GUILD)))["history"]
+    assert "GUILD SYSTEM PROMPT" in json.dumps(stored)
+    await writer.close(timeout=1)
+
+
+@pytest.mark.parametrize("reason", ["no_notes", "memory_disabled"])
+async def test_an_unfixable_refusal_ends_the_night_without_an_attempt(
+    redis_client, reason
+):
+    brain = Brain()
+    verdicts = [{"accepted": False, "reason": reason, "message": ""}]
+    service, api, writer = await build(redis_client, verdicts, brain)
+
+    assert await service.sweep_once() == {GUILD: "nothing to dream"}
+
+    assert len(api.submitted) == 1 and len(brain.prompts) == 1
+    assert not await redis_client.exists(dream_cooldown_key(GUILD))
+    await writer.close(timeout=1)
+
+
+async def test_nothing_is_dreamed_before_the_cutoff(redis_client):
+    brain = Brain()
+    # 23:55 the night before: the web has snapped the cutoff to midnight.
+    before = 1_762_300_800 - 300  # 2025-11-05T00:00Z minus five minutes
+    service, api, writer = await build(
+        redis_client,
+        [{"accepted": True}],
+        brain,
+        clock=lambda: before,
+    )
+    api.inputs = INPUTS | {"cutoff": "2025-11-05T00:00:00Z"}
+
+    assert await service.sweep_once() == {}
+    assert brain.prompts == [] and api.submitted == []
+    await writer.close(timeout=1)
+
+
+async def test_a_set_stop_ends_the_sweep_between_guilds(redis_client):
+    brain = Brain()
+    service, api, writer = await build(redis_client, [{"accepted": True}], brain)
+    stop = asyncio.Event()
+    stop.set()
+
+    assert await service.sweep_once(stop) == {}
+    assert brain.prompts == []
+    await writer.close(timeout=1)
+
+
+def test_the_prompt_is_rendered_with_the_webs_limits():
+    text = dream_instructions({"personality": 111, "behavior": 222, "facts": 333})
+
+    assert "at most 111 characters" in text
+    assert "at most 222 characters" in text
+    assert "at most 333 characters" in text
+    assert "[[" not in text
+    assert "at most 750 characters" in dream_instructions(None)
+
+
+async def test_a_slow_run_times_out_and_still_reports_usage(redis_client, monkeypatch):
+    monkeypatch.setattr(dream_module, "RUN_TIMEOUT_SECONDS", 0.05)
+
+    async def slow(messages, info):
+        await asyncio.sleep(5)
+
+    brain = Brain()
+    service, api, writer = await build(redis_client, [], brain)
+    service._model = FunctionModel(slow)
+
+    assert await service.sweep_once() == {GUILD: "timed out"}
+    assert await redis_client.exists(dream_cooldown_key(GUILD))
+    await writer.close(timeout=1)
+
+
+async def test_thinking_is_not_kept_in_the_history(redis_client):
+    async def respond(messages, info: AgentInfo):
+        tool = info.output_tools[0]
+        return ModelResponse(
+            parts=[
+                ThinkingPart(content="secret reasoning", signature="sig"),
+                ToolCallPart(tool.name, {"memory": "## Ongoing Context\nx"}),
+            ]
+        )
+
+    brain = Brain()
+    service, api, writer = await build(redis_client, [{"accepted": True}], brain)
+    service._model = FunctionModel(respond)
+
+    assert await service.sweep_once() == {GUILD: "dreamed"}
+
+    await writer.flush(GUILD)
+    stored = json.loads(await redis_client.get(history_key(GUILD)))["history"]
+    assert "secret reasoning" not in json.dumps(stored)
+    await writer.close(timeout=1)

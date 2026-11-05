@@ -10,7 +10,8 @@ stored, and goes back to the agent in the same conversation, at most
 
 The guild is fenced like an idle fold: the guild lease when the worker owns the
 guild, else the privacy lock, so a dream never runs beside a wake or a purge on
-the same guild. A busy fence is retried on the next tick. History is read
+the same guild. A busy fence is retried on the next tick and costs no attempt; only the guilds
+the worker does not run (``externally_owned``) are dreamed. History is read
 through the opt-out scrub, and written through the history writer's.
 
 Off unless ``PROACTIVE_DREAM_ENABLED`` is set; the smarter-dev cron dreams
@@ -24,7 +25,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -39,10 +40,10 @@ from proactive_agent.agent import (
     ZERO_USAGE,
     add_usage,
     compact_agent_history,
-    drop_other_models_claude_thinking,
+    without_thinking,
 )
 from proactive_agent.errors import exception_trace
-from proactive_agent.history import HistoryChecksumError
+from proactive_agent.history import HistoryChecksumError, StaleHistoryError
 from proactive_agent.idle import renew_fence, try_fence
 from proactive_agent.keys import dream_attempts_key, dream_cooldown_key
 from proactive_agent.optout_gate import scrub_history
@@ -59,6 +60,14 @@ MAX_RETRIES = 2
 MAX_NIGHT_ATTEMPTS = 3
 COOLDOWN_SECONDS = 30 * 60
 TURN_TIMEOUT_SECONDS = 300
+# The whole run, summaries and turns together, holds the fence: well under the
+# purge's 15 minute FENCE_WAIT_SECONDS.
+RUN_TIMEOUT_SECONDS = 8 * 60
+# Outcomes that are not a failed night: no attempt counted, no cooldown.
+FREE_OUTCOMES = ("dreamed", "nothing to dream", "fence busy", "tombstoned")
+# Refusals no second answer can fix: there is nothing left to dream.
+NOTHING_TO_DREAM_REASONS = ("no_notes", "memory_disabled")
+DEFAULT_LIMITS = {"personality": 250, "behavior": 750, "facts": 1000}
 ATTEMPT_TTL_SECONDS = 3 * 24 * 60 * 60
 
 
@@ -78,6 +87,15 @@ class DreamAnswer(BaseModel):
     personality: str | None = None
     facts: str | None = None
     personality_reason: str | None = None
+
+
+def dream_instructions(limits: dict | None) -> str:
+    """The dream prompt with the web's current block limits written in."""
+    limits = {**DEFAULT_LIMITS, **{k: v for k, v in (limits or {}).items() if v}}
+    text = DREAM_PROMPT
+    for name in DEFAULT_LIMITS:
+        text = text.replace(f"[[{name}_limit]]", str(limits[name]))
+    return text
 
 
 def opening_prompt(inputs: dict) -> str:
@@ -113,6 +131,7 @@ class DreamService:
         summarize,
         api,
         model_id: str,
+        system_prompt_for: Callable[[str], Awaitable[str]],
         blocked_users=None,
         clock: Callable[[], float] = time.time,
         tick_seconds: float = SWEEP_TICK_SECONDS,
@@ -126,6 +145,7 @@ class DreamService:
         self._summarize = summarize
         self._api = api
         self._model_id = model_id
+        self._system_prompt_for = system_prompt_for
         self._blocked_users = blocked_users
         self._clock = clock
         self._tick_seconds = tick_seconds
@@ -137,7 +157,7 @@ class DreamService:
             return
         while not stop.is_set():
             try:
-                await self.sweep_once()
+                await self.sweep_once(stop)
             except Exception as error:
                 logger.error("proactive dream sweep failed\n%s", exception_trace(error))
             try:
@@ -145,7 +165,7 @@ class DreamService:
             except TimeoutError:
                 pass
 
-    async def sweep_once(self) -> dict[str, str]:
+    async def sweep_once(self, stop: asyncio.Event | None = None) -> dict[str, str]:
         if self._blocked_users is not None and not self._blocked_users.enforcing:
             # No list yet, so nobody would be scrubbed from the history (#100).
             return {}
@@ -153,8 +173,16 @@ class DreamService:
         if not listed:
             return {}
         cutoff = str(listed["cutoff"])
+        if self._clock() < datetime.fromisoformat(cutoff).timestamp():
+            # The web snaps the cutoff forward near midnight; the night has not
+            # ended, and dreaming now would dream again at 00:00.
+            return {}
         outcomes: dict[str, str] = {}
         for guild_id in listed["guild_ids"]:
+            if stop is not None and stop.is_set():
+                break
+            if not await self._queue.externally_owned(guild_id):
+                continue
             if await self._redis.exists(dream_cooldown_key(guild_id)):
                 continue
             attempts_key = dream_attempts_key(guild_id, cutoff)
@@ -170,7 +198,7 @@ class DreamService:
                     guild_id,
                     exception_trace(error),
                 )
-            if outcomes[guild_id] not in ("dreamed", "nothing to dream"):
+            if outcomes[guild_id] not in FREE_OUTCOMES:
                 await self._redis.incr(attempts_key)
                 await self._redis.expire(attempts_key, ATTEMPT_TTL_SECONDS)
                 await self._redis.set(
@@ -217,55 +245,85 @@ class DreamService:
         usage = dict(ZERO_USAGE)
 
         async def summarize(messages: list[ModelMessage]) -> str:
-            summary, spent = await self._summarize(messages)
+            summary, spent = await asyncio.wait_for(
+                self._summarize(messages), timeout=TURN_TIMEOUT_SECONDS
+            )
             add_usage(usage, spent)
             return summary
 
-        history = await compact_agent_history(
-            history, token_limit=HISTORY_TOKEN_LIMIT, summarize=summarize
+        # The live agent's own system prompt: pydantic-ai adds it only to an
+        # empty history, so a dream that starts one must not leave it bare.
+        agent = Agent(
+            self._model,
+            output_type=DreamAnswer,
+            system_prompt=await self._system_prompt_for(guild_id),
+            instructions=dream_instructions(inputs.get("limits")),
         )
-        agent = Agent(self._model, output_type=DreamAnswer, instructions=DREAM_PROMPT)
         new_messages: list[ModelMessage] = []
         prompt = opening_prompt(inputs)
         outcome = "refused"
         try:
             async with wake_meter() as meter:
                 try:
-                    for _ in range(MAX_RETRIES + 1):
-                        sent = drop_other_models_claude_thinking(
-                            [*history, *new_messages],
-                            getattr(self._model, "model_name", None),
+                    async with asyncio.timeout(RUN_TIMEOUT_SECONDS):
+                        history = await compact_agent_history(
+                            history,
+                            token_limit=HISTORY_TOKEN_LIMIT,
+                            summarize=summarize,
                         )
-                        result = await asyncio.wait_for(
-                            agent.run(
-                                prompt,
-                                message_history=sent or None,
-                                model=meter.wrap(self._model),
-                            ),
-                            timeout=TURN_TIMEOUT_SECONDS,
-                        )
-                        new_messages.extend(result.new_messages())
-                        verdict = await self._api.submit_dream(
-                            guild_id, submission(inputs, result.output)
-                        )
-                        if verdict.get("accepted"):
-                            outcome = "dreamed"
-                            break
-                        if verdict.get("reason") == "stale":
-                            inputs = await self._api.dream_inputs(guild_id)
-                            if inputs is None or not inputs.get("needed"):
+                        for _ in range(MAX_RETRIES + 1):
+                            # No tools here, so no thinking block signed with
+                            # the live tool set would match; and nothing later
+                            # shares this request's prefix, so no cache write.
+                            sent = without_thinking([*history, *new_messages])
+                            result = await asyncio.wait_for(
+                                agent.run(
+                                    prompt,
+                                    message_history=sent or None,
+                                    model=meter.wrap(self._model),
+                                    model_settings={"anthropic_cache_messages": False},
+                                ),
+                                timeout=TURN_TIMEOUT_SECONDS,
+                            )
+                            # Kept without thinking too: the next live wake must
+                            # not send a block signed for another request.
+                            new_messages.extend(without_thinking(result.new_messages()))
+                            verdict = await self._api.submit_dream(
+                                guild_id, submission(inputs, result.output)
+                            )
+                            if verdict.get("accepted"):
+                                outcome = "dreamed"
+                                break
+                            reason = verdict.get("reason")
+                            if reason in NOTHING_TO_DREAM_REASONS:
                                 outcome = "nothing to dream"
                                 break
-                            prompt = restart_prompt(inputs)
-                        else:
-                            prompt = refusal_prompt(str(verdict.get("message") or ""))
+                            if reason == "stale":
+                                inputs = await self._api.dream_inputs(guild_id)
+                                if inputs is None or not inputs.get("needed"):
+                                    outcome = "nothing to dream"
+                                    break
+                                prompt = restart_prompt(inputs)
+                            else:
+                                prompt = refusal_prompt(
+                                    str(verdict.get("message") or "")
+                                )
+                except TimeoutError:
+                    outcome = "timed out"
                 finally:
                     for spent in meter.usage_by_model().values():
                         add_usage(usage, spent)
         finally:
-            if new_messages:
-                await self._keep_exchange(guild_id, snapshot, history, new_messages)
+            # Usage first: keeping the exchange can lose to a concurrent save.
             await self._record_usage(guild_id, usage)
+            if new_messages:
+                try:
+                    await self._keep_exchange(guild_id, snapshot, history, new_messages)
+                except StaleHistoryError:
+                    logger.warning(
+                        "proactive dream history moved guild=%s; exchange not kept",
+                        guild_id,
+                    )
         return outcome
 
     async def _keep_exchange(self, guild_id, snapshot, history, new_messages) -> None:

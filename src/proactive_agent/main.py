@@ -165,6 +165,14 @@ async def run() -> None:
         model_id=settings.proactive_agent_model,
         blocked_users=blocked_users,
     )
+    async def dream_system_prompt(guild_id: str) -> str:
+        guild = await discord.guild(guild_id)
+        return build_guild_agent_system_prompt(
+            bot_display_name=me.get("username") or "the bot",
+            bot_user_id=str(me["id"]),
+            guild_name=guild.get("name") or guild_id,
+        )
+
     dream_service = DreamService(
         redis_client,
         queue,
@@ -175,6 +183,7 @@ async def run() -> None:
         summarize=idle_summarize,
         api=api,
         model_id=settings.proactive_agent_model,
+        system_prompt_for=dream_system_prompt,
         blocked_users=blocked_users,
         enabled=settings.proactive_dream_enabled,
     )
