@@ -29,3 +29,7 @@ CHANNELS (every channel id, with your watch instructions), the RECIPES list
 (each enabled recipe's name and preview) and YOUR MEMORY. Do not copy those
 into this note. Do keep the ids of the channels and posts where something you
 care about is still going on.
+
+FACTS. Anything the owner or an admin stated or corrected that is still true
+(and is not already in the FACTS of YOUR MEMORY) belongs in this note, with who
+said it, so the nightly review can keep it.

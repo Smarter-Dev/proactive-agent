@@ -567,3 +567,15 @@ async def test_idle_sweep_waits_for_the_blocked_list(redis_client):
     await compactor.sweep_once()
     assert len(asked) == 1
     await writer.close(timeout=1)
+
+
+def test_facts_are_scrubbed_like_the_other_memory_blocks():
+    from proactive_agent.optout_gate import scrub_memory
+
+    class Blocked:
+        def is_blocked(self, user_id, message_id=None):
+            return user_id == "101"
+
+    memory = {"facts": "<101:kai> asked for pizza.\nServer is Pine."}
+
+    assert scrub_memory(memory, Blocked())["facts"] == "Server is Pine."

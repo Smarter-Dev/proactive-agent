@@ -169,3 +169,13 @@ def tombstone_cleared_key(run_id: str) -> str:
 # only while it is set, so a worker without forum support (an older one, or a
 # rollback) never gets them.
 FORUM_POSTS_CAPABILITY_KEY = f"{KEY_PREFIX}:capability:forum-posts"
+
+
+def dream_attempts_key(guild_id: str, cutoff: str) -> str:
+    """How many times this night's dream was tried for a guild."""
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:dream-attempts:{cutoff}"
+
+
+def dream_cooldown_key(guild_id: str) -> str:
+    """Set after a failed attempt so the next tick leaves the guild alone."""
+    return f"{KEY_PREFIX}:{guild_tag(guild_id)}:dream-cooldown"

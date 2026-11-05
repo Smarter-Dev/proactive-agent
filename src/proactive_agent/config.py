@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     proactive_reclaim_idle_seconds: int = Field(240, ge=30, le=86400)
     proactive_max_attempts: int = Field(5, ge=1, le=100)
     proactive_health_port: int = Field(8080, ge=1, le=65535)
+    # The agent runs the nightly dream itself (smarter-dev #454). Off until the
+    # web endpoints are live; the smarter-dev cron dreams meanwhile.
+    proactive_dream_enabled: bool = False
     log_level: str = "INFO"
 
     def require_runtime_secrets(self) -> None:

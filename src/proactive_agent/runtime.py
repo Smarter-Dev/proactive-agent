@@ -226,12 +226,34 @@ def _decode_or_none(value) -> str | None:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-def render_memory_block(memory: dict | None, blocked_users=None) -> str:
-    """The memory prompt block; blocked users' ids are scrubbed first."""
+def render_memory_block(
+    memory: dict | None, blocked_users=None, *, identity: bool = False
+) -> str:
+    """The memory prompt block; blocked users' ids are scrubbed first.
+
+    ``identity`` adds the personality and behavior blocks, which the worker has
+    not rendered until now; it follows ``PROACTIVE_DREAM_ENABLED`` so a deploy
+    changes nothing the agent sees until the flag flips.
+    """
     memory = scrub_memory(memory, blocked_users)
     if not memory or memory.get("memory_enabled") is False:
         return ""
     sections = []
+    # The web has long returned behavior and personality too; the worker did
+    # not render them. The durable blocks lead, most stable first.
+    for key, label in (
+        ("personality", "PERSONALITY (who you are here)"),
+        ("behavior", "BEHAVIOR (what you've learned about how to act here)"),
+        (
+            "facts",
+            "FACTS (what is true about you, your setup and this server, "
+            "including what the owner or an admin decided)",
+        ),
+    ):
+        if key in ("personality", "behavior") and not identity:
+            continue
+        if memory.get(key):
+            sections.append(f"{label}:\n{memory[key]}")
     content = memory.get("content")
     if content:
         stamp = (
@@ -338,6 +360,9 @@ class GuildRuntime:
     # Anything with is_blocked(user_id); notification bodies naming a
     # blocked user's id never reach the brief. None blocks nobody.
     blocked_users: object = None
+    # Whether the memory block carries personality and behavior; set from
+    # PROACTIVE_DREAM_ENABLED.
+    render_identity: bool = False
     # Channel id -> its forum's id, or None when it is not a forum post.
     forum_parents: OrderedDict = field(default_factory=OrderedDict)
     # Id -> whether it is a text channel of this guild, for ids found in
@@ -423,7 +448,9 @@ class GuildRuntime:
             or time.monotonic() - self.memory_refreshed_at >= MEMORY_REFRESH_SECONDS
         ):
             self.memory_block = render_memory_block(
-                await self.api.get_memory(self.guild_id), self.blocked_users
+                await self.api.get_memory(self.guild_id),
+                self.blocked_users,
+                identity=self.render_identity,
             )
             self.memory_refreshed_at = time.monotonic()
         opened = opened_recipes(self.engine.agent_runner.history)
