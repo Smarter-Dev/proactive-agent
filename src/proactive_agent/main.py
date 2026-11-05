@@ -26,6 +26,7 @@ from proactive_agent.capabilities import (
 )
 from proactive_agent.config import Settings
 from proactive_agent.discord import DiscordREST
+from proactive_agent.dream import DreamService
 from proactive_agent.engine import AgentEngine, SkimRunner
 from proactive_agent.health import HealthServer
 from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
@@ -163,6 +164,19 @@ async def run() -> None:
         model_id=settings.proactive_agent_model,
         blocked_users=blocked_users,
     )
+    dream_service = DreamService(
+        redis_client,
+        queue,
+        history_repository,
+        history_writer,
+        # The agent's own model dreams, in its own history.
+        model=idle_model,
+        summarize=idle_summarize,
+        api=api,
+        model_id=settings.proactive_agent_model,
+        blocked_users=blocked_users,
+        enabled=settings.proactive_dream_enabled,
+    )
     worker = ProactiveWorker(
         queue,
         runtimes,
@@ -172,6 +186,7 @@ async def run() -> None:
             blocked_users,
             privacy_purges,
             idle_compactor,
+            dream_service,
             CapabilityBeacon(redis_client),
         ),
         blocked_users=blocked_users,

@@ -232,6 +232,19 @@ def render_memory_block(memory: dict | None, blocked_users=None) -> str:
     if not memory or memory.get("memory_enabled") is False:
         return ""
     sections = []
+    # The web has long returned behavior and personality too; the worker did
+    # not render them. All three durable blocks lead, most stable first.
+    for key, label in (
+        ("personality", "PERSONALITY (who you are here)"),
+        ("behavior", "BEHAVIOR (what you've learned about how to act here)"),
+        (
+            "facts",
+            "FACTS (what is true about you, your setup and this server, "
+            "including what the owner or an admin decided)",
+        ),
+    ):
+        if memory.get(key):
+            sections.append(f"{label}:\n{memory[key]}")
     content = memory.get("content")
     if content:
         stamp = (

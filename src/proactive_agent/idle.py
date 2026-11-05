@@ -70,6 +70,34 @@ UNREADABLE_NOTE = (
 )
 
 
+async def renew_fence(fence) -> None:
+    # Losing the fence mid-fold is caught by the revision check on save.
+    while True:
+        await asyncio.sleep(min(5, max(1, fence.ttl_seconds / 3)))
+        if not await fence.renew():
+            return
+
+
+async def try_fence(redis_client, queue, guild_id: str):
+    """The guild lease when the worker owns the guild, else the privacy lock;
+    None while either is busy."""
+    if await queue.externally_owned(guild_id):
+        return await queue.acquire_lease(guild_id)
+    token = uuid4().hex
+    if not await redis_client.set(
+        privacy_lock_key(guild_id), token, nx=True, ex=FENCE_SECONDS
+    ):
+        return None
+    fence = PrivacyLock(
+        redis_client, guild_id=guild_id, token=token, ttl_seconds=FENCE_SECONDS
+    )
+    if await redis_client.exists(lease_key(guild_id)):
+        # Ownership just moved to the bot while a worker wake still runs.
+        await fence.release()
+        return None
+    return fence
+
+
 class IdleHistoryCompactor:
     """Worker service (``run(stop)``) folding idle guild histories."""
 
@@ -147,28 +175,10 @@ class IdleHistoryCompactor:
 
     @staticmethod
     async def _renew(fence) -> None:
-        # Losing the fence mid-fold is caught by the revision check on save.
-        while True:
-            await asyncio.sleep(min(5, max(1, fence.ttl_seconds / 3)))
-            if not await fence.renew():
-                return
+        await renew_fence(fence)
 
     async def _try_fence(self, guild_id: str):
-        if await self._queue.externally_owned(guild_id):
-            return await self._queue.acquire_lease(guild_id)
-        token = uuid4().hex
-        if not await self._redis.set(
-            privacy_lock_key(guild_id), token, nx=True, ex=FENCE_SECONDS
-        ):
-            return None
-        fence = PrivacyLock(
-            self._redis, guild_id=guild_id, token=token, ttl_seconds=FENCE_SECONDS
-        )
-        if await self._redis.exists(lease_key(guild_id)):
-            # Ownership just moved to the bot while a worker wake still runs.
-            await fence.release()
-            return None
-        return fence
+        return await try_fence(self._redis, self._queue, guild_id)
 
     async def _compact_fenced(self, guild_id: str) -> str:
         if await self._repository.is_invalid(guild_id):

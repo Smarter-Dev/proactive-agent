@@ -180,6 +180,29 @@ class ApplicationAPI:
         )
         return None if response is None else response.json()
 
+    async def dream_guilds(self) -> dict[str, Any] | None:
+        """Guilds that need tonight's dream; None when the application
+        predates agent-run dreams."""
+        response = await self._request(
+            "GET", "/chat-memory/dream/guilds", allow_not_found=True
+        )
+        return None if response is None else response.json()
+
+    async def dream_inputs(self, guild_id: str) -> dict[str, Any] | None:
+        """Everything this guild's dream reads (smarter-dev #454)."""
+        response = await self._request(
+            "GET", f"/guilds/{guild_id}/chat-memory/dream", allow_not_found=True
+        )
+        return None if response is None else response.json()
+
+    async def submit_dream(
+        self, guild_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST", f"/guilds/{guild_id}/chat-memory/dream", json=payload
+        )
+        return response.json()
+
     async def save_memory_note(
         self, guild_id: str, payload: dict[str, Any]
     ) -> dict[str, Any]:

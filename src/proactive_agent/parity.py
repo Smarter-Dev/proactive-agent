@@ -389,7 +389,9 @@ async def remember(ctx, text: str) -> str:
     at most 500 characters, so write one short lesson per note; a longer one
     is refused, not cut. Name every person as a tag, `<userid:username>` like
     `<123456789012345678:kai>`, with the uid from the transcript (`<:username>`
-    only for someone you have no id for)."""
+    only for someone you have no id for). A durable fact, such as something the
+    owner or an admin decided or corrected, is worth a note too: say who stated
+    it, and the nightly review keeps it in your facts."""
     note = (text or "").strip()
     if not note:
         return "there was nothing in that one to keep."

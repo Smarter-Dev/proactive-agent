@@ -27,7 +27,7 @@ MEMBER_TAG_PATTERN = re.compile(r"<([0-9]{1,22}):([^<>\n]{1,64})>")
 SNOWFLAKE_PATTERN = re.compile(r"(?<![0-9])([0-9]{15,22})(?![0-9])")
 _LINE_MESSAGE_ID = re.compile(r"^\[id=([0-9]+)\]")
 # The memory fields the web returns as free text (blob and its sections).
-_MEMORY_TEXT_FIELDS = ("content", "behavior", "personality")
+_MEMORY_TEXT_FIELDS = ("content", "behavior", "personality", "facts")
 
 
 def _blocked(blocked_users, user_id, message_id=None) -> bool:
