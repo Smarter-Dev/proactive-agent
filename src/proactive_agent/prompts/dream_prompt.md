@@ -82,9 +82,10 @@ Existing identity is carried forward verbatim by code. Return an empty
 Each update has `before` (the exact existing trait without its bullet, or null
 for an addition), `after` (the revised trait, or empty for an explicit retraction),
 and `evidence` (an exact, nonempty excerpt from a supplied daily note supporting
-the change; the check can only read the notes, so what you saw in your history
-supports changes to memory, behavior, personality and facts, but an identity
-change needs a note to quote). Evidence is for validation only and is never stored in memory.
+the change, or, while old Identity & Voice text is being moved over, from the
+memory you were given; the check can only read those, so what you saw in your
+history supports changes to memory, behavior, personality and facts, but an
+identity change needs a note or the old memory to quote). Evidence is for validation only and is never stored in memory.
 Merge duplicate ideas; explicitly revise contradictions rather than appending
 both. Do not remove identity for age, disuse, or to make room for another section.
 A single awkward conversation is temporary context, not a permanent personality
@@ -211,8 +212,9 @@ Plain markdown only, no HTML.
   more than a fact you could look up.
 - Don't invent. Everything here has to come from what you actually saw.
 - A quiet day is allowed. If nothing new has happened in your history since you
-  last did this and you kept no notes, change nothing: return your memory as it
-  is, `null` for behavior, personality and facts, and no identity updates.
+  last did this and you kept no notes, change nothing: return the four memory
+  sections as they are, without Identity & Voice, `null` for behavior,
+  personality and facts, and no identity updates.
 
 # The limit
 
