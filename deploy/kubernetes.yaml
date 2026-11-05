@@ -28,6 +28,11 @@ spec:
             - configMapRef:
                 name: smarter-dev-config
           env:
+            # The agent dreams the guilds it runs, and renders PERSONALITY/BEHAVIOR
+            # in its prompt. Set here, not in smarter-dev-config: this deployment
+            # is the only reader.
+            - name: PROACTIVE_DREAM_ENABLED
+              value: "true"
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
