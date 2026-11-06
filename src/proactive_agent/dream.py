@@ -39,6 +39,8 @@ from proactive_agent.agent import (
     ZERO_USAGE,
     add_usage,
     compact_agent_history,
+    without_stored_instructions,
+    without_system_prompts,
     without_thinking,
 )
 from proactive_agent.errors import exception_trace
@@ -260,13 +262,15 @@ class DreamService:
             add_usage(usage, spent)
             return summary
 
-        # The live agent's own system prompt: pydantic-ai adds it only to an
-        # empty history, so a dream that starts one must not leave it bare.
+        # The live agent's own prompt, as instructions like the live agent's
+        # (#456): sent on every run, whatever shape the history has.
         agent = Agent(
             self._model,
             output_type=DreamAnswer,
-            system_prompt=await self._system_prompt_for(guild_id),
-            instructions=dream_instructions(inputs.get("limits")),
+            instructions=[
+                await self._system_prompt_for(guild_id),
+                dream_instructions(inputs.get("limits")),
+            ],
         )
         new_messages: list[ModelMessage] = []
         prompt = opening_prompt(inputs)
@@ -285,7 +289,9 @@ class DreamService:
                             # live tool set, so no thinking block signed with
                             # that set would match; and nothing later
                             # shares this request's prefix, so no cache write.
-                            sent = without_thinking([*history, *new_messages])
+                            sent = without_system_prompts(
+                                without_thinking([*history, *new_messages])
+                            )
                             result = await asyncio.wait_for(
                                 agent.run(
                                     prompt,
@@ -297,7 +303,11 @@ class DreamService:
                             )
                             # Kept without thinking too: the next live wake must
                             # not send a block signed for another request.
-                            new_messages.extend(without_thinking(result.new_messages()))
+                            new_messages.extend(
+                                without_stored_instructions(
+                                    without_thinking(result.new_messages())
+                                )
+                            )
                             verdict = await self._api.submit_dream(
                                 guild_id, submission(inputs, result.output)
                             )
