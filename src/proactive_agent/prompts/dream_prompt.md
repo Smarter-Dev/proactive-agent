@@ -18,6 +18,8 @@ why, in words that quote nothing stored; fix exactly that and answer again.
 
 # What you're given
 
+- `# Rules for tonight` — the limits and the tag format, short enough to
+  re-read each night; the rest of this prompt is the full version.
 - `# My personality` — who you are here and how you want people to feel about
   you. At most [[personality_limit]] characters.
 - `# My behavior` — what you've learned about how to act here. At most [[behavior_limit]]
