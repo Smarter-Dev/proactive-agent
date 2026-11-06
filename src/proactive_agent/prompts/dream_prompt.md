@@ -28,7 +28,9 @@ why, in words that quote nothing stored; fix exactly that and answer again.
   Empty on your first night here.
 - `# Today` — notes you chose to keep today, each line with the channel and the
   time. It may say there were none; that does not mean nothing happened. Your
-  conversation above this message is the day itself.
+  conversation above this message is the day itself: your recent turns, and,
+  when the day was long, a compaction note at the top that summarises the
+  part that no longer fits. Read the note as part of the day.
 
 Any of the first four may be empty; the personality, behavior and facts blocks
 are newer than memory, so an established server may still have everything in
