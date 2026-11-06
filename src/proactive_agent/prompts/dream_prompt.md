@@ -18,6 +18,8 @@ why, in words that quote nothing stored; fix exactly that and answer again.
 
 # What you're given
 
+- `# Rules for tonight` — the limits and the tag format, short enough to
+  re-read each night; the rest of this prompt is the full version.
 - `# My personality` — who you are here and how you want people to feel about
   you. At most [[personality_limit]] characters.
 - `# My behavior` — what you've learned about how to act here. At most [[behavior_limit]]
@@ -28,7 +30,9 @@ why, in words that quote nothing stored; fix exactly that and answer again.
   Empty on your first night here.
 - `# Today` — notes you chose to keep today, each line with the channel and the
   time. It may say there were none; that does not mean nothing happened. Your
-  conversation above this message is the day itself.
+  conversation above this message is the day itself: your recent turns, and,
+  when the day was long, a compaction note at the top that summarises the
+  part that no longer fits. Read the note as part of the day.
 
 Any of the first four may be empty; the personality, behavior and facts blocks
 are newer than memory, so an established server may still have everything in
