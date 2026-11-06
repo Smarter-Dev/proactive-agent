@@ -28,6 +28,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     ModelResponsePart,
+    SystemPromptPart,
     TextPart,
     ThinkingPart,
     UserPromptPart,
@@ -321,11 +322,15 @@ def build_kimi_agent(
     extra_tools: list = (),
     deps_type: type = AgentDeps,
 ) -> Agent:
+    # ``instructions``, not ``system_prompt``: pydantic-ai adds a system prompt
+    # only to an empty history, so every fold (compaction, idle, privacy) that
+    # rebuilt the history left later wakes without the guild prompt (#456).
+    # Instructions are rebuilt from the agent on every run, whatever the history.
     agent = Agent(
         model,
         deps_type=deps_type,
         output_type=str,
-        system_prompt=system_prompt,
+        instructions=system_prompt,
     )
 
     @agent.tool
@@ -711,6 +716,31 @@ def without_thinking(messages: list[ModelMessage]) -> list[ModelMessage]:
     block's prefix holds, and the reasoning is not what it summarizes.
     """
     return _without_parts(messages, lambda _, __, part: isinstance(part, ThinkingPart))
+
+
+def without_system_prompts(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """The messages with no stored system prompt part.
+
+    The guild prompt travels as instructions; a history stored before that
+    (it opens with the prompt pydantic-ai added to the first run) would send
+    it twice. ``messages`` itself is returned when there is none.
+    """
+    if not any(
+        isinstance(part, SystemPromptPart)
+        for message in messages
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+    ):
+        return messages
+    kept: list[ModelMessage] = []
+    for message in messages:
+        if isinstance(message, ModelRequest):
+            parts = [p for p in message.parts if not isinstance(p, SystemPromptPart)]
+            if not parts:
+                continue
+            message = replace(message, parts=parts)
+        kept.append(message)
+    return kept
 
 
 def drop_other_models_claude_thinking(
@@ -1226,8 +1256,10 @@ class KimiAgentRunner:
             brief = brief(self.history)
         # The model is sent its own Claude thinking only; the stored history
         # keeps every block, so a model the agent moves back to finds its own.
-        sent = drop_other_models_claude_thinking(
-            self.history, getattr(model, "model_name", None)
+        sent = without_system_prompts(
+            drop_other_models_claude_thinking(
+                self.history, getattr(model, "model_name", None)
+            )
         )
         meter = UsageMeter()
         # Wrapped only when it is a model: test doubles stand in for agents.

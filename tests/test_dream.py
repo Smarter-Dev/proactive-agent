@@ -295,9 +295,11 @@ async def test_an_empty_history_keeps_the_guild_system_prompt(redis_client):
 
     assert await service.sweep_once() == {GUILD: "dreamed"}
 
+    assert "GUILD SYSTEM PROMPT" in (brain.instructions[0] or "")
     await writer.flush(GUILD)
     stored = json.loads(await redis_client.get(history_key(GUILD)))["history"]
-    assert "GUILD SYSTEM PROMPT" in json.dumps(stored)
+    assert "SystemPromptPart" not in json.dumps(stored)
+    assert "system-prompt" not in json.dumps(stored)
     await writer.close(timeout=1)
 
 
