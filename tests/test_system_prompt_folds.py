@@ -22,6 +22,7 @@ from proactive_agent.agent import (
     KimiAgentRunner,
     build_kimi_agent,
     compact_agent_history,
+    estimated_history_tokens,
     purge_agent_history,
 )
 
@@ -123,3 +124,33 @@ async def test_an_old_history_that_already_holds_the_prompt_sends_it_once():
     _assert_prompt_sent_once(seen)
     # Stored history is not rewritten; only what is sent.
     assert _system_parts(runner.history) == 1
+
+
+def _stored_instructions(messages) -> list[str]:
+    return [
+        message.instructions
+        for message in messages
+        if isinstance(message, ModelRequest) and message.instructions
+    ]
+
+
+async def test_stored_history_keeps_no_instructions():
+    seen = Seen()
+    runner = await _wake(_turns(2), seen)
+    assert _stored_instructions(runner.history) == []
+    await runner.wake("again", deps=None)
+    assert _stored_instructions(runner.history) == []
+
+
+async def test_history_size_does_not_grow_by_the_prompt_per_request():
+    big = PROMPT + " " + "x" * 20_000
+    seen = Seen()
+    agent = build_kimi_agent(seen.model(), system_prompt=big)
+    runner = KimiAgentRunner(agent=agent, summarize=lambda m: _summary_with_usage())
+    await runner.wake("first", deps=None)
+    before = estimated_history_tokens(runner.history)
+    for _ in range(5):
+        await runner.wake("again", deps=None)
+    grown = estimated_history_tokens(runner.history) - before
+    # One stored copy of the prompt alone is ~5000 tokens.
+    assert grown < len(big) // 4

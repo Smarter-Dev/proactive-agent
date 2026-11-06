@@ -743,6 +743,22 @@ def without_system_prompts(messages: list[ModelMessage]) -> list[ModelMessage]:
     return kept
 
 
+def without_stored_instructions(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """The messages with ``instructions`` cleared on every request.
+
+    pydantic-ai copies the agent's instructions onto each request it makes but
+    never re-sends a stored one, so kept in history they only add the prompt's
+    size to every request: the history looks several times larger to the
+    compaction trigger and the purge's scan.
+    """
+    return [
+        replace(message, instructions=None)
+        if isinstance(message, ModelRequest) and message.instructions
+        else message
+        for message in messages
+    ]
+
+
 def drop_other_models_claude_thinking(
     history: list[ModelMessage], model_name: object
 ) -> list[ModelMessage]:
@@ -1272,6 +1288,9 @@ class KimiAgentRunner:
             for spent in meter.usage_by_model().values():
                 add_usage(usage, spent)
             raise
-        self.history = [*self.history, *result.new_messages()]
+        self.history = [
+            *self.history,
+            *without_stored_instructions(result.new_messages()),
+        ]
         add_usage(usage, usage_dict(result.usage, result.new_messages()))
         return result.output, usage

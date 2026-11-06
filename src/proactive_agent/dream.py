@@ -39,6 +39,7 @@ from proactive_agent.agent import (
     ZERO_USAGE,
     add_usage,
     compact_agent_history,
+    without_stored_instructions,
     without_system_prompts,
     without_thinking,
 )
@@ -302,7 +303,11 @@ class DreamService:
                             )
                             # Kept without thinking too: the next live wake must
                             # not send a block signed for another request.
-                            new_messages.extend(without_thinking(result.new_messages()))
+                            new_messages.extend(
+                                without_stored_instructions(
+                                    without_thinking(result.new_messages())
+                                )
+                            )
                             verdict = await self._api.submit_dream(
                                 guild_id, submission(inputs, result.output)
                             )

@@ -8,7 +8,12 @@ import json
 import fakeredis.aioredis
 import pytest
 from purge_fakes import GUILD, FakeAPI, dump, raw_history_with_target
-from pydantic_ai.messages import ModelResponse, ThinkingPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelResponse,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from proactive_agent import dream as dream_module
@@ -65,9 +70,11 @@ class Brain:
         self.answer = {"memory": "## Ongoing Context\nthe shader shipped"} | answer
         self.prompts: list[str] = []
         self.instructions: list[str | None] = []
+        self.sent: list[list] = []
 
     def model(self) -> FunctionModel:
         async def respond(messages, info: AgentInfo):
+            self.sent.append(list(messages))
             self.prompts.append(str(messages[-1].parts[-1].content))
             self.instructions.append(
                 info.instructions if hasattr(info, "instructions") else None
@@ -298,8 +305,33 @@ async def test_an_empty_history_keeps_the_guild_system_prompt(redis_client):
     assert "GUILD SYSTEM PROMPT" in (brain.instructions[0] or "")
     await writer.flush(GUILD)
     stored = json.loads(await redis_client.get(history_key(GUILD)))["history"]
-    assert "SystemPromptPart" not in json.dumps(stored)
     assert "system-prompt" not in json.dumps(stored)
+    assert all(not message.get("instructions") for message in stored)
+    assert "GUILD SYSTEM PROMPT" not in json.dumps(stored)
+    await writer.close(timeout=1)
+
+
+async def test_a_stored_system_prompt_is_not_sent_again(redis_client):
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+
+    brain = Brain()
+    service, api, writer = await build(redis_client, [{"accepted": True}], brain)
+    old = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(content="OLD STORED PROMPT"),
+                UserPromptPart(content="an earlier wake"),
+            ]
+        ),
+        ModelResponse(parts=[TextPart(content="done")]),
+    ]
+    await writer.save(guild_id=GUILD, history=dump(old), previous_revision=0)
+
+    assert await service.sweep_once() == {GUILD: "dreamed"}
+
+    sent = json.dumps([repr(m) for m in brain.sent[0]])
+    assert "OLD STORED PROMPT" not in sent and "an earlier wake" in sent
+    assert "GUILD SYSTEM PROMPT" in (brain.instructions[0] or "")
     await writer.close(timeout=1)
 
 
