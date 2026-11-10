@@ -579,3 +579,33 @@ def test_facts_are_scrubbed_like_the_other_memory_blocks():
     memory = {"facts": "<101:kai> asked for pizza.\nServer is Pine."}
 
     assert scrub_memory(memory, Blocked())["facts"] == "Server is Pine."
+
+
+# -- remember: a forum post's long label (#475) ------------------------------
+
+
+@pytest.mark.parametrize("tags", [0, 6])
+async def test_remember_clips_a_long_forum_post_label(redis_client, tags):
+    api = GateAPI()
+    blocked = await blocked_list(redis_client, api, [])
+    ctx = remember_ctx(api, blocked)
+    tag_text = "; tags: " + ", ".join(f"tag-number-{i}" for i in range(tags))
+    ctx.deps.channel_name = (
+        f"{'T' * 100} (post in forum #showcase{tag_text if tags else ''})"
+    )
+    assert len(ctx.deps.channel_name) > 120
+    answer = await remember(ctx, "kai likes cats")
+    assert api.notes, answer
+    sent = api.notes[0]["channel_name"]
+    assert len(sent) <= 120
+    assert sent.startswith("T" * 20)
+    assert "…" in sent
+
+
+async def test_remember_leaves_a_short_channel_name_alone(redis_client):
+    api = GateAPI()
+    blocked = await blocked_list(redis_client, api, [])
+    ctx = remember_ctx(api, blocked)
+    ctx.deps.channel_name = "general"
+    await remember(ctx, "kai likes cats")
+    assert api.notes[0]["channel_name"] == "general"

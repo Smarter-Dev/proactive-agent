@@ -44,6 +44,9 @@ COMMON_UNICODE_EMOJIS = [
 MAX_CODE_OUTPUT_CHARS = 10_000
 MAX_MEMORIES_PER_TURN = 3
 MAX_MEMORY_NOTE_CHARS = 500
+# The website's ChatMemoryNoteCreate.channel_name limit. A forum post's label
+# ("<title> (post in forum #x; tags: ...)") can pass it; a 422 loses the note.
+MAX_MEMORY_CHANNEL_NAME_CHARS = 120
 REMEMBER_OPTED_OUT = (
     "that one's about someone who opted out of the assistant — "
     "nothing about them gets kept."
@@ -384,6 +387,24 @@ def _format_remaining(status: dict) -> str:
     )
 
 
+def _clip_channel_name(name: str | None) -> str | None:
+    """Fit a channel label to the website's limit. A forum post label is
+    "<title> (post in forum #x; tags: ...)": a long title is shortened with an
+    ellipsis and the "(post in forum ...)" part is kept when it fits, so the
+    dream still reads where the note came from."""
+    if name is None or len(name) <= MAX_MEMORY_CHANNEL_NAME_CHARS:
+        return name
+    limit = MAX_MEMORY_CHANNEL_NAME_CHARS
+    split = name.rfind(" (post in forum #")
+    if split > 0:
+        suffix = name[split:]
+        room = limit - len(suffix) - 1
+        if room >= 20:
+            return name[:split][:room].rstrip() + "…" + suffix
+        # Suffix too long to keep whole: keep the title and as much as fits.
+    return name[: limit - 1].rstrip() + "…"
+
+
 async def remember(ctx, text: str) -> str:
     """Keep a short first-person memory attributed to this channel. A note is
     at most 500 characters, so write one short lesson per note; a longer one
@@ -417,7 +438,7 @@ async def remember(ctx, text: str) -> str:
             ctx.deps.guild_id,
             {
                 "channel_id": ctx.deps.channel_id,
-                "channel_name": ctx.deps.channel_name,
+                "channel_name": _clip_channel_name(ctx.deps.channel_name),
                 "content": note,
                 "engagement_id": None,
             },
