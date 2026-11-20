@@ -148,10 +148,13 @@ def test_claude_skips_the_litellm_proxy(monkeypatch, no_keys) -> None:
     assert isinstance(models.build_model("z-ai/glm-5.3-flash"), OpenAIChatModel)
 
 
-def test_bare_non_claude_ids_still_go_to_zen(monkeypatch, no_keys) -> None:
-    monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "zen")
+def test_bare_kimi_id_goes_to_openrouter(monkeypatch, no_keys) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or")
 
-    assert not isinstance(models.build_model("kimi-k3"), AnthropicModel)
+    model = models.build_model("kimi-k3")
+
+    assert not isinstance(model, AnthropicModel)
+    assert model.model_name == "moonshotai/kimi-k3"
 
 
 # --- the request Opus 5.5 receives ------------------------------------------
