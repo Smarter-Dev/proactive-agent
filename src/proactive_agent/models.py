@@ -116,20 +116,10 @@ def build_model(model_id: str) -> Model:
             model_id,
             provider=GoogleProvider(api_key=get_credential("gemini-api-key")),
         )
-    if model_id == "kimi-k3" or "/" not in model_id:
-        return OpenAIChatModel(
-            model_id,
-            provider=OpenAIProvider(
-                base_url=os.getenv(
-                    "OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1"
-                ),
-                api_key=get_credential("opencode-zen-api-key"),
-            ),
-            profile=OpenAIModelProfile(
-                openai_supports_tool_choice_required=False,
-                openai_chat_supports_multiple_system_messages=False,
-            ),
-        )
+    # The bare Kimi id was an OpenCode Zen name; OpenRouter spells it with the
+    # author's prefix.
+    if model_id == "kimi-k3":
+        model_id = "moonshotai/kimi-k3"
     return OpenAIChatModel(
         model_id,
         provider=OpenRouterProvider(api_key=get_credential("openrouter-api-key")),
