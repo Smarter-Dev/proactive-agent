@@ -77,6 +77,8 @@ def decode_credential(encoded: str) -> str:
     if not encoded.startswith(PREFIX):
         raise ValueError("not a v1 encoded credential")
     body = encoded[len(PREFIX) :]
+    if "+" in body or "/" in body:
+        raise ValueError("v1 body is base64url: '+' and '/' are not allowed")
     try:
         raw = base64.b64decode(
             body + "=" * (-len(body) % 4), altchars=b"-_", validate=True
@@ -105,11 +107,19 @@ def get_credential(logical: str, default: str = "") -> str:
                     spec.opaque,
                 )
             else:
+                # A trailing newline in the stored value would break auth and
+                # httpx echoes a bad header value into its error text.
+                value = value.strip()
                 if value:
                     logger.debug("credential %s: read from %s", logical, spec.opaque)
                     return value
+                logger.warning(
+                    "credential %s: %s decodes to an empty value; trying legacy names",
+                    logical,
+                    spec.opaque,
+                )
     for name in spec.legacy:
-        value = os.environ.get(name, "")
+        value = os.environ.get(name, "").strip()
         if value:
             logger.debug("credential %s: read from legacy %s", logical, name)
             return value

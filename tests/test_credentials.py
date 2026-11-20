@@ -50,7 +50,7 @@ def test_keystream_spans_blocks() -> None:
     assert decode_credential(encode_credential(text)) == text
 
 
-@pytest.mark.parametrize("bad", ["plain", "v2.abc", "v1.!!!!"])
+@pytest.mark.parametrize("bad", ["plain", "v2.abc", "v1.!!!!", "v1.ab+c", "v1.ab/c"])
 def test_decode_rejects_bad_values(bad) -> None:
     with pytest.raises(ValueError):
         decode_credential(bad)
@@ -123,3 +123,16 @@ def test_no_legacy_env_reads_outside_credentials() -> None:
         if pattern.search(line)
     ]
     assert offenders == []
+
+
+def test_decoded_value_is_stripped(monkeypatch) -> None:
+    monkeypatch.setenv("KMSVP8", encode_credential("sk-key\n"))
+    assert get_credential("anthropic-api-key") == "sk-key"
+
+
+def test_empty_decoded_value_falls_back_to_legacy(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("KMSVP8", encode_credential(""))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "legacy")
+    with caplog.at_level(logging.WARNING, logger="proactive_agent.credentials"):
+        assert get_credential("anthropic-api-key") == "legacy"
+    assert "KMSVP8" in caplog.text
