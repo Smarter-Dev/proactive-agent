@@ -78,8 +78,8 @@ def decode_credential(encoded: str) -> str:
     if not encoded.startswith(PREFIX):
         raise ValueError("not a v1 encoded credential")
     body = encoded[len(PREFIX) :]
-    if "+" in body or "/" in body:
-        raise ValueError("v1 body is base64url: '+' and '/' are not allowed")
+    if "+" in body or "/" in body or "=" in body:
+        raise ValueError("v1 body is unpadded base64url: no '+', '/' or '='")
     try:
         raw = base64.b64decode(
             body + "=" * (-len(body) % 4), altchars=b"-_", validate=True

@@ -50,7 +50,10 @@ def test_keystream_spans_blocks() -> None:
     assert decode_credential(encode_credential(text)) == text
 
 
-@pytest.mark.parametrize("bad", ["plain", "v2.abc", "v1.!!!!", "v1.ab+c", "v1.ab/c"])
+@pytest.mark.parametrize(
+    "bad",
+    ["plain", "v2.abc", "v1.!!!!", "v1.ab+c", "v1.ab/c", "v1.-PEJJ30=", "v1.-PEJJ30=="],
+)
 def test_decode_rejects_bad_values(bad) -> None:
     with pytest.raises(ValueError):
         decode_credential(bad)
