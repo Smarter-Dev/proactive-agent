@@ -20,6 +20,7 @@ from proactive_agent.agent import (
     build_kimi_agent,
     disabled_channel_error,
 )
+from proactive_agent.credentials import get_credential
 from proactive_agent.optout_gate import names_blocked_user
 
 COMMON_UNICODE_EMOJIS = [
@@ -132,9 +133,9 @@ async def web_search(ctx, query: str) -> list[dict[str, str]]:
     await _post_status(
         ctx, _search_status(query, preview.get("url") if preview else None)
     )
-    key = os.getenv("BRAVE_SEARCH_API_KEY", "")
+    key = get_credential("brave-search-api-key")
     if not key:
-        results = [{"error": "BRAVE_SEARCH_API_KEY not configured"}]
+        results = [{"error": "web search is not configured"}]
     else:
         try:
             async with httpx.AsyncClient(timeout=15) as client:

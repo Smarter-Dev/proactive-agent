@@ -16,6 +16,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 
+from proactive_agent.credentials import get_credential
+
 # Prompt caching on every Claude request: the tool definitions, the system
 # prompt and the newest message, three of Anthropic's four breakpoints, all on
 # the 1-hour TTL. The guild system prompt and tool set never change and the
@@ -33,8 +35,8 @@ ANTHROPIC_CACHE_SETTINGS = AnthropicModelSettings(
 
 
 def anthropic_api_key() -> str:
-    """The direct Claude API key: ANTHROPIC_API_KEY, else CLAUDE_API_KEY."""
-    return os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or ""
+    """The direct Claude API key (see ``credentials`` for where it is read)."""
+    return get_credential("anthropic-api-key")
 
 
 def build_claude_model(model_id: str) -> AnthropicModel:
@@ -94,7 +96,7 @@ def build_model(model_id: str) -> Model:
             "use the direct id (e.g. claude-opus-5-5)"
         )
     litellm_endpoint = os.getenv("LITELLM_ENDPOINT", "").rstrip("/")
-    litellm_api_key = os.getenv("LITELLM_API_KEY", "")
+    litellm_api_key = get_credential("litellm-api-key")
     if litellm_endpoint and litellm_api_key:
         if not litellm_endpoint.endswith("/v1"):
             litellm_endpoint += "/v1"
@@ -112,9 +114,7 @@ def build_model(model_id: str) -> Model:
     if model_id.startswith("gemini-"):
         return GoogleModel(
             model_id,
-            provider=GoogleProvider(
-                api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-            ),
+            provider=GoogleProvider(api_key=get_credential("gemini-api-key")),
         )
     if model_id == "kimi-k3" or "/" not in model_id:
         return OpenAIChatModel(
@@ -123,7 +123,7 @@ def build_model(model_id: str) -> Model:
                 base_url=os.getenv(
                     "OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1"
                 ),
-                api_key=os.getenv("OPENCODE_ZEN_API_KEY") or "",
+                api_key=get_credential("opencode-zen-api-key"),
             ),
             profile=OpenAIModelProfile(
                 openai_supports_tool_choice_required=False,
@@ -132,10 +132,5 @@ def build_model(model_id: str) -> Model:
         )
     return OpenAIChatModel(
         model_id,
-        provider=OpenRouterProvider(
-            api_key=os.getenv("OPENROUTER_API_KEY")
-            or os.getenv("OPEN_ROUTER_API_KEY")
-            or os.getenv("OPEN_ROUTER")
-            or ""
-        ),
+        provider=OpenRouterProvider(api_key=get_credential("openrouter-api-key")),
     )
