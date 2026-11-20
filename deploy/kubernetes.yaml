@@ -79,6 +79,52 @@ spec:
                 secretKeyRef:
                   name: smarter-dev-secrets
                   key: brave-search-api-key
+            # Phase 1 of the key obfuscation (smarter-dev #482): each secret
+            # also lives under an opaque key, its env var the uppercase of that
+            # key, holding the v1-encoded value. optional so a pod starts before
+            # the secret has them; the plain names above stay until phase 2.
+            - name: FUC9HA
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: fuc9ha
+                  optional: true
+            - name: FHI1OT
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: fhi1ot
+                  optional: true
+            - name: IN8OID
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: in8oid
+                  optional: true
+            - name: IRBCKR
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: irbckr
+                  optional: true
+            - name: KMSVP8
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: kmsvp8
+                  optional: true
+            - name: RCGW3A
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: rcgw3a
+                  optional: true
+            - name: AO6HUE
+              valueFrom:
+                secretKeyRef:
+                  name: smarter-dev-secrets
+                  key: ao6hue
+                  optional: true
           ports:
             - name: health
               containerPort: 8080

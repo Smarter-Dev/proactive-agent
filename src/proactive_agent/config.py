@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from proactive_agent.credentials import get_credential
 
 
 class Settings(BaseSettings):
@@ -41,12 +43,24 @@ class Settings(BaseSettings):
     proactive_dream_enabled: bool = False
     log_level: str = "INFO"
 
+    @model_validator(mode="after")
+    def _read_credentials(self) -> Settings:
+        # The opaque encoded env vars win; a value from .env (or the legacy
+        # env names) stays as the fallback.
+        self.proactive_agent_api_key = get_credential(
+            "proactive-agent-api-key", self.proactive_agent_api_key
+        )
+        self.discord_bot_token = get_credential(
+            "discord-bot-token", self.discord_bot_token
+        )
+        return self
+
     def require_runtime_secrets(self) -> None:
         missing = [
             name
             for name, value in (
-                ("PROACTIVE_AGENT_API_KEY", self.proactive_agent_api_key),
-                ("DISCORD_BOT_TOKEN", self.discord_bot_token),
+                ("proactive-agent-api-key", self.proactive_agent_api_key),
+                ("discord-bot-token", self.discord_bot_token),
             )
             if not value
         ]

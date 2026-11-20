@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 from urllib.parse import urlparse
 
 import httpx
 import pdfplumber
+
+from proactive_agent.credentials import get_credential
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ async def fetch_via_jina(url: str) -> dict[str, str] | None:
     Returns dict with keys ``title``, ``description``, ``content``, ``url``
     on success, or ``None`` on failure.
     """
-    api_key = os.environ.get("JINA_API_KEY", "")
+    api_key = get_credential("jina-api-key")
     headers: dict[str, str] = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
