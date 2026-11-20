@@ -44,7 +44,8 @@ CREDENTIALS: dict[str, CredentialSpec] = {
     "openrouter-api-key": CredentialSpec(
         "RCGW3A", ("OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY", "OPEN_ROUTER")
     ),
-    "opencode-zen-api-key": CredentialSpec("BU4V05", ("OPENCODE_ZEN_API_KEY",)),
+    # OpenCode Zen is being removed (smarter-dev #484): legacy-only, no opaque name.
+    "opencode-zen-api-key": CredentialSpec("", ("OPENCODE_ZEN_API_KEY",)),
     "brave-search-api-key": CredentialSpec("AO6HUE", ("BRAVE_SEARCH_API_KEY",)),
     "jina-api-key": CredentialSpec("IDNDWL", ("JINA_API_KEY",)),
     "discord-bot-token": CredentialSpec("FHI1OT", ("DISCORD_BOT_TOKEN",)),

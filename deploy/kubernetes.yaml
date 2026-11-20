@@ -119,12 +119,6 @@ spec:
                   name: smarter-dev-secrets
                   key: rcgw3a
                   optional: true
-            - name: BU4V05
-              valueFrom:
-                secretKeyRef:
-                  name: smarter-dev-secrets
-                  key: bu4v05
-                  optional: true
             - name: AO6HUE
               valueFrom:
                 secretKeyRef:
