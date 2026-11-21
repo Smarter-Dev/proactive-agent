@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.models.google import GoogleModelSettings
 
-from proactive_agent.credentials import get_credential
+from proactive_agent.credentials import require_credential
 from proactive_agent.handler_lint import lint_script
 from proactive_agent.handler_schedule import (
     ScheduleError,
@@ -117,7 +117,7 @@ class ImageCapabilities:
                 google_thinking_config={"thinking_level": "LOW"}
             ),
         )
-        key = get_credential("gemini-api-key")
+        key = require_credential("gemini-api-key")
         self._client = genai.Client(api_key=key)
 
     async def review(self, prompt: str) -> ImageVerdict:

@@ -16,7 +16,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 
-from proactive_agent.credentials import get_credential
+from proactive_agent.credentials import get_credential, require_credential
 
 # Prompt caching on every Claude request: the tool definitions, the system
 # prompt and the newest message, three of Anthropic's four breakpoints, all on
@@ -36,7 +36,7 @@ ANTHROPIC_CACHE_SETTINGS = AnthropicModelSettings(
 
 def anthropic_api_key() -> str:
     """The direct Claude API key (see ``credentials`` for where it is read)."""
-    return get_credential("anthropic-api-key")
+    return require_credential("anthropic-api-key")
 
 
 def build_claude_model(model_id: str) -> AnthropicModel:
@@ -114,7 +114,7 @@ def build_model(model_id: str) -> Model:
     if model_id.startswith("gemini-"):
         return GoogleModel(
             model_id,
-            provider=GoogleProvider(api_key=get_credential("gemini-api-key")),
+            provider=GoogleProvider(api_key=require_credential("gemini-api-key")),
         )
     # The bare Kimi id was an OpenCode Zen name; OpenRouter spells it with the
     # author's prefix.
@@ -122,5 +122,5 @@ def build_model(model_id: str) -> Model:
         model_id = "moonshotai/kimi-k3"
     return OpenAIChatModel(
         model_id,
-        provider=OpenRouterProvider(api_key=get_credential("openrouter-api-key")),
+        provider=OpenRouterProvider(api_key=require_credential("openrouter-api-key")),
     )

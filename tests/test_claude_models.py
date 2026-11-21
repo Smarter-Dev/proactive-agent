@@ -44,6 +44,7 @@ from proactive_agent.agent import (
 )
 from proactive_agent.capabilities import WebSummarizer
 from proactive_agent.config import Settings
+from proactive_agent.credentials import MissingCredentialError, encode_credential
 from proactive_agent.runtime import GuildRuntime
 
 ONE_HOUR = {"type": "ephemeral", "ttl": "1h"}
@@ -51,8 +52,7 @@ ONE_HOUR = {"type": "ephemeral", "ttl": "1h"}
 
 @pytest.fixture
 def no_keys(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
+    monkeypatch.delenv("KMSVP8", raising=False)
     monkeypatch.delenv("LITELLM_ENDPOINT", raising=False)
     monkeypatch.delenv("LITELLM_API_KEY", raising=False)
 
@@ -101,7 +101,7 @@ def kinds(message: ModelResponse) -> list[str]:
 def test_claude_ids_go_to_anthropic_on_the_claude_key(
     monkeypatch, no_keys, model_id
 ) -> None:
-    monkeypatch.setenv("CLAUDE_API_KEY", "from-claude-name")
+    monkeypatch.setenv("KMSVP8", encode_credential("from-claude-name"))
     server = serve(monkeypatch)
 
     model = models.build_model(model_id)
@@ -117,14 +117,13 @@ def test_claude_ids_go_to_anthropic_on_the_claude_key(
     }
 
 
-def test_anthropic_api_key_wins_over_claude_api_key(monkeypatch, no_keys) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "canonical")
-    monkeypatch.setenv("CLAUDE_API_KEY", "fallback")
-    server = serve(monkeypatch)
-
-    models.build_model("claude-opus-5-5")
-
-    assert server.keys == ["canonical"]
+def test_legacy_anthropic_names_are_ignored(monkeypatch, no_keys) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "legacy")
+    monkeypatch.setenv("CLAUDE_API_KEY", "legacy")
+    with pytest.raises(MissingCredentialError):
+        models.anthropic_api_key()
+    with pytest.raises(MissingCredentialError):
+        models.build_model("claude-opus-5-5")
 
 
 def test_openrouter_claude_ids_are_refused(no_keys) -> None:
@@ -135,7 +134,7 @@ def test_openrouter_claude_ids_are_refused(no_keys) -> None:
 def test_claude_skips_the_litellm_proxy(monkeypatch, no_keys) -> None:
     from pydantic_ai.models.openai import OpenAIChatModel
 
-    monkeypatch.setenv("CLAUDE_API_KEY", "claude")
+    monkeypatch.setenv("KMSVP8", encode_credential("claude"))
     monkeypatch.setenv("LITELLM_ENDPOINT", "http://litellm.test")
     monkeypatch.setenv("LITELLM_API_KEY", "litellm")
     server = serve(monkeypatch)
@@ -149,7 +148,7 @@ def test_claude_skips_the_litellm_proxy(monkeypatch, no_keys) -> None:
 
 
 def test_bare_kimi_id_goes_to_openrouter(monkeypatch, no_keys) -> None:
-    monkeypatch.setenv("OPENROUTER_API_KEY", "or")
+    monkeypatch.setenv("RCGW3A", encode_credential("or"))
 
     model = models.build_model("kimi-k3")
 
@@ -167,7 +166,7 @@ class Decisions(BaseModel):
 async def test_structured_output_is_cached_and_never_forces_a_tool(
     monkeypatch, no_keys
 ) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("KMSVP8", encode_credential("k"))
     server = serve(
         monkeypatch,
         tool_reply(
@@ -215,7 +214,7 @@ async def test_structured_output_is_cached_and_never_forces_a_tool(
 
 
 async def test_a_wake_reports_its_cache_writes(monkeypatch, no_keys) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("KMSVP8", encode_credential("k"))
     serve(monkeypatch, text_reply("nothing to do", cache_write_1h=4_096))
     runner = KimiAgentRunner(
         agent=Agent(models.build_model("claude-opus-5-5"), system_prompt="guild"),
@@ -278,7 +277,7 @@ async def test_compaction_strips_thinking_from_the_kept_tail() -> None:
 async def test_the_summarizer_never_receives_claude_thinking(
     monkeypatch, no_keys
 ) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("KMSVP8", encode_credential("k"))
     server = serve(monkeypatch, text_reply("memory note"))
     history = [
         turn("a"),
@@ -330,7 +329,7 @@ def test_the_defaults_are_opus_and_haiku_on_the_direct_key(monkeypatch) -> None:
 async def test_the_web_summarizer_speaks_claude_and_caches_only_its_prompt(
     monkeypatch, no_keys
 ) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("KMSVP8", encode_credential("k"))
     server = serve(monkeypatch, text_reply("the page says hi", cache_write_1h=600))
     summarize = WebSummarizer(models.build_model("claude-haiku-5-5"))
 
@@ -379,7 +378,7 @@ def test_same_model_history_is_left_alone() -> None:
 async def test_a_wake_on_a_new_claude_model_sends_no_foreign_thinking(
     monkeypatch, no_keys
 ) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("KMSVP8", encode_credential("k"))
     server = serve(monkeypatch, text_reply("ok"))
     # Opus, then Sonnet, then back to Opus: Sonnet's block sits in the middle.
     history = [
