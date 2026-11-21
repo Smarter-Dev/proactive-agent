@@ -93,7 +93,10 @@ async def run() -> None:
         image_capabilities = ImageCapabilities(
             reviewer_model=build_model(settings.proactive_image_reviewer_model),
         )
-        media_reader = MediaReader(build_model(settings.proactive_media_reader_model))
+        media_reader = MediaReader(
+            build_model(settings.proactive_media_reader_model),
+            image_model=build_model(settings.proactive_media_reader_image_model),
+        )
         author_handler = HandlerAuthor(
             api=api,
             model=build_model(settings.proactive_handler_model),
