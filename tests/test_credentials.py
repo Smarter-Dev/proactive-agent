@@ -201,6 +201,6 @@ def test_builders_refuse_an_empty_key(monkeypatch) -> None:
     for name in LEGACY_NAMES:
         monkeypatch.setenv(name, "plain")
     monkeypatch.delenv("LITELLM_ENDPOINT", raising=False)
-    for model_id in ("claude-opus-5-5", "gemini-3-flash-preview", "glm-5.3-flash"):
+    for model_id in ("claude-opus-5-5", "gemini-3.5-flash-lite", "glm-5.3-flash"):
         with pytest.raises(MissingCredentialError):
             models.build_model(model_id)

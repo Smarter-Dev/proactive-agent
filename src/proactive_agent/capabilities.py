@@ -11,9 +11,11 @@ from typing import Any
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
-from pydantic_ai import Agent, BinaryContent
-from pydantic_ai.models.google import GoogleModelSettings
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic_ai import Agent, AgentRetries, BinaryContent
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+from pydantic_ai.settings import ModelSettings
 
 from proactive_agent.credentials import require_credential
 from proactive_agent.handler_lint import lint_script
@@ -37,6 +39,56 @@ IMAGE_REVIEW_PROMPT = (_PROMPTS / "image_review_prompt.md").read_text(encoding="
 MEDIA_READER_PROMPT = (_PROMPTS / "media_reader_prompt.md").read_text(encoding="utf-8")
 
 
+def _output_retries(model) -> AgentRetries | None:
+    return (
+        AgentRetries(output=UNFORCED_OUTPUT_RETRIES)
+        if isinstance(model, AnthropicModel)
+        else None
+    )
+
+
+def _thinking_settings(model, level: str) -> ModelSettings:
+    """Reasoning ``level`` (LOW/MEDIUM) in ``model``'s own dialect.
+
+    Claude gets adaptive thinking at that effort; a Gemini model keeps its
+    ``thinking_level``. The internal models are Claude by default but can be
+    overridden to Gemini (the media reader must be, to hear audio).
+    """
+    if isinstance(model, AnthropicModel):
+        return reasoning_settings(model, level.lower(), cache_messages=False)
+    if isinstance(model, GoogleModel):
+        return GoogleModelSettings(google_thinking_config={"thinking_level": level})
+    # OpenAI, OpenRouter or a LiteLLM reroute: the OpenAI-dialect effort.
+    return reasoning_settings(model, level.lower(), cache_messages=False)
+
+
+# Claude cannot be forced to call the output tool, so it can end a turn with
+# plain text; the author and judge get more output retries (smarter-dev's
+# UNFORCED_OUTPUT_RETRIES).
+UNFORCED_OUTPUT_RETRIES = 3
+
+
+class HandlerSettings(BaseModel):
+    """Trigger settings as typed optional fields.
+
+    With thinking on, Claude's structured output uses a strict JSON schema in
+    which a free-form ``dict`` becomes ``{}`` and the model can return nothing,
+    so every key the validators and prompts use is spelled out here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    interval_seconds: int | None = None
+    daily_time: str | None = None
+    start_at: str | None = None
+    delay_seconds: int | None = None
+    fire_at: str | None = None
+    include_bot_messages: bool | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump(exclude_none=True)
+
+
 class HandlerPlan(BaseModel):
     feasible: bool
     error: str = ""
@@ -44,7 +96,7 @@ class HandlerPlan(BaseModel):
     target_handler_id: str = ""
     name: str = ""
     trigger_type: str = "message"
-    settings: dict[str, Any] = Field(default_factory=dict)
+    settings: HandlerSettings = Field(default_factory=HandlerSettings)
     description: str = ""
     script: str = ""
 
@@ -81,9 +133,7 @@ class WebSummarizer:
                 fallback_model,
                 output_type=str,
                 system_prompt=WEB_SUMMARY_PROMPT,
-                model_settings=GoogleModelSettings(
-                    google_thinking_config={"thinking_level": "LOW"}
-                ),
+                model_settings=_thinking_settings(fallback_model, "LOW"),
             )
             if fallback_model is not None
             else None
@@ -113,9 +163,7 @@ class ImageCapabilities:
             reviewer_model,
             output_type=ImageVerdict,
             system_prompt=IMAGE_REVIEW_PROMPT,
-            model_settings=GoogleModelSettings(
-                google_thinking_config={"thinking_level": "LOW"}
-            ),
+            model_settings=_thinking_settings(reviewer_model, "LOW"),
         )
         key = require_credential("gemini-api-key")
         self._client = genai.Client(api_key=key)
@@ -142,26 +190,44 @@ class ImageCapabilities:
         raise RuntimeError("image model returned no image")
 
 
+# Image types Anthropic accepts; anything else (bmp) goes to the audio model.
+_CLAUDE_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+
 class MediaReader:
-    def __init__(self, model):
-        self._agent = Agent(
+    """Reads one image or audio clip.
+
+    Images go to ``image_model`` (Claude) when Anthropic accepts the type;
+    audio, and bmp, go to ``model`` (a Gemini, as Claude cannot hear).
+    """
+
+    def __init__(self, model, image_model=None):
+        self._agent = self._build(model)
+        self._image_agent = (
+            self._build(image_model) if image_model is not None else None
+        )
+
+    @staticmethod
+    def _build(model) -> Agent:
+        return Agent(
             model,
             output_type=str,
             system_prompt=MEDIA_READER_PROMPT,
-            model_settings=GoogleModelSettings(
-                google_thinking_config={"thinking_level": "LOW"}
-            ),
+            model_settings=_thinking_settings(model, "LOW"),
         )
 
     async def __call__(
         self, *, instruction: str, data: bytes, media_type: str, url: str, kind: str
     ) -> str:
-        result = await self._agent.run(
+        agent = self._agent
+        if self._image_agent is not None and media_type in _CLAUDE_IMAGE_TYPES:
+            agent = self._image_agent
+        result = await agent.run(
             [
                 f"URL: {url}\nKIND: {kind}\n\nINSTRUCTION:\n{instruction}",
                 BinaryContent(data=data, media_type=media_type),
             ],
-            model=metered(self._agent.model),
+            model=metered(agent.model),
         )
         return result.output
 
@@ -222,9 +288,7 @@ def _resolve_plan_target(
             target_handler_id=plan.target_handler_id,
             name=target["name"],
             trigger_type=target["trigger_type"],
-            settings=dict(plan.settings)
-            if plan.settings
-            else dict(target.get("settings") or {}),
+            settings=plan.settings.to_dict() or dict(target.get("settings") or {}),
         )
     if plan.action != "create":
         return f"the author chose an invalid action {plan.action!r}", None
@@ -243,7 +307,7 @@ def _resolve_plan_target(
         target_handler_id=None,
         name=name,
         trigger_type=plan.trigger_type,
-        settings=dict(plan.settings),
+        settings=plan.settings.to_dict(),
     )
 
 
@@ -338,17 +402,15 @@ class HandlerAuthor:
             self.model,
             output_type=HandlerPlan,
             system_prompt=HANDLER_AUTHOR_PROMPT,
-            model_settings=GoogleModelSettings(
-                google_thinking_config={"thinking_level": "MEDIUM"}
-            ),
+            model_settings=_thinking_settings(self.model, "MEDIUM"),
+            retries=_output_retries(self.model),
         )
         self._judge = Agent(
             self.model,
             output_type=HandlerVerdict,
             system_prompt=HANDLER_JUDGE_PROMPT,
-            model_settings=GoogleModelSettings(
-                google_thinking_config={"thinking_level": "MEDIUM"}
-            ),
+            model_settings=_thinking_settings(self.model, "MEDIUM"),
+            retries=_output_retries(self.model),
         )
 
     async def __call__(
