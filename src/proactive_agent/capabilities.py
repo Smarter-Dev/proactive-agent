@@ -13,7 +13,9 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, BinaryContent
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.google import GoogleModelSettings
+from pydantic_ai.settings import ModelSettings
 
 from proactive_agent.credentials import require_credential
 from proactive_agent.handler_lint import lint_script
@@ -35,6 +37,18 @@ HANDLER_JUDGE_PROMPT = (_PROMPTS / "handler_judge.md").read_text(encoding="utf-8
 IMAGE_REVIEW_PROMPT = (_PROMPTS / "image_review_prompt.md").read_text(encoding="utf-8")
 
 MEDIA_READER_PROMPT = (_PROMPTS / "media_reader_prompt.md").read_text(encoding="utf-8")
+
+
+def _thinking_settings(model, level: str) -> ModelSettings:
+    """Reasoning ``level`` (LOW/MEDIUM) in ``model``'s own dialect.
+
+    Claude gets adaptive thinking at that effort; a Gemini model keeps its
+    ``thinking_level``. The internal models are Claude by default but can be
+    overridden to Gemini (the media reader must be, to hear audio).
+    """
+    if isinstance(model, AnthropicModel):
+        return reasoning_settings(model, level.lower(), cache_messages=False)
+    return GoogleModelSettings(google_thinking_config={"thinking_level": level})
 
 
 class HandlerPlan(BaseModel):
@@ -81,9 +95,7 @@ class WebSummarizer:
                 fallback_model,
                 output_type=str,
                 system_prompt=WEB_SUMMARY_PROMPT,
-                model_settings=GoogleModelSettings(
-                    google_thinking_config={"thinking_level": "LOW"}
-                ),
+                model_settings=_thinking_settings(fallback_model, "LOW"),
             )
             if fallback_model is not None
             else None
@@ -113,9 +125,7 @@ class ImageCapabilities:
             reviewer_model,
             output_type=ImageVerdict,
             system_prompt=IMAGE_REVIEW_PROMPT,
-            model_settings=GoogleModelSettings(
-                google_thinking_config={"thinking_level": "LOW"}
-            ),
+            model_settings=_thinking_settings(reviewer_model, "LOW"),
         )
         key = require_credential("gemini-api-key")
         self._client = genai.Client(api_key=key)
@@ -148,9 +158,7 @@ class MediaReader:
             model,
             output_type=str,
             system_prompt=MEDIA_READER_PROMPT,
-            model_settings=GoogleModelSettings(
-                google_thinking_config={"thinking_level": "LOW"}
-            ),
+            model_settings=_thinking_settings(model, "LOW"),
         )
 
     async def __call__(
@@ -338,17 +346,13 @@ class HandlerAuthor:
             self.model,
             output_type=HandlerPlan,
             system_prompt=HANDLER_AUTHOR_PROMPT,
-            model_settings=GoogleModelSettings(
-                google_thinking_config={"thinking_level": "MEDIUM"}
-            ),
+            model_settings=_thinking_settings(self.model, "MEDIUM"),
         )
         self._judge = Agent(
             self.model,
             output_type=HandlerVerdict,
             system_prompt=HANDLER_JUDGE_PROMPT,
-            model_settings=GoogleModelSettings(
-                google_thinking_config={"thinking_level": "MEDIUM"}
-            ),
+            model_settings=_thinking_settings(self.model, "MEDIUM"),
         )
 
     async def __call__(

@@ -25,10 +25,18 @@ class Settings(BaseSettings):
     proactive_agent_model: str = "claude-opus-5-5"
     proactive_skim_model: str = "z-ai/glm-5.3-flash"
     proactive_web_summarizer_model: str = "claude-haiku-5-5"
+    # The Google account is unfunded, and Claude is covered by API credits, so
+    # internal models are Claude unless Claude cannot do the job. The web
+    # summarizer's primary is Claude, so its fallback stays a different vendor
+    # (a Claude outage would take both down). The media reader hears audio,
+    # which Claude cannot, so it stays on the one catalogue Gemini. The handler
+    # authors and judges sandbox code, hence Opus; the image reviewer only
+    # reads a prompt, hence Haiku. Image generation stays Gemini (Claude has
+    # no image output).
     proactive_web_summarizer_fallback_model: str = "gemini-3.5-flash-lite"
-    proactive_handler_model: str = "gemini-3-flash-preview"
-    proactive_image_reviewer_model: str = "gemini-3.1-flash-lite"
-    proactive_media_reader_model: str = "gemini-3.1-flash-lite"
+    proactive_handler_model: str = "claude-opus-5-5"
+    proactive_image_reviewer_model: str = "claude-haiku-5-5"
+    proactive_media_reader_model: str = "gemini-3.5-flash-lite"
     proactive_worker_concurrency: int = Field(8, ge=1, le=128)
     proactive_history_debounce_seconds: float = Field(5, ge=0, le=300)
     proactive_history_flush_timeout_seconds: float = Field(10, gt=0, le=300)
