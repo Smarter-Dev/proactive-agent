@@ -44,7 +44,7 @@ from proactive_agent.agent import (
 )
 from proactive_agent.capabilities import WebSummarizer
 from proactive_agent.config import Settings
-from proactive_agent.credentials import encode_credential
+from proactive_agent.credentials import MissingCredentialError, encode_credential
 from proactive_agent.runtime import GuildRuntime
 
 ONE_HOUR = {"type": "ephemeral", "ttl": "1h"}
@@ -120,7 +120,10 @@ def test_claude_ids_go_to_anthropic_on_the_claude_key(
 def test_legacy_anthropic_names_are_ignored(monkeypatch, no_keys) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "legacy")
     monkeypatch.setenv("CLAUDE_API_KEY", "legacy")
-    assert models.anthropic_api_key() == ""
+    with pytest.raises(MissingCredentialError):
+        models.anthropic_api_key()
+    with pytest.raises(MissingCredentialError):
+        models.build_model("claude-opus-5-5")
 
 
 def test_openrouter_claude_ids_are_refused(no_keys) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import Field, model_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from proactive_agent.credentials import get_credential
@@ -18,8 +18,6 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     api_base_url: str = "http://localhost:8000/api"
-    proactive_agent_api_key: str = ""
-    discord_bot_token: str = ""
     # Claude Opus 5.5 and Haiku 5.5 on the direct Anthropic key since
     # 2026-10-17 (smarter-dev #199); production sets PROACTIVE_AGENT_MODEL in
     # the smarter-dev ConfigMap too. The summarizer was OpenRouter's retired
@@ -43,17 +41,15 @@ class Settings(BaseSettings):
     proactive_dream_enabled: bool = False
     log_level: str = "INFO"
 
-    @model_validator(mode="after")
-    def _read_credentials(self) -> Settings:
-        # The opaque encoded env vars win; a value from .env (or the legacy
-        # env names) stays as the fallback.
-        self.proactive_agent_api_key = get_credential(
-            "proactive-agent-api-key", self.proactive_agent_api_key
-        )
-        self.discord_bot_token = get_credential(
-            "discord-bot-token", self.discord_bot_token
-        )
-        return self
+    # Credentials are not settings fields: pydantic-settings would fill them
+    # from the plain env names and .env. They come only from the opaque env vars.
+    @property
+    def proactive_agent_api_key(self) -> str:
+        return get_credential("proactive-agent-api-key")
+
+    @property
+    def discord_bot_token(self) -> str:
+        return get_credential("discord-bot-token")
 
     def require_runtime_secrets(self) -> None:
         missing = [

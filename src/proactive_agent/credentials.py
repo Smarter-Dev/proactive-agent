@@ -135,3 +135,23 @@ def get_credential(logical: str, default: str = "") -> str:
             logger.debug("credential %s: read from %s", logical, name)
             return value
     return default
+
+
+class MissingCredentialError(ValueError):
+    """A required credential is unset or invalid."""
+
+
+def require_credential(logical: str) -> str:
+    """Like :func:`get_credential`, but raises on an empty result.
+
+    The provider SDKs read their own plain env names (ANTHROPIC_API_KEY and
+    friends) when handed an empty key, which would bring the legacy names back.
+    """
+    value = get_credential(logical)
+    if not value:
+        spec = CREDENTIALS[logical]
+        raise MissingCredentialError(
+            f"credential {logical} is not set: export {spec.opaque or logical} "
+            "(a v1-encoded value)"
+        )
+    return value

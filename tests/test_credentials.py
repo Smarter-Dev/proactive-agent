@@ -153,7 +153,9 @@ def test_manifest_has_no_legacy_credential_env() -> None:
     assert names.isdisjoint(LEGACY_NAMES)
     for spec in CREDENTIALS.values():
         if spec.opaque:
-            assert spec.opaque in names or spec.opaque == "IDNDWL"
+            assert spec.opaque in names
+    assert "PROACTIVE_ALLOW_PLAIN_CREDENTIALS" not in manifest.read_text()
+    assert "optional: true" not in manifest.read_text()
 
 
 def test_decoded_value_is_stripped(monkeypatch) -> None:
@@ -166,3 +168,39 @@ def test_empty_decoded_value_gives_default(monkeypatch, caplog) -> None:
     with caplog.at_level(logging.WARNING, logger="proactive_agent.credentials"):
         assert get_credential("anthropic-api-key") == ""
     assert "KMSVP8" in caplog.text
+
+
+def test_settings_do_not_fill_credentials_from_plain_names(
+    monkeypatch, tmp_path
+) -> None:
+    from proactive_agent.config import Settings
+
+    env = tmp_path / ".env"
+    env.write_text("PROACTIVE_AGENT_API_KEY=plain\nDISCORD_BOT_TOKEN=plain\n")
+    monkeypatch.setenv("PROACTIVE_AGENT_API_KEY", "plain")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "plain")
+    settings = Settings(_env_file=env)
+    assert settings.proactive_agent_api_key == ""
+    assert settings.discord_bot_token == ""
+    with pytest.raises(ValueError, match="missing required settings"):
+        settings.require_runtime_secrets()
+
+
+def test_no_settings_field_maps_to_a_legacy_name() -> None:
+    from proactive_agent.config import Settings
+
+    fields = {name.upper() for name in Settings.model_fields}
+    assert fields.isdisjoint(LEGACY_NAMES)
+
+
+def test_builders_refuse_an_empty_key(monkeypatch) -> None:
+    from proactive_agent import models
+    from proactive_agent.credentials import MissingCredentialError
+
+    # The SDKs would read these plain names themselves given an empty key.
+    for name in LEGACY_NAMES:
+        monkeypatch.setenv(name, "plain")
+    monkeypatch.delenv("LITELLM_ENDPOINT", raising=False)
+    for model_id in ("claude-opus-5-5", "gemini-3-flash-preview", "glm-5.3-flash"):
+        with pytest.raises(MissingCredentialError):
+            models.build_model(model_id)
