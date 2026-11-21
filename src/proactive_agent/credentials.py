@@ -1,6 +1,8 @@
-"""API credentials, read from opaque encoded env vars first, legacy names after.
+"""API credentials, read from opaque encoded env vars only.
 
-Phase 1 of smarter-dev's key obfuscation (#482 web side, #483 here): each key
+Phase 2 of smarter-dev's key obfuscation (#482/#487 web side, #483/#488 here): the
+plain legacy names (ANTHROPIC_API_KEY and friends) are no longer read at all.
+Each key
 lives under a non-obvious env name and its value is encoded so a scanner does
 not see a key shape. The encoding is shared byte for byte with #482:
 
@@ -11,6 +13,10 @@ not see a key shape. The encoding is shared byte for byte with #482:
 
 This is obfuscation against scanners, not encryption. Values are never logged;
 only which source answered.
+
+Local dev and evals: set ``PROACTIVE_ALLOW_PLAIN_CREDENTIALS=1`` to accept a
+plain (non-``v1.``) value under an opaque name. Production never sets it, so a
+plain value there is refused.
 """
 
 from __future__ import annotations
@@ -28,28 +34,29 @@ MASK = bytes.fromhex("f57d64f1e6341340da83b07d00003b1cb3478f4083d21eda")
 PREFIX = "v1."
 
 
+DEV_PLAIN_FLAG = "PROACTIVE_ALLOW_PLAIN_CREDENTIALS"
+
+
 @dataclass(frozen=True)
 class CredentialSpec:
-    opaque: str  # uppercase of the smarter-dev-secrets key's opaque name; "" if none
-    legacy: tuple[str, ...]
+    opaque: str  # uppercase of the smarter-dev-secrets key's opaque name
+    # Only for a key with no opaque name; it is never a production secret.
+    legacy: tuple[str, ...] = ()
 
 
 # logical name (the smarter-dev-secrets key) -> where it may be found.
 CREDENTIALS: dict[str, CredentialSpec] = {
-    "anthropic-api-key": CredentialSpec(
-        "KMSVP8", ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY")
-    ),
-    "openai-api-key": CredentialSpec("IRBCKR", ("OPENAI_API_KEY",)),
-    "gemini-api-key": CredentialSpec("IN8OID", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
-    "openrouter-api-key": CredentialSpec(
-        "RCGW3A", ("OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY", "OPEN_ROUTER")
-    ),
-    "brave-search-api-key": CredentialSpec("AO6HUE", ("BRAVE_SEARCH_API_KEY",)),
-    "jina-api-key": CredentialSpec("IDNDWL", ("JINA_API_KEY",)),
-    "discord-bot-token": CredentialSpec("FHI1OT", ("DISCORD_BOT_TOKEN",)),
-    "proactive-agent-api-key": CredentialSpec("FUC9HA", ("PROACTIVE_AGENT_API_KEY",)),
-    # An optional proxy key for a LiteLLM endpoint. Not in the production
-    # secret and not part of #482's table, so it has no opaque name yet.
+    "anthropic-api-key": CredentialSpec("KMSVP8"),
+    "openai-api-key": CredentialSpec("IRBCKR"),
+    "gemini-api-key": CredentialSpec("IN8OID"),
+    "openrouter-api-key": CredentialSpec("RCGW3A"),
+    "brave-search-api-key": CredentialSpec("AO6HUE"),
+    "jina-api-key": CredentialSpec("IDNDWL"),
+    "discord-bot-token": CredentialSpec("FHI1OT"),
+    "proactive-agent-api-key": CredentialSpec("FUC9HA"),
+    # An optional proxy key for a LiteLLM endpoint (local development only).
+    # Not in the production secret and not part of #482's table, so it has no
+    # opaque name and keeps its plain one.
     "litellm-api-key": CredentialSpec("", ("LITELLM_API_KEY",)),
 }
 
@@ -87,11 +94,15 @@ def decode_credential(encoded: str) -> str:
         raise ValueError("malformed v1 encoded credential") from exc
 
 
-def get_credential(logical: str, default: str = "") -> str:
-    """The credential's value: opaque env var (decoded), then legacy names.
+def _dev_plain_allowed() -> bool:
+    return os.environ.get(DEV_PLAIN_FLAG, "").strip().lower() in {"1", "true", "yes"}
 
-    Returns ``default`` (the empty string) when no source holds it. Logs the
-    source's env var name, never the value.
+
+def get_credential(logical: str, default: str = "") -> str:
+    """The credential's value from its opaque env var (decoded).
+
+    Returns ``default`` (the empty string) when it is unset or invalid. Logs the
+    env var name, never the value.
     """
     spec = CREDENTIALS[logical]
     if spec.opaque:
@@ -100,26 +111,27 @@ def get_credential(logical: str, default: str = "") -> str:
             try:
                 value = decode_credential(encoded)
             except ValueError:
-                logger.warning(
-                    "credential %s: %s is not a valid v1 value; trying legacy names",
-                    logical,
-                    spec.opaque,
-                )
-            else:
-                # A trailing newline in the stored value would break auth and
-                # httpx echoes a bad header value into its error text.
-                value = value.strip()
-                if value:
-                    logger.debug("credential %s: read from %s", logical, spec.opaque)
-                    return value
-                logger.warning(
-                    "credential %s: %s decodes to an empty value; trying legacy names",
-                    logical,
-                    spec.opaque,
-                )
+                if encoded.startswith(PREFIX) or not _dev_plain_allowed():
+                    logger.warning(
+                        "credential %s: %s is not a valid v1 value; ignoring it",
+                        logical,
+                        spec.opaque,
+                    )
+                    return default
+                value = encoded
+            # A trailing newline in the stored value would break auth and
+            # httpx echoes a bad header value into its error text.
+            value = value.strip()
+            if value:
+                logger.debug("credential %s: read from %s", logical, spec.opaque)
+                return value
+            logger.warning(
+                "credential %s: %s decodes to an empty value", logical, spec.opaque
+            )
+        return default
     for name in spec.legacy:
         value = os.environ.get(name, "").strip()
         if value:
-            logger.debug("credential %s: read from legacy %s", logical, name)
+            logger.debug("credential %s: read from %s", logical, name)
             return value
     return default

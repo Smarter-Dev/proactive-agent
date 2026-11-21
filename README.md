@@ -44,11 +44,12 @@ Before the first deployment, add this key to the existing
 
 - `proactive-agent-api-key`: a distinct Skrift key with `bot-api` permission
 
-The manifest continues to use the existing `redis-url`, `discord-bot-token`,
-provider-key, and `brave-search-api-key` entries. `anthropic-api-key` becomes
-`ANTHROPIC_API_KEY` (or, phase 1 of the key obfuscation, the opaque `KMSVP8`
-holding a v1-encoded value; see `src/proactive_agent/credentials.py`, which also
-lists the other opaque names and prefers them over the legacy ones): any `claude-*` model id (for example
+The manifest uses the existing `redis-url` entry and the opaque-named credential entries. Credentials are read only
+from opaque env vars holding v1-encoded values (phase 2 of the key obfuscation):
+`anthropic-api-key` becomes `KMSVP8`. See `src/proactive_agent/credentials.py`
+for the other opaque names; the plain legacy names such as `ANTHROPIC_API_KEY` are
+no longer read. For local dev and evals, set `PROACTIVE_ALLOW_PLAIN_CREDENTIALS=1`
+to accept plain values under the opaque names. With that, any `claude-*` model id (for example
 `PROACTIVE_AGENT_MODEL=claude-opus-5-5`) calls Anthropic directly with it,
 with 1-hour prompt caching on the tools, system prompt and newest message.
 The defaults are `claude-opus-5-5` for the agent and `claude-haiku-5-5` for
@@ -121,7 +122,7 @@ marked that guild `external` in Redis.
 after the global mode is external. The embedded, shadow, and external guild
 lists are mutually exclusive; the bot refuses an ambiguous configuration.
 
-The bot and worker must share Redis, `DISCORD_BOT_TOKEN` (or the opaque `FHI1OT`), and an API key with
+The bot and worker must share Redis, the opaque `FHI1OT` (the Discord bot token), and an API key with
 the existing `bot-api` permission. Rolling back is the reverse flag change;
 pending Redis wakes and persisted guild history remain available.
 

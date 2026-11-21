@@ -38,46 +38,10 @@ spec:
                 secretKeyRef:
                   name: smarter-dev-secrets
                   key: redis-url
-            - name: PROACTIVE_AGENT_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: smarter-dev-secrets
-                  key: proactive-agent-api-key
-            - name: DISCORD_BOT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: smarter-dev-secrets
-                  key: discord-bot-token
-            - name: GEMINI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: smarter-dev-secrets
-                  key: gemini-api-key
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: smarter-dev-secrets
-                  key: openai-api-key
-            # Direct Claude API for any claude-* model in config.
-            - name: ANTHROPIC_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: smarter-dev-secrets
-                  key: anthropic-api-key
-            - name: OPENROUTER_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: smarter-dev-secrets
-                  key: openrouter-api-key
-            - name: BRAVE_SEARCH_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: smarter-dev-secrets
-                  key: brave-search-api-key
-            # Phase 1 of the key obfuscation (smarter-dev #482): each secret
-            # also lives under an opaque key, its env var the uppercase of that
-            # key, holding the v1-encoded value. optional so a pod starts before
-            # the secret has them; the plain names above stay until phase 2.
+            # Key obfuscation (smarter-dev #482, #487): each credential lives
+            # under an opaque key, its env var the uppercase of that key,
+            # holding the v1-encoded value. The plain names are gone (phase 2).
+            # optional so a pod starts before the secret has them.
             - name: FUC9HA
               valueFrom:
                 secretKeyRef:

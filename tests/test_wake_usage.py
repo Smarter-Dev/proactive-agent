@@ -27,6 +27,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models.test import TestModel
 
 from proactive_agent.agent import KimiAgentRunner, self_compaction_summary, usage_dict
+from proactive_agent.credentials import encode_credential
 from proactive_agent.engine import AgentEngine, SkimRunner
 from proactive_agent.history import DebouncedHistoryWriter, GuildHistoryRepository
 from proactive_agent.models import build_model
@@ -67,8 +68,8 @@ def providers(monkeypatch):
         monkeypatch.setattr(client.AsyncHTTPTransport, "handle_async_request", handle)
     monkeypatch.delenv("LITELLM_ENDPOINT", raising=False)
     monkeypatch.delenv("LITELLM_API_KEY", raising=False)
-    monkeypatch.setenv("GEMINI_API_KEY", "test")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    monkeypatch.setenv("IN8OID", encode_credential("test"))
+    monkeypatch.setenv("RCGW3A", encode_credential("test"))
     return requests
 
 
